@@ -6,8 +6,8 @@
 use blitz_dom::node::Node;
 use blitz_html::HtmlDocument;
 
-/// Collect focusable element ids in document (tree) order.
-pub fn focusable_ids(doc: &HtmlDocument) -> Vec<String> {
+/// Collect every element `id` in document (tree) order.
+pub fn ids_in_document_order(doc: &HtmlDocument) -> Vec<String> {
     let mut out = Vec::new();
     let root = doc.root_node().id;
     let mut stack = vec![root];
@@ -22,9 +22,6 @@ pub fn focusable_ids(doc: &HtmlDocument) -> Vec<String> {
         if !node.is_element() {
             continue;
         }
-        if !is_focusable_element(node) {
-            continue;
-        }
         if let Some(id) = element_id(node) {
             if !id.is_empty() {
                 out.push(id);
@@ -32,6 +29,18 @@ pub fn focusable_ids(doc: &HtmlDocument) -> Vec<String> {
         }
     }
     out
+}
+
+/// Collect focusable element ids in document (tree) order.
+pub fn focusable_ids(doc: &HtmlDocument) -> Vec<String> {
+    ids_in_document_order(doc)
+        .into_iter()
+        .filter(|id| {
+            doc.get_element_by_id(id)
+                .and_then(|nid| doc.get_node(nid))
+                .is_some_and(is_focusable_element)
+        })
+        .collect()
 }
 
 fn element_id(node: &Node) -> Option<String> {

@@ -12,7 +12,7 @@ use blitz_traits::shell::{ColorScheme, Viewport as BlitzViewport};
 
 use crate::dialect::{validate_loaded_attrs, ElementBinding, SwapMode, SyncMode};
 use crate::error::EngineError;
-use crate::focus::{focusable_ids, step_focus};
+use crate::focus::{focusable_ids, ids_in_document_order, step_focus};
 use crate::fonts::bundled_font_context;
 use crate::paint::paint_rgba;
 use crate::pending::{PendingEntry, PendingState, QueuedRelease};
@@ -994,38 +994,67 @@ impl Engine {
             }
         }
 
-        // (d) from:body / from:document triggers.
+        // (d) from:body / from:document triggers — document order; prefer enabled.
+        // Among filter matches: first ENABLED (not greyed) emits Action; greyed
+        // matches are skipped; if every match is greyed → Blocked with the first
+        // greyed match's reason (Designer pause/resume Space pattern).
         {
             let ctx = filter_ctx_from_key(&key);
-            let candidates: Vec<(String, _)> = self
-                .bindings
-                .iter()
-                .flat_map(|(id, b)| {
-                    b.triggers
-                        .iter()
-                        .filter(|t| t.event == event && t.from == Some(FromTarget::Body))
-                        .map(|t| (id.clone(), t.clone()))
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-            for (id, t) in candidates {
-                if matches!(event, TriggerEvent::KeyDown)
-                    && key.repeat
-                    && !keydown_repeat_allowed(&t.filter, true)
-                {
+            let order = self
+                .doc
+                .as_ref()
+                .map(ids_in_document_order)
+                .unwrap_or_default();
+            let trigger_info = TriggerInfo::Key {
+                event: if key.pressed { "keydown" } else { "keyup" },
+                key: key.key.clone(),
+                code: key.code.clone(),
+                mods: key.mods,
+                repeat: key.repeat,
+            };
+            let mut first_greyed: Option<(String, String, String)> = None;
+            for id in order {
+                let Some(binding) = self.bindings.get(&id).cloned() else {
+                    continue;
+                };
+                let Some(action_name) = binding.hx_post.clone() else {
+                    continue;
+                };
+                let mut matched = false;
+                for t in &binding.triggers {
+                    if t.event != event || t.from != Some(FromTarget::Body) {
+                        continue;
+                    }
+                    if matches!(event, TriggerEvent::KeyDown)
+                        && key.repeat
+                        && !keydown_repeat_allowed(&t.filter, true)
+                    {
+                        continue;
+                    }
+                    let ok = t.filter.as_ref().map(|f| f.eval(&ctx)).unwrap_or(true);
+                    if ok {
+                        matched = true;
+                        break;
+                    }
+                }
+                if !matched {
                     continue;
                 }
-                let ok = t.filter.as_ref().map(|f| f.eval(&ctx)).unwrap_or(true);
-                if ok {
-                    let trigger_info = TriggerInfo::Key {
-                        event: if key.pressed { "keydown" } else { "keyup" },
-                        key: key.key.clone(),
-                        code: key.code.clone(),
-                        mods: key.mods,
-                        repeat: key.repeat,
-                    };
-                    return self.fire_on(&id, event, ctx, trigger_info, None, true);
+                if let Some(reason) = self.disabled_actions.get(&action_name).cloned() {
+                    if first_greyed.is_none() {
+                        first_greyed = Some((id, action_name, reason));
+                    }
+                    continue;
                 }
+                return self.fire_on(&id, event, ctx, trigger_info, None, true);
+            }
+            if let Some((source_id, name, reason)) = first_greyed {
+                return InputOutcome::Blocked {
+                    name,
+                    reason,
+                    source_id,
+                    trigger: trigger_info,
+                };
             }
         }
 

@@ -1315,4 +1315,94 @@ fn strict_bad_fragment_errors_on_sync_not_applied() {
     let after = eng.serialize_html().unwrap();
     assert_eq!(before, after, "bad fragment must not be applied");
     assert!(!after.contains("DATE bad"));
+
+    // Hand-written data-hx-reason in a swap fragment is also rejected (engine-only).
+    frags.set(
+        "time-strip",
+        r##"<span id="time-label" data-hx-reason="sample">DATE reason</span>"##,
+    );
+    slices.bump("time");
+    let err = eng
+        .sync(&slices, &mut frags)
+        .expect_err("data-hx-reason in fragment");
+    match err {
+        EngineError::InvalidAttribute { attr, .. } => assert_eq!(attr, "data-hx-reason"),
+        other => panic!("expected InvalidAttribute for data-hx-reason, got {other:?}"),
+    }
+    assert_eq!(
+        before,
+        eng.serialize_html().unwrap(),
+        "data-hx-reason fragment must not be applied"
+    );
+}
+
+#[test]
+fn from_body_prefers_first_enabled_in_document_order() {
+    // Designer time-strip: pause + resume share Space from:body; exactly one greyed.
+    let html = r##"<!DOCTYPE html><html><body>
+      <button id="tstrip-pause"
+        hx-post="time.pause"
+        hx-trigger="click, keydown[key==' '&&!repeat] from:body">Pause</button>
+      <button id="tstrip-resume"
+        hx-post="time.resume"
+        hx-trigger="click, keydown[key==' '&&!repeat] from:body">Resume</button>
+    </body></html>"##;
+
+    let mut eng = Engine::new(EngineConfig::default());
+    eng.declare_actions(&["time.pause", "time.resume"]);
+    eng.load_html(html).expect("load designer pair");
+
+    let mut slices = MemSlices::new();
+    slices.actions.push((
+        "time.pause".into(),
+        ActionState::Disabled {
+            reason: "already paused".into(),
+        },
+    ));
+    // resume stays Enabled (absent from Disabled list)
+    let mut frags = SpyFrags::new();
+    eng.sync(&slices, &mut frags).unwrap();
+
+    let space = KeyEvent {
+        key: " ".into(),
+        code: "Space".into(),
+        mods: Modifiers::default(),
+        repeat: false,
+        pressed: true,
+    };
+    // No focus — step (d) only.
+    assert!(eng.focus_state().focused_id.is_none());
+
+    let out = eng.input(InputEvent::Key(space.clone()));
+    match out {
+        InputOutcome::Action {
+            name, source_id, ..
+        } => {
+            assert_eq!(name, "time.resume");
+            assert_eq!(source_id, "tstrip-resume");
+        }
+        other => panic!("expected Action time.resume, got {other:?}"),
+    }
+
+    // Flip: resume Disabled, pause Enabled → Space fires pause.
+    slices.actions.clear();
+    slices.actions.push((
+        "time.resume".into(),
+        ActionState::Disabled {
+            reason: "running".into(),
+        },
+    ));
+    slices.bump("actions");
+    eng.sync(&slices, &mut frags).unwrap();
+
+    let out = eng.input(InputEvent::Key(space));
+    match out {
+        InputOutcome::Action {
+            name, source_id, ..
+        } => {
+            assert_eq!(name, "time.pause");
+            assert_eq!(source_id, "tstrip-pause");
+        }
+        other => panic!("expected Action time.pause after flip, got {other:?}"),
+    }
 }
