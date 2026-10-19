@@ -13,6 +13,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+// AtomicBool/Ordering used by LoadGuard and FAF busy-control bench.
+
 use hx_native::*;
 
 /// Discarded frames after open / before samples. Raised from 10 after the
@@ -221,7 +223,7 @@ fn run_worker(width: u32, height: u32, busy: bool) -> WorkerStats {
         .unwrap();
     worker.flush().unwrap();
     let mut last_gen = worker
-        .take_frame(SurfaceId::DEFAULT)
+        .latest_frame(SurfaceId::DEFAULT, 0)
         .map(|f| f.generation)
         .unwrap_or(0);
 
@@ -242,7 +244,7 @@ fn run_worker(width: u32, height: u32, busy: bool) -> WorkerStats {
                     mods: Modifiers::default(),
                 })
                 .unwrap();
-            let _ = worker.take_frame(SurfaceId::DEFAULT);
+            let _ = worker.latest_frame(SurfaceId::DEFAULT, last_gen);
             let host_cost = t_host0.elapsed().as_nanos() as u64;
 
             let mut frames_waited = 0u64;
@@ -263,7 +265,7 @@ fn run_worker(width: u32, height: u32, busy: bool) -> WorkerStats {
                 host_ns.push(host_cost);
             }
         } else {
-            let _ = worker.take_frame(SurfaceId::DEFAULT);
+            let _ = worker.latest_frame(SurfaceId::DEFAULT, last_gen);
             let host_cost = t_host0.elapsed().as_nanos() as u64;
             worker.flush().ok();
             if i >= WARMUP {
@@ -271,9 +273,7 @@ fn run_worker(width: u32, height: u32, busy: bool) -> WorkerStats {
             }
         }
 
-        if let Some(frame) = worker.take_frame(SurfaceId::DEFAULT) {
-            // Only record when the worker published a new paint. Re-reading the
-            // same generation repeated a prior paint_ns and skewed percentiles.
+        if let Some(frame) = worker.latest_frame(SurfaceId::DEFAULT, last_gen) {
             if frame.generation > last_gen {
                 last_gen = frame.generation;
                 if i >= WARMUP {
@@ -339,7 +339,7 @@ fn print_worker(label: &str, width: u32, height: u32, busy: bool, stats: &Worker
     println!("### {label} ({width}x{height}, busy_cores={busy})");
     println!("| Metric | n | mean ms | p95 ms | p99 ms |");
     println!("|---|---|---|---|---|");
-    report_row("host frame (enqueue + take_frame)", &stats.host_ns);
+    report_row("host frame (enqueue + latest_frame)", &stats.host_ns);
     report_row("worker paint (new gens)", &stats.paint_ns);
     if !stats.input_latency_frames.is_empty() {
         println!(
@@ -350,6 +350,74 @@ fn print_worker(label: &str, width: u32, height: u32, busy: bool, stats: &Worker
             stats.input_latency_frames.len(),
         );
     }
+}
+
+/// Host-side cost of fire-and-forget open / pre-drawn show / close while the
+/// worker is busy painting (target: under 0.1 ms each).
+fn bench_faf_controls_while_busy() {
+    let worker = PaintWorker::spawn(EngineConfig {
+        max_paint_ns: 50_000_000,
+        paint_mode: PaintMode::Exact,
+        ..EngineConfig::default()
+    });
+    worker.declare_actions(&["act.do"]).unwrap();
+    worker
+        .open_surface(
+            SurfaceId::DEFAULT,
+            &section_page(1920, 1080),
+            Viewport::new(1920, 1080),
+            SurfaceOpts {
+                visible: true,
+                pinned: true,
+            },
+        )
+        .unwrap();
+    worker.flush().unwrap();
+
+    // Keep the worker busy with continuous syncs on a side thread.
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_c = Arc::clone(&stop);
+    // PaintWorker is not Clone; flood from this thread interleaved with timing.
+    let mut open_ns = Vec::new();
+    let mut show_ns = Vec::new();
+    let mut close_ns = Vec::new();
+    for i in 0..40u64 {
+        worker.sync(packet(i + 1, -((i as i32 % 20) * 3))).unwrap();
+        let id = SurfaceId(10 + (i % 5));
+        let t0 = Instant::now();
+        worker
+            .open_surface(
+                id,
+                &section_page(640, 360),
+                Viewport::new(640, 360),
+                SurfaceOpts {
+                    visible: false,
+                    pinned: false,
+                },
+            )
+            .unwrap();
+        open_ns.push(t0.elapsed().as_nanos() as u64);
+
+        let t1 = Instant::now();
+        worker.set_visible(id, true).unwrap();
+        show_ns.push(t1.elapsed().as_nanos() as u64);
+
+        let t2 = Instant::now();
+        worker.close_surface(id).unwrap();
+        close_ns.push(t2.elapsed().as_nanos() as u64);
+    }
+    stop_c.store(true, Ordering::Relaxed);
+    let _ = stop;
+    worker.flush().ok();
+    drop(worker);
+
+    println!();
+    println!("## Fire-and-forget host cost while worker busy (target < 0.1 ms)");
+    println!("| Call | n | mean ms | p95 ms | p99 ms |");
+    println!("|---|---|---|---|---|");
+    report_row("open_surface (hidden pre-draw)", &open_ns);
+    report_row("set_visible(true) pre-drawn show", &show_ns);
+    report_row("close_surface", &close_ns);
 }
 
 fn main() {
@@ -395,4 +463,6 @@ fn main() {
         println!("|---|---|---|---|---|");
         report_row("sync Engine paint", &sync_ns);
     }
+
+    bench_faf_controls_while_busy();
 }

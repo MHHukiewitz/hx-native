@@ -32,8 +32,10 @@ pub use pending::PendingTimeout;
 pub use trigger::{FilterExpr, FromTarget, ParsedTrigger, TriggerEvent};
 pub use types::*;
 pub use worker::{
-    PaintWorker, SyncPacket, WorkerError, WorkerFrame, WorkerStatus, PAINT_WORKER_COMMAND_CAPACITY,
-    PAINT_WORKER_FRAME_SLOTS, PAINT_WORKER_JOIN_WARN_NS,
+    FrameView, PaintWorker, SyncPacket, WorkerError, WorkerFrame, WorkerOutcome, WorkerStatus,
+    DAMAGE_HISTORY_GENERATIONS, PAINT_WORKER_COMMAND_CAPACITY, PAINT_WORKER_DISCRETE_HARD_CAP,
+    PAINT_WORKER_DISCRETE_SOFT_CAP, PAINT_WORKER_FRAME_SLOTS, PAINT_WORKER_JOIN_WARN_NS,
+    WORKER_STALL_TIMEOUT_NS,
 };
 
 /// Crate version string.
@@ -50,6 +52,8 @@ const _: () = {
         assert_send::<Timings>();
         assert_send::<SyncPacket>();
         assert_send::<WorkerFrame>();
+        assert_send::<FrameView>();
+        assert_send::<WorkerOutcome>();
     }
     let _ = check;
 };

@@ -4,40 +4,57 @@
 //!
 //! Blitz documents are `!Send`, so the worker thread creates and owns the
 //! [`Engine`] and every surface. The host keeps a [`PaintWorker`] handle that
-//! is `Send` and never blocks waiting for paint.
+//! is `Send` and never blocks waiting for paint after spawn.
 //!
 //! Typical Mainnet frame:
 //!
 //! 1. After the sim tick, build a [`SyncPacket`] from already-rendered slice
-//!    HTML (the worker must never call into the sim). Enqueue it with
-//!    [`PaintWorker::sync`] / [`PaintWorker::sync_surface`].
-//! 2. Enqueue input with [`PaintWorker::input`] / [`PaintWorker::input_surface`].
-//!    Input is never dropped; slice syncs for the same target may coalesce.
-//! 3. Call [`PaintWorker::take_frame`] for each surface you composite. That
-//!    returns the last finished [`PaintOutput`] (shared via `Arc`) plus damage.
-//!    Upload only the damage rects with `queue.write_texture`. If there is no
-//!    newer frame, keep the previous GPU texture.
-//! 4. Drain [`PaintWorker::poll_outcomes`] and route `Action` / `Blocked` to the
-//!    game between ticks. Call [`PaintWorker::complete`] when an action finishes.
-//! 5. On shutdown, drop the handle. The worker joins; a panic is reported via
-//!    [`PaintWorker::poll_error`] and the last finished frames stay available.
+//!    HTML (the worker must never call into the sim). Enqueue with
+//!    [`PaintWorker::sync`] / [`PaintWorker::sync_surface`] (fire-and-forget).
+//! 2. Enqueue input and surface controls the same way. Discrete input and
+//!    `complete` are never dropped; slice syncs, pointer moves, and per-surface
+//!    controls coalesce. The structural bound is O(slices + surfaces) plus
+//!    human-rate discrete input ([`PAINT_WORKER_DISCRETE_SOFT_CAP`]).
+//! 3. Call [`PaintWorker::latest_frame`]`(id, since_generation)`. That returns
+//!    an [`FrameView`] whose `output` is an `Arc` (cloning the view is cheap;
+//!    pixels are not copied) and whose `damage` is the union since
+//!    `since_generation` (or a full-surface rect when history is insufficient).
+//!    Published frames also carry forward damage from any earlier published
+//!    frame the host never took, so a host that ignores generations stays safe.
+//! 4. Drain [`PaintWorker::poll_outcomes`] (each carries [`SurfaceId`]) and call
+//!    [`PaintWorker::complete`] when an action finishes.
+//! 5. On shutdown, drop the handle. The worker joins; a panic or stall is
+//!    reported via [`PaintWorker::poll_error`].
 //!
-//! Keep using the synchronous [`Engine`] API when you do not need a worker. The
-//! worker is a wrapper; it does not remove or change that API.
+//! Keep using the synchronous [`Engine`] API when you do not need a worker.
 
 use std::collections::{HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, SyncSender};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use crate::damage::{merge_damage_rects, IntRect};
 use crate::engine::{DirtySet, Engine};
 use crate::error::EngineError;
 use crate::types::*;
 
-/// Bound on the worker command mailbox (queued commands).
+/// Soft cap on the order-preserving discrete-input queue. Exceeding it warns
+/// and increments [`PaintWorker::discrete_over_cap_count`]; events are never
+/// dropped. The real bound is O(slices + surfaces) for coalesced state plus
+/// human-rate discrete input.
+pub const PAINT_WORKER_DISCRETE_SOFT_CAP: usize = 256;
+
+/// Hard cap on the discrete queue. Past this, host calls return
+/// [`WorkerError::Stalled`] (events already queued are kept; new discrete
+/// events are still enqueued so input is never dropped, but the host must
+/// fall back). Also triggered by [`WORKER_STALL_TIMEOUT_NS`] with no progress.
+pub const PAINT_WORKER_DISCRETE_HARD_CAP: usize = 1024;
+
+/// Historical name kept for docs / benches. The mailbox no longer blocks at
+/// this size; coalescing and the discrete soft-cap replace a hard wait.
 pub const PAINT_WORKER_COMMAND_CAPACITY: usize = 64;
 
 /// How long [`PaintWorker::Drop`] waits for the worker thread to join before
@@ -47,6 +64,14 @@ pub const PAINT_WORKER_JOIN_WARN_NS: u64 = 2_000_000_000;
 /// Number of RGBA / frame slots in the per-surface triple buffer.
 pub const PAINT_WORKER_FRAME_SLOTS: usize = 3;
 
+/// Generations of per-surface damage kept for [`PaintWorker::latest_frame`].
+pub const DAMAGE_HISTORY_GENERATIONS: usize = 8;
+
+/// Host-visible stall timeout. Any remaining wait (e.g. [`PaintWorker::flush`])
+/// is bounded by this. A wedged worker yields [`WorkerError::Stalled`] so the
+/// host can fall back to the sync [`Engine`].
+pub const WORKER_STALL_TIMEOUT_NS: u64 = 100_000_000; // 100 ms
+
 /// Error surfaced from the paint worker to the host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkerError {
@@ -54,8 +79,14 @@ pub enum WorkerError {
     Panic(String),
     /// The worker has shut down (or never started).
     ShutDown,
+    /// The worker made no progress within [`WORKER_STALL_TIMEOUT_NS`].
+    /// Queued input is still held; the host may fall back to a sync [`Engine`].
+    Stalled,
     /// An engine command failed on the worker.
-    Engine(EngineError),
+    Engine {
+        surface: Option<SurfaceId>,
+        error: EngineError,
+    },
     /// Internal mailbox / protocol failure.
     Internal(String),
 }
@@ -65,7 +96,14 @@ impl std::fmt::Display for WorkerError {
         match self {
             WorkerError::Panic(msg) => write!(f, "paint worker panicked: {msg}"),
             WorkerError::ShutDown => write!(f, "paint worker is shut down"),
-            WorkerError::Engine(e) => write!(f, "paint worker engine error: {e}"),
+            WorkerError::Stalled => write!(
+                f,
+                "paint worker stalled (no progress within {WORKER_STALL_TIMEOUT_NS} ns)"
+            ),
+            WorkerError::Engine { surface, error } => match surface {
+                Some(id) => write!(f, "paint worker engine error on {id}: {error}"),
+                None => write!(f, "paint worker engine error: {error}"),
+            },
             WorkerError::Internal(msg) => write!(f, "paint worker internal error: {msg}"),
         }
     }
@@ -73,31 +111,31 @@ impl std::fmt::Display for WorkerError {
 
 impl std::error::Error for WorkerError {}
 
-impl From<EngineError> for WorkerError {
-    fn from(value: EngineError) -> Self {
-        WorkerError::Engine(value)
-    }
+fn engine_err(surface: Option<SurfaceId>, error: EngineError) -> WorkerError {
+    WorkerError::Engine { surface, error }
 }
 
 /// Owned slice + fragment snapshot the host sends to the worker.
-///
-/// The worker applies this through [`SliceSource`] / [`FragmentSource`] and
-/// never holds a live reference into the sim. Build it on the host after the
-/// sim tick has already rendered HTML for dirty sections.
 #[derive(Clone, Debug, Default)]
 pub struct SyncPacket {
-    /// Slice name → version from the published end-of-tick snapshot.
     pub versions: HashMap<String, u64>,
-    /// Reserved `actions` slice greying.
     pub actions: Vec<(String, ActionState)>,
-    /// section id → HTML body for [`FragmentSource::render`].
     pub fragments: HashMap<String, String>,
 }
 
 impl SyncPacket {
-    /// Replace `self` with `newer` (latest sync wins when coalesced).
-    pub fn merge_latest(&mut self, newer: SyncPacket) {
-        *self = newer;
+    /// Merge `newer` per slice / section (latest key wins). Used when coalescing.
+    pub fn merge_per_slice(&mut self, newer: SyncPacket) {
+        let replace_actions = newer.versions.contains_key("actions") || !newer.actions.is_empty();
+        for (k, v) in newer.versions {
+            self.versions.insert(k, v);
+        }
+        for (k, v) in newer.fragments {
+            self.fragments.insert(k, v);
+        }
+        if replace_actions {
+            self.actions = newer.actions;
+        }
     }
 }
 
@@ -120,41 +158,61 @@ impl FragmentSource for SyncPacket {
     }
 }
 
-/// One finished surface frame the host can composite.
+/// One finished surface frame held in the triple buffer.
+///
+/// Cloning this value is cheap: [`Self::output`] is an `Arc`, so only the `Arc`
+/// and small metadata are copied — not the RGBA bytes.
 #[derive(Clone, Debug)]
 pub struct WorkerFrame {
     pub surface: SurfaceId,
-    /// Shared so the host can hold the last frame without copying pixels.
     pub output: Arc<PaintOutput>,
+    /// Damage for GPU upload: this paint ∪ any earlier published frame that was
+    /// never taken by the host (may be a single full-surface rect).
+    pub publish_damage: Vec<Rect>,
     pub stats: PaintStats,
-    /// Monotonic paint generation for this surface (starts at 1).
     pub generation: u64,
-    /// Worker paint time for this frame (nanoseconds).
     pub paint_ns: u64,
+    pub width: u32,
+    pub height: u32,
+    pub full_upload: bool,
 }
 
-/// Snapshot of host-visible worker state after a command batch.
+/// Host-facing view from [`PaintWorker::latest_frame`].
+///
+/// Cloning is cheap because [`Self::output`] is an `Arc` (no RGBA copy). Use
+/// [`Self::damage`] for `write_texture`, not `output.damage` (that is only the
+/// last paint's rects).
+#[derive(Clone, Debug)]
+pub struct FrameView {
+    pub surface: SurfaceId,
+    pub output: Arc<PaintOutput>,
+    pub damage: Vec<Rect>,
+    pub generation: u64,
+    pub stats: PaintStats,
+    pub paint_ns: u64,
+    pub full_upload: bool,
+}
+
+/// Dispatched input outcome tagged with its surface.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkerOutcome {
+    pub surface: SurfaceId,
+    pub outcome: InputOutcome,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct WorkerStatus {
     pub dirty_surfaces: Vec<SurfaceId>,
     pub timings: Timings,
     pub paint_stats: PaintStats,
     pub last_dirty: DirtySet,
-    /// True when at least one surface still has a pending action.
     pub has_pending: bool,
-    /// Frames painted since the worker started.
     pub frames_painted: u64,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 enum SyncTarget {
     All,
-    Surface(SurfaceId),
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum InputTarget {
-    Default,
     Surface(SurfaceId),
 }
 
@@ -176,42 +234,34 @@ impl<T> Reply<T> {
 enum Command {
     DeclareActions {
         names: Vec<String>,
-        reply: Reply<Result<(), WorkerError>>,
     },
-    MarkTheme {
-        reply: Reply<Result<(), WorkerError>>,
-    },
+    MarkTheme,
     OpenSurface {
         id: SurfaceId,
         html: String,
         viewport: Viewport,
         opts: SurfaceOpts,
-        reply: Reply<Result<(), WorkerError>>,
     },
     CloseSurface {
         id: SurfaceId,
-        reply: Reply<Result<(), WorkerError>>,
     },
     SetVisible {
         id: SurfaceId,
         visible: bool,
-        reply: Reply<Result<(), WorkerError>>,
     },
     ResizeSurface {
         id: SurfaceId,
         viewport: Viewport,
-        reply: Reply<Result<(), WorkerError>>,
     },
     LoadHtml {
         html: String,
-        reply: Reply<Result<(), WorkerError>>,
     },
     Sync {
         target: SyncTarget,
         packet: SyncPacket,
     },
     Input {
-        target: InputTarget,
+        surface: SurfaceId,
         event: InputEvent,
     },
     Complete {
@@ -221,46 +271,82 @@ enum Command {
     Flush {
         reply: Reply<Result<(), WorkerError>>,
     },
-    /// Test-only: panic on the worker after the mailbox accepts the command.
     TestPanic,
+    /// Test-only: park until `release` is true (stall detection).
+    TestHold {
+        release: Arc<AtomicBool>,
+    },
     Shutdown,
 }
 
-fn sync_target_of(cmd: &Command) -> Option<SyncTarget> {
+fn is_discrete_input(ev: &InputEvent) -> bool {
+    !matches!(ev, InputEvent::PointerMove { .. })
+}
+
+fn is_discrete_cmd(cmd: &Command) -> bool {
     match cmd {
-        Command::Sync { target, .. } => Some(*target),
-        _ => None,
+        Command::Input { event, .. } => is_discrete_input(event),
+        // Close / open end a surface "run": control coalescing must not cross them.
+        Command::Complete { .. }
+        | Command::Flush { .. }
+        | Command::DeclareActions { .. }
+        | Command::OpenSurface { .. }
+        | Command::CloseSurface { .. }
+        | Command::LoadHtml { .. }
+        | Command::TestPanic
+        | Command::TestHold { .. }
+        | Command::Shutdown => true,
+        _ => false,
     }
 }
 
-fn is_input(cmd: &Command) -> bool {
-    matches!(cmd, Command::Input { .. })
+fn union_damage(rects: Vec<Rect>, width: u32, height: u32) -> (Vec<Rect>, bool) {
+    let int_rects: Vec<IntRect> = rects
+        .into_iter()
+        .map(|r| IntRect {
+            x: r.x.floor() as i32,
+            y: r.y.floor() as i32,
+            w: r.width.ceil() as i32,
+            h: r.height.ceil() as i32,
+        })
+        .map(|r| r.clamp_to_surface(width, height))
+        .collect();
+    let plan = merge_damage_rects(int_rects, width, height);
+    let full_upload = plan.full_repaint
+        || plan.full_repaint_area_fallback
+        || (plan.merged_to_bbox && plan.rects.len() == 1);
+    (
+        plan.rects.iter().map(|r| r.to_rect()).collect(),
+        full_upload,
+    )
 }
 
-/// Bounded mailbox: input is never dropped; same-target syncs coalesce when no
-/// input sits between them.
+/// Non-blocking mailbox: coalesces syncs / moves / controls; never drops
+/// discrete input or `complete`. Never waits on `not_full`.
 struct Mailbox {
     inner: Mutex<MailboxInner>,
     not_empty: Condvar,
-    not_full: Condvar,
+    discrete_over_cap: AtomicU64,
 }
 
 struct MailboxInner {
     queue: VecDeque<Command>,
-    capacity: usize,
     closed: bool,
+    /// Primary/secondary/middle buttons currently down per surface. While > 0,
+    /// PointerMove is not coalesced (drag keeps every move).
+    buttons_down: HashMap<SurfaceId, u8>,
 }
 
 impl Mailbox {
-    fn new(capacity: usize) -> Self {
+    fn new() -> Self {
         Self {
             inner: Mutex::new(MailboxInner {
-                queue: VecDeque::with_capacity(capacity),
-                capacity,
+                queue: VecDeque::new(),
                 closed: false,
+                buttons_down: HashMap::new(),
             }),
             not_empty: Condvar::new(),
-            not_full: Condvar::new(),
+            discrete_over_cap: AtomicU64::new(0),
         }
     }
 
@@ -268,69 +354,244 @@ impl Mailbox {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.closed = true;
         self.not_empty.notify_all();
-        self.not_full.notify_all();
     }
 
-    /// Enqueue a sync: replace an existing same-target sync if one sits after
-    /// the last input; otherwise push (waiting when the mailbox is full).
-    fn push_sync(&self, target: SyncTarget, packet: SyncPacket) -> Result<(), WorkerError> {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        loop {
-            if g.closed {
-                return Err(WorkerError::ShutDown);
-            }
-            let mut replace_at: Option<usize> = None;
-            for (idx, cmd) in g.queue.iter().enumerate().rev() {
-                if is_input(cmd) {
-                    break;
-                }
-                if sync_target_of(cmd) == Some(target) {
-                    replace_at = Some(idx);
-                    break;
-                }
-            }
-            if let Some(idx) = replace_at {
-                if let Some(Command::Sync {
-                    packet: slot,
-                    target: t,
-                }) = g.queue.get_mut(idx)
-                {
-                    debug_assert_eq!(*t, target);
-                    slot.merge_latest(packet);
-                }
-                return Ok(());
-            }
-            if g.queue.len() < g.capacity {
-                g.queue.push_back(Command::Sync { target, packet });
-                self.not_empty.notify_one();
-                return Ok(());
-            }
-            g = self.not_full.wait(g).unwrap_or_else(|e| e.into_inner());
-        }
-    }
-
-    /// Enqueue any non-sync command. Waits when full so input is never dropped.
-    fn push(&self, cmd: Command) -> Result<(), WorkerError> {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        loop {
-            if g.closed {
-                return Err(WorkerError::ShutDown);
-            }
-            if g.queue.len() < g.capacity {
-                g.queue.push_back(cmd);
-                self.not_empty.notify_one();
-                return Ok(());
-            }
-            g = self.not_full.wait(g).unwrap_or_else(|e| e.into_inner());
-        }
-    }
-
-    fn try_push_front_shutdown(&self) {
+    fn push_front_shutdown(&self) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.closed = true;
         g.queue.push_front(Command::Shutdown);
         self.not_empty.notify_all();
-        self.not_full.notify_all();
+    }
+
+    fn push_sync(&self, target: SyncTarget, packet: SyncPacket) -> Result<(), WorkerError> {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.closed {
+            return Err(WorkerError::ShutDown);
+        }
+        let mut replace_at = None;
+        for (idx, cmd) in g.queue.iter().enumerate().rev() {
+            if is_discrete_cmd(cmd) {
+                break;
+            }
+            if matches!(cmd, Command::Sync { target: t, .. } if *t == target) {
+                replace_at = Some(idx);
+                break;
+            }
+        }
+        if let Some(idx) = replace_at {
+            if let Some(Command::Sync { packet: slot, .. }) = g.queue.get_mut(idx) {
+                slot.merge_per_slice(packet);
+            }
+        } else {
+            g.queue.push_back(Command::Sync { target, packet });
+            self.not_empty.notify_one();
+        }
+        Ok(())
+    }
+
+    fn push_pointer_move(&self, surface: SurfaceId, event: InputEvent) -> Result<(), WorkerError> {
+        debug_assert!(matches!(event, InputEvent::PointerMove { .. }));
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.closed {
+            return Err(WorkerError::ShutDown);
+        }
+        // While a button is held, keep every move (drag). Surviving coalesced
+        // moves keep their own modifiers from the latest event.
+        if g.buttons_down.get(&surface).copied().unwrap_or(0) > 0 {
+            drop(g);
+            return self.push_discrete(Command::Input { surface, event });
+        }
+        let mut replace_at = None;
+        for (idx, cmd) in g.queue.iter().enumerate().rev() {
+            if is_discrete_cmd(cmd) {
+                break;
+            }
+            if matches!(
+                cmd,
+                Command::Input {
+                    surface: s,
+                    event: InputEvent::PointerMove { .. }
+                } if *s == surface
+            ) {
+                replace_at = Some(idx);
+                break;
+            }
+        }
+        if let Some(idx) = replace_at {
+            if let Some(Command::Input { event: slot, .. }) = g.queue.get_mut(idx) {
+                *slot = event;
+            }
+        } else {
+            g.queue.push_back(Command::Input { surface, event });
+            self.not_empty.notify_one();
+        }
+        Ok(())
+    }
+
+    fn push_set_visible(&self, id: SurfaceId, visible: bool) -> Result<(), WorkerError> {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.closed {
+            return Err(WorkerError::ShutDown);
+        }
+        let mut replace_at = None;
+        for (idx, cmd) in g.queue.iter().enumerate().rev() {
+            if is_discrete_cmd(cmd) {
+                break;
+            }
+            if matches!(cmd, Command::SetVisible { id: s, .. } if *s == id) {
+                replace_at = Some(idx);
+                break;
+            }
+        }
+        if let Some(idx) = replace_at {
+            if let Some(Command::SetVisible { visible: slot, .. }) = g.queue.get_mut(idx) {
+                *slot = visible;
+            }
+        } else {
+            g.queue.push_back(Command::SetVisible { id, visible });
+            self.not_empty.notify_one();
+        }
+        Ok(())
+    }
+
+    fn push_resize(&self, id: SurfaceId, viewport: Viewport) -> Result<(), WorkerError> {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.closed {
+            return Err(WorkerError::ShutDown);
+        }
+        let mut replace_at = None;
+        for (idx, cmd) in g.queue.iter().enumerate().rev() {
+            if is_discrete_cmd(cmd) {
+                break;
+            }
+            if matches!(cmd, Command::ResizeSurface { id: s, .. } if *s == id) {
+                replace_at = Some(idx);
+                break;
+            }
+        }
+        if let Some(idx) = replace_at {
+            if let Some(Command::ResizeSurface { viewport: slot, .. }) = g.queue.get_mut(idx) {
+                *slot = viewport;
+            }
+        } else {
+            g.queue.push_back(Command::ResizeSurface { id, viewport });
+            self.not_empty.notify_one();
+        }
+        Ok(())
+    }
+
+    fn push_close(&self, id: SurfaceId) -> Result<(), WorkerError> {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.closed {
+            return Err(WorkerError::ShutDown);
+        }
+        // Drop coalescable controls / syncs for this surface since the last barrier.
+        let mut keep = VecDeque::new();
+        let mut stripping = true;
+        while let Some(cmd) = g.queue.pop_back() {
+            if stripping && is_discrete_cmd(&cmd) {
+                stripping = false;
+                keep.push_front(cmd);
+                continue;
+            }
+            if stripping {
+                let drop_it = match &cmd {
+                    Command::SetVisible { id: s, .. }
+                    | Command::ResizeSurface { id: s, .. }
+                    | Command::CloseSurface { id: s } => *s == id,
+                    Command::Sync {
+                        target: SyncTarget::Surface(s),
+                        ..
+                    } => *s == id,
+                    Command::Input {
+                        surface: s,
+                        event: InputEvent::PointerMove { .. },
+                    } => *s == id,
+                    _ => false,
+                };
+                if drop_it {
+                    continue;
+                }
+            }
+            keep.push_front(cmd);
+        }
+        g.queue = keep;
+        g.buttons_down.remove(&id);
+        g.queue.push_back(Command::CloseSurface { id });
+        self.not_empty.notify_one();
+        Ok(())
+    }
+
+    fn push_mark_theme(&self) -> Result<(), WorkerError> {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.closed {
+            return Err(WorkerError::ShutDown);
+        }
+        let mut replace_at = None;
+        for (idx, cmd) in g.queue.iter().enumerate().rev() {
+            if is_discrete_cmd(cmd) {
+                break;
+            }
+            if matches!(cmd, Command::MarkTheme) {
+                replace_at = Some(idx);
+                break;
+            }
+        }
+        if replace_at.is_none() {
+            g.queue.push_back(Command::MarkTheme);
+            self.not_empty.notify_one();
+        }
+        Ok(())
+    }
+
+    fn push_discrete(&self, cmd: Command) -> Result<(), WorkerError> {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.closed {
+            return Err(WorkerError::ShutDown);
+        }
+        // Track button press state for drag-aware move coalescing.
+        if let Command::Input { surface, event } = &cmd {
+            match event {
+                InputEvent::PointerDown { .. } => {
+                    let n = g.buttons_down.entry(*surface).or_insert(0);
+                    *n = n.saturating_add(1);
+                }
+                InputEvent::PointerUp { .. } => {
+                    if let Some(n) = g.buttons_down.get_mut(surface) {
+                        *n = n.saturating_sub(1);
+                        if *n == 0 {
+                            g.buttons_down.remove(surface);
+                        }
+                    }
+                }
+                InputEvent::PointerLeave => {
+                    g.buttons_down.remove(surface);
+                }
+                _ => {}
+            }
+        }
+        if let Command::OpenSurface { id, .. } = &cmd {
+            g.buttons_down.remove(id);
+        }
+
+        let discrete_len = g.queue.iter().filter(|c| is_discrete_cmd(c)).count();
+        if discrete_len >= PAINT_WORKER_DISCRETE_SOFT_CAP {
+            let n = self.discrete_over_cap.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n.is_multiple_of(64) {
+                eprintln!(
+                    "hx_native: discrete command queue above soft cap \
+                     {PAINT_WORKER_DISCRETE_SOFT_CAP} (count={n}); not dropping"
+                );
+            }
+        }
+        let hard = discrete_len >= PAINT_WORKER_DISCRETE_HARD_CAP;
+        g.queue.push_back(cmd);
+        self.not_empty.notify_one();
+        if hard {
+            Err(WorkerError::Stalled)
+        } else {
+            Ok(())
+        }
     }
 
     fn recv_batch(&self) -> Option<Vec<Command>> {
@@ -341,7 +602,6 @@ impl Mailbox {
                 while let Some(cmd) = g.queue.pop_front() {
                     out.push(cmd);
                 }
-                self.not_full.notify_all();
                 return Some(out);
             }
             if g.closed {
@@ -352,14 +612,34 @@ impl Mailbox {
     }
 }
 
+#[derive(Clone, Debug)]
+struct UntakenDamage {
+    rects: Vec<Rect>,
+    width: u32,
+    height: u32,
+    full: bool,
+}
+
 /// Triple buffer of finished frames for one surface (safe Rust, no `unsafe`).
 ///
-/// The mutex guards only index swaps. Pixel buffers live in the slots and are
-/// moved / `Arc`-cloned, never copied byte-by-byte on publish.
+/// Soundness comes from **each slot having its own `Mutex`**: a producer write
+/// and a consumer read never share a slot mutex, so index swaps under
+/// `indices` only decide *which* slot is published — they do not protect pixel
+/// data by themselves.
 struct TripleFrameBuffer {
     slots: [Mutex<Option<WorkerFrame>>; PAINT_WORKER_FRAME_SLOTS],
-    /// `(write_idx, published_idx)`.
     indices: Mutex<(usize, Option<usize>)>,
+    /// Damage of the last published frame if the host has not taken it yet.
+    untaken_damage: Mutex<Option<UntakenDamage>>,
+    history: Mutex<VecDeque<HistEntry>>,
+}
+
+#[derive(Clone, Debug)]
+struct HistEntry {
+    generation: u64,
+    damage: Vec<Rect>,
+    width: u32,
+    height: u32,
 }
 
 impl TripleFrameBuffer {
@@ -367,10 +647,58 @@ impl TripleFrameBuffer {
         Self {
             slots: [Mutex::new(None), Mutex::new(None), Mutex::new(None)],
             indices: Mutex::new((0, None)),
+            untaken_damage: Mutex::new(None),
+            history: Mutex::new(VecDeque::new()),
         }
     }
 
-    fn publish(&self, frame: WorkerFrame) {
+    fn publish(&self, mut frame: WorkerFrame) {
+        let paint_damage = frame.output.damage.clone();
+        let w = frame.width;
+        let h = frame.height;
+
+        // Carry forward damage from a published frame the host never took.
+        {
+            let mut untaken = self
+                .untaken_damage
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(prev) = untaken.take() {
+                if prev.full || prev.width != w || prev.height != h {
+                    frame.publish_damage = vec![IntRect::full_surface(w, h).to_rect()];
+                    frame.full_upload = true;
+                } else {
+                    let mut all = prev.rects;
+                    all.extend(paint_damage.iter().copied());
+                    let (merged, full) = union_damage(all, w, h);
+                    frame.publish_damage = merged;
+                    frame.full_upload = full;
+                }
+            } else {
+                frame.publish_damage = paint_damage.clone();
+                frame.full_upload = false;
+            }
+            *untaken = Some(UntakenDamage {
+                rects: frame.publish_damage.clone(),
+                width: w,
+                height: h,
+                full: frame.full_upload,
+            });
+        }
+
+        {
+            let mut hist = self.history.lock().unwrap_or_else(|e| e.into_inner());
+            hist.push_back(HistEntry {
+                generation: frame.generation,
+                damage: paint_damage,
+                width: w,
+                height: h,
+            });
+            while hist.len() > DAMAGE_HISTORY_GENERATIONS {
+                hist.pop_front();
+            }
+        }
+
         let mut idx = self.indices.lock().unwrap_or_else(|e| e.into_inner());
         let write = idx.0;
         {
@@ -386,7 +714,8 @@ impl TripleFrameBuffer {
         idx.1 = Some(published);
     }
 
-    fn take_latest(&self) -> Option<WorkerFrame> {
+    /// Latest published frame. Cloning is cheap (`Arc` on pixels).
+    fn latest(&self) -> Option<WorkerFrame> {
         let published = {
             let idx = self.indices.lock().unwrap_or_else(|e| e.into_inner());
             idx.1?
@@ -396,22 +725,76 @@ impl TripleFrameBuffer {
             .unwrap_or_else(|e| e.into_inner());
         slot.clone()
     }
+
+    fn mark_taken(&self) {
+        let mut untaken = self
+            .untaken_damage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *untaken = None;
+    }
+
+    fn damage_since(&self, since_generation: u64, latest: &WorkerFrame) -> (Vec<Rect>, bool) {
+        if since_generation >= latest.generation {
+            return (Vec::new(), false);
+        }
+        let hist = self.history.lock().unwrap_or_else(|e| e.into_inner());
+        let needed_from = since_generation.saturating_add(1);
+        let oldest = hist.front().map(|e| e.generation);
+        if oldest.is_none_or(|o| o > needed_from) {
+            return (
+                vec![IntRect::full_surface(latest.width, latest.height).to_rect()],
+                true,
+            );
+        }
+        if latest.full_upload {
+            return (
+                vec![IntRect::full_surface(latest.width, latest.height).to_rect()],
+                true,
+            );
+        }
+        let mut rects = Vec::new();
+        let mut seen = 0u64;
+        for e in hist.iter() {
+            if e.generation < needed_from || e.generation > latest.generation {
+                continue;
+            }
+            if e.width != latest.width || e.height != latest.height {
+                return (
+                    vec![IntRect::full_surface(latest.width, latest.height).to_rect()],
+                    true,
+                );
+            }
+            seen += 1;
+            rects.extend(e.damage.iter().copied());
+        }
+        let expected = latest.generation.saturating_sub(since_generation);
+        if seen < expected {
+            return (
+                vec![IntRect::full_surface(latest.width, latest.height).to_rect()],
+                true,
+            );
+        }
+        union_damage(rects, latest.width, latest.height)
+    }
 }
 
 struct SharedState {
     frames: Mutex<HashMap<SurfaceId, Arc<TripleFrameBuffer>>>,
-    outcomes: Mutex<Vec<InputOutcome>>,
+    outcomes: Mutex<Vec<WorkerOutcome>>,
     status: Mutex<WorkerStatus>,
     error: Mutex<Option<WorkerError>>,
-    /// Generation counter for input→frame latency (host increments on input).
     input_seq: AtomicU64,
-    /// Last published frame's observed `input_seq`.
     frame_input_seq: AtomicU64,
+    /// Nanoseconds (Instant::now relative) of last worker progress.
+    last_progress_ns: AtomicU64,
+    progress_epoch: Instant,
     busy: AtomicBool,
 }
 
 impl SharedState {
     fn new() -> Self {
+        let epoch = Instant::now();
         Self {
             frames: Mutex::new(HashMap::new()),
             outcomes: Mutex::new(Vec::new()),
@@ -419,8 +802,21 @@ impl SharedState {
             error: Mutex::new(None),
             input_seq: AtomicU64::new(0),
             frame_input_seq: AtomicU64::new(0),
+            last_progress_ns: AtomicU64::new(0),
+            progress_epoch: epoch,
             busy: AtomicBool::new(false),
         }
+    }
+
+    fn bump_progress(&self) {
+        let ns = self.progress_epoch.elapsed().as_nanos() as u64;
+        self.last_progress_ns.store(ns, Ordering::SeqCst);
+    }
+
+    fn is_stalled(&self) -> bool {
+        let last = self.last_progress_ns.load(Ordering::SeqCst);
+        let now = self.progress_epoch.elapsed().as_nanos() as u64;
+        now.saturating_sub(last) > WORKER_STALL_TIMEOUT_NS
     }
 
     fn buffer_for(&self, id: SurfaceId) -> Arc<TripleFrameBuffer> {
@@ -430,22 +826,18 @@ impl SharedState {
             .clone()
     }
 
-    fn take_frame(&self, id: SurfaceId) -> Option<WorkerFrame> {
-        let map = self.frames.lock().unwrap_or_else(|e| e.into_inner());
-        map.get(&id)?.take_latest()
-    }
-
     fn set_error(&self, err: WorkerError) {
         let mut g = self.error.lock().unwrap_or_else(|e| e.into_inner());
-        if g.is_none() {
-            *g = Some(err);
+        // Prefer Panic / Stalled over quieter engine errors once set.
+        match (&*g, &err) {
+            (Some(WorkerError::Panic(_)), _) => {}
+            (Some(WorkerError::Stalled), WorkerError::Engine { .. }) => {}
+            _ => *g = Some(err),
         }
     }
 }
 
-/// Host-side handle for a background paint thread.
-///
-/// `Send` and `Sync`. Drop joins the worker cleanly.
+/// Host-side handle for a background paint thread (`Send` + `Sync`).
 pub struct PaintWorker {
     mailbox: Arc<Mailbox>,
     shared: Arc<SharedState>,
@@ -458,7 +850,8 @@ const _: () = {
         assert_send_sync::<PaintWorker>();
         assert_send_sync::<SyncPacket>();
         assert_send_sync::<WorkerFrame>();
-        assert_send_sync::<WorkerStatus>();
+        assert_send_sync::<FrameView>();
+        assert_send_sync::<WorkerOutcome>();
         assert_send_sync::<WorkerError>();
     }
     let _ = check;
@@ -467,8 +860,9 @@ const _: () = {
 impl PaintWorker {
     /// Spawn a worker thread that creates and owns the [`Engine`].
     pub fn spawn(config: EngineConfig) -> Self {
-        let mailbox = Arc::new(Mailbox::new(PAINT_WORKER_COMMAND_CAPACITY));
+        let mailbox = Arc::new(Mailbox::new());
         let shared = Arc::new(SharedState::new());
+        shared.bump_progress();
         let mb = Arc::clone(&mailbox);
         let sh = Arc::clone(&shared);
         let join = thread::Builder::new()
@@ -482,19 +876,38 @@ impl PaintWorker {
         }
     }
 
+    /// After a successful enqueue, surface a stall so the host can fall back.
+    /// Input remains queued.
+    fn check_stall_after_enqueue(
+        &self,
+        enqueued: Result<(), WorkerError>,
+    ) -> Result<(), WorkerError> {
+        if let Err(WorkerError::Stalled) = enqueued {
+            self.shared.set_error(WorkerError::Stalled);
+            return enqueued;
+        }
+        enqueued?;
+        if let Some(err @ WorkerError::Panic(_)) = self.poll_error() {
+            return Err(err);
+        }
+        if self.shared.is_stalled() {
+            let err = WorkerError::Stalled;
+            self.shared.set_error(err.clone());
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Fire-and-forget. Engine failures appear in [`Self::poll_error`] with a
+    /// [`SurfaceId`] when known.
     pub fn declare_actions(&self, names: &[&str]) -> Result<(), WorkerError> {
-        let (tx, rx) = mpsc::sync_channel(1);
-        self.mailbox.push(Command::DeclareActions {
+        self.check_stall_after_enqueue(self.mailbox.push_discrete(Command::DeclareActions {
             names: names.iter().map(|s| (*s).to_string()).collect(),
-            reply: Reply(tx),
-        })?;
-        rx.recv().map_err(|_| WorkerError::ShutDown)?
+        }))
     }
 
     pub fn mark_theme_or_stylesheet_changed(&self) -> Result<(), WorkerError> {
-        let (tx, rx) = mpsc::sync_channel(1);
-        self.mailbox.push(Command::MarkTheme { reply: Reply(tx) })?;
-        rx.recv().map_err(|_| WorkerError::ShutDown)?
+        self.check_stall_after_enqueue(self.mailbox.push_mark_theme())
     }
 
     pub fn open_surface(
@@ -504,83 +917,53 @@ impl PaintWorker {
         viewport: Viewport,
         opts: SurfaceOpts,
     ) -> Result<(), WorkerError> {
-        let (tx, rx) = mpsc::sync_channel(1);
-        self.mailbox.push(Command::OpenSurface {
+        self.check_stall_after_enqueue(self.mailbox.push_discrete(Command::OpenSurface {
             id,
             html: html.to_string(),
             viewport,
             opts,
-            reply: Reply(tx),
-        })?;
-        rx.recv().map_err(|_| WorkerError::ShutDown)?
+        }))
     }
 
     pub fn close_surface(&self, id: SurfaceId) -> Result<(), WorkerError> {
-        let (tx, rx) = mpsc::sync_channel(1);
-        self.mailbox.push(Command::CloseSurface {
-            id,
-            reply: Reply(tx),
-        })?;
-        rx.recv().map_err(|_| WorkerError::ShutDown)?
+        self.check_stall_after_enqueue(self.mailbox.push_close(id))
     }
 
     pub fn set_visible(&self, id: SurfaceId, visible: bool) -> Result<(), WorkerError> {
-        let (tx, rx) = mpsc::sync_channel(1);
-        self.mailbox.push(Command::SetVisible {
-            id,
-            visible,
-            reply: Reply(tx),
-        })?;
-        rx.recv().map_err(|_| WorkerError::ShutDown)?
+        self.check_stall_after_enqueue(self.mailbox.push_set_visible(id, visible))
     }
 
     pub fn resize_surface(&self, id: SurfaceId, viewport: Viewport) -> Result<(), WorkerError> {
-        let (tx, rx) = mpsc::sync_channel(1);
-        self.mailbox.push(Command::ResizeSurface {
-            id,
-            viewport,
-            reply: Reply(tx),
-        })?;
-        rx.recv().map_err(|_| WorkerError::ShutDown)?
+        self.check_stall_after_enqueue(self.mailbox.push_resize(id, viewport))
     }
 
     pub fn load_html(&self, html: &str) -> Result<(), WorkerError> {
-        let (tx, rx) = mpsc::sync_channel(1);
-        self.mailbox.push(Command::LoadHtml {
+        self.check_stall_after_enqueue(self.mailbox.push_discrete(Command::LoadHtml {
             html: html.to_string(),
-            reply: Reply(tx),
-        })?;
-        rx.recv().map_err(|_| WorkerError::ShutDown)?
+        }))
     }
 
-    /// Enqueue a sync for every live surface. May coalesce with a prior pending
-    /// all-surface sync when no input sits between them.
     pub fn sync(&self, packet: SyncPacket) -> Result<(), WorkerError> {
-        self.mailbox.push_sync(SyncTarget::All, packet)
+        self.check_stall_after_enqueue(self.mailbox.push_sync(SyncTarget::All, packet))
     }
 
-    /// Enqueue a sync for one surface. May coalesce with a prior pending sync
-    /// for the same surface when no input sits between them.
     pub fn sync_surface(&self, id: SurfaceId, packet: SyncPacket) -> Result<(), WorkerError> {
-        self.mailbox.push_sync(SyncTarget::Surface(id), packet)
+        self.check_stall_after_enqueue(self.mailbox.push_sync(SyncTarget::Surface(id), packet))
     }
 
-    /// Enqueue input for the default surface. Never dropped.
     pub fn input(&self, event: InputEvent) -> Result<(), WorkerError> {
-        self.shared.input_seq.fetch_add(1, Ordering::SeqCst);
-        self.mailbox.push(Command::Input {
-            target: InputTarget::Default,
-            event,
-        })
+        self.input_surface(SurfaceId::DEFAULT, event)
     }
 
-    /// Enqueue input for one surface. Never dropped.
     pub fn input_surface(&self, id: SurfaceId, event: InputEvent) -> Result<(), WorkerError> {
         self.shared.input_seq.fetch_add(1, Ordering::SeqCst);
-        self.mailbox.push(Command::Input {
-            target: InputTarget::Surface(id),
-            event,
-        })
+        let r = if matches!(event, InputEvent::PointerMove { .. }) {
+            self.mailbox.push_pointer_move(id, event)
+        } else {
+            self.mailbox
+                .push_discrete(Command::Input { surface: id, event })
+        };
+        self.check_stall_after_enqueue(r)
     }
 
     pub fn complete(
@@ -588,28 +971,64 @@ impl PaintWorker {
         request: RequestId,
         result: Result<(), Reason>,
     ) -> Result<(), WorkerError> {
-        self.mailbox.push(Command::Complete { request, result })
+        self.check_stall_after_enqueue(
+            self.mailbox
+                .push_discrete(Command::Complete { request, result }),
+        )
     }
 
-    /// Wait until the worker has drained every command queued before this call
-    /// and painted dirty surfaces. Used by tests and setup code.
+    /// Wait until commands queued before this call are applied and dirty
+    /// surfaces painted. Bound by [`WORKER_STALL_TIMEOUT_NS`].
     pub fn flush(&self) -> Result<(), WorkerError> {
         if let Some(err) = self.poll_error() {
             return Err(err);
         }
         let (tx, rx) = mpsc::sync_channel(1);
-        self.mailbox.push(Command::Flush { reply: Reply(tx) })?;
-        rx.recv().map_err(|_| WorkerError::ShutDown)?
+        self.mailbox
+            .push_discrete(Command::Flush { reply: Reply(tx) })?;
+        match rx.recv_timeout(Duration::from_nanos(WORKER_STALL_TIMEOUT_NS)) {
+            Ok(r) => r,
+            Err(RecvTimeoutError::Timeout) => {
+                let err = WorkerError::Stalled;
+                self.shared.set_error(err.clone());
+                Err(err)
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                if let Some(err) = self.poll_error() {
+                    Err(err)
+                } else {
+                    Err(WorkerError::ShutDown)
+                }
+            }
+        }
     }
 
-    /// Last finished frame for `id`, if the worker has published one. Never waits
-    /// on paint.
-    pub fn take_frame(&self, id: SurfaceId) -> Option<WorkerFrame> {
-        self.shared.take_frame(id)
+    /// Latest finished frame for `id`, with damage union since `since_generation`.
+    ///
+    /// Returns `None` if nothing has been published yet. Cloning the returned
+    /// [`FrameView`] is cheap because [`FrameView::output`] is an `Arc` — the
+    /// RGBA buffer is not copied. Marks the frame taken so the next publish
+    /// does not carry this damage forward again.
+    pub fn latest_frame(&self, id: SurfaceId, since_generation: u64) -> Option<FrameView> {
+        let buf = {
+            let map = self.shared.frames.lock().unwrap_or_else(|e| e.into_inner());
+            map.get(&id)?.clone()
+        };
+        let latest = buf.latest()?;
+        let (damage, full) = buf.damage_since(since_generation, &latest);
+        buf.mark_taken();
+        Some(FrameView {
+            surface: latest.surface,
+            output: latest.output,
+            damage,
+            generation: latest.generation,
+            stats: latest.stats,
+            paint_ns: latest.paint_ns,
+            full_upload: full || latest.full_upload,
+        })
     }
 
-    /// Drain dispatched input outcomes (actions, blocked, …) since the last poll.
-    pub fn poll_outcomes(&self) -> Vec<InputOutcome> {
+    pub fn poll_outcomes(&self) -> Vec<WorkerOutcome> {
         let mut g = self
             .shared
             .outcomes
@@ -626,7 +1045,6 @@ impl PaintWorker {
             .clone()
     }
 
-    /// Worker panic or fatal error, if any. The last finished frames stay available.
     pub fn poll_error(&self) -> Option<WorkerError> {
         self.shared
             .error
@@ -635,7 +1053,6 @@ impl PaintWorker {
             .clone()
     }
 
-    /// Input sequence number observed by the most recently published paint.
     pub fn last_frame_input_seq(&self) -> u64 {
         self.shared.frame_input_seq.load(Ordering::SeqCst)
     }
@@ -644,15 +1061,23 @@ impl PaintWorker {
         self.shared.input_seq.load(Ordering::SeqCst)
     }
 
-    /// Test-only: ask the worker to panic. Last finished frames stay available.
+    pub fn discrete_over_cap_count(&self) -> u64 {
+        self.mailbox.discrete_over_cap.load(Ordering::Relaxed)
+    }
+
     pub fn inject_panic_for_test(&self) -> Result<(), WorkerError> {
-        self.mailbox.push(Command::TestPanic)
+        self.mailbox.push_discrete(Command::TestPanic)
+    }
+
+    /// Test-only: park the worker until `release` is set true.
+    pub fn inject_hold_for_test(&self, release: Arc<AtomicBool>) -> Result<(), WorkerError> {
+        self.mailbox.push_discrete(Command::TestHold { release })
     }
 }
 
 impl Drop for PaintWorker {
     fn drop(&mut self) {
-        self.mailbox.try_push_front_shutdown();
+        self.mailbox.push_front_shutdown();
         if let Some(handle) = self.join.take() {
             let t0 = Instant::now();
             let _ = handle.join();
@@ -671,8 +1096,10 @@ fn worker_main(config: EngineConfig, mailbox: Arc<Mailbox>, shared: Arc<SharedSt
     let result = catch_unwind(AssertUnwindSafe(|| {
         let mut eng = Engine::new(config);
         let mut generations: HashMap<SurfaceId, u64> = HashMap::new();
+        shared.bump_progress();
         while let Some(batch) = mailbox.recv_batch() {
             shared.busy.store(true, Ordering::SeqCst);
+            shared.bump_progress();
             let mut stop = false;
             let mut flush_replies: Vec<Reply<Result<(), WorkerError>>> = Vec::new();
             for cmd in batch {
@@ -681,7 +1108,7 @@ fn worker_main(config: EngineConfig, mailbox: Arc<Mailbox>, shared: Arc<SharedSt
                         stop = true;
                         break;
                     }
-                    Ok(false) => {}
+                    Ok(false) => shared.bump_progress(),
                     Err(err) => {
                         shared.set_error(err.clone());
                         for reply in flush_replies.drain(..) {
@@ -699,6 +1126,7 @@ fn worker_main(config: EngineConfig, mailbox: Arc<Mailbox>, shared: Arc<SharedSt
             }
             let paint_result = paint_dirty(&mut eng, &shared, &mut generations);
             refresh_status(&eng, &shared);
+            shared.bump_progress();
             match paint_result {
                 Ok(()) => {
                     for reply in flush_replies.drain(..) {
@@ -716,8 +1144,7 @@ fn worker_main(config: EngineConfig, mailbox: Arc<Mailbox>, shared: Arc<SharedSt
         }
     }));
     if let Err(payload) = result {
-        let msg = panic_message(&payload);
-        shared.set_error(WorkerError::Panic(msg));
+        shared.set_error(WorkerError::Panic(panic_message(&payload)));
     }
     mailbox.close();
 }
@@ -732,7 +1159,6 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-/// Returns Ok(true) when the worker should shut down.
 fn process_command(
     eng: &mut Engine,
     cmd: Command,
@@ -740,15 +1166,13 @@ fn process_command(
     flush_replies: &mut Vec<Reply<Result<(), WorkerError>>>,
 ) -> Result<bool, WorkerError> {
     match cmd {
-        Command::DeclareActions { names, reply } => {
+        Command::DeclareActions { names } => {
             let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
             eng.declare_actions(&refs);
-            reply.send(Ok(()));
             Ok(false)
         }
-        Command::MarkTheme { reply } => {
+        Command::MarkTheme => {
             eng.mark_theme_or_stylesheet_changed();
-            reply.send(Ok(()));
             Ok(false)
         }
         Command::OpenSurface {
@@ -756,60 +1180,65 @@ fn process_command(
             html,
             viewport,
             opts,
-            reply,
         } => {
-            reply.send(
-                eng.open_surface(id, &html, viewport, opts)
-                    .map_err(Into::into),
-            );
+            if let Err(e) = eng.open_surface(id, &html, viewport, opts) {
+                shared.set_error(engine_err(Some(id), e));
+            }
             Ok(false)
         }
-        Command::CloseSurface { id, reply } => {
-            reply.send(eng.close_surface(id).map_err(Into::into));
+        Command::CloseSurface { id } => {
+            if let Err(e) = eng.close_surface(id) {
+                shared.set_error(engine_err(Some(id), e));
+            }
             Ok(false)
         }
-        Command::SetVisible { id, visible, reply } => {
-            reply.send(eng.set_visible(id, visible).map_err(Into::into));
+        Command::SetVisible { id, visible } => {
+            if let Err(e) = eng.set_visible(id, visible) {
+                shared.set_error(engine_err(Some(id), e));
+            }
             Ok(false)
         }
-        Command::ResizeSurface {
-            id,
-            viewport,
-            reply,
-        } => {
-            reply.send(eng.resize_surface(id, viewport).map_err(Into::into));
+        Command::ResizeSurface { id, viewport } => {
+            if let Err(e) = eng.resize_surface(id, viewport) {
+                shared.set_error(engine_err(Some(id), e));
+            }
             Ok(false)
         }
-        Command::LoadHtml { html, reply } => {
-            reply.send(eng.load_html(&html).map_err(Into::into));
+        Command::LoadHtml { html } => {
+            if let Err(e) = eng.load_html(&html) {
+                shared.set_error(engine_err(Some(SurfaceId::DEFAULT), e));
+            }
             Ok(false)
         }
         Command::Sync { target, packet } => {
             let slices = packet.clone();
             let mut frags = packet;
             let dirty = match target {
-                SyncTarget::All => eng.sync(&slices, &mut frags)?,
-                SyncTarget::Surface(id) => eng.sync_surface(id, &slices, &mut frags)?,
+                SyncTarget::All => eng
+                    .sync(&slices, &mut frags)
+                    .map_err(|e| engine_err(None, e))?,
+                SyncTarget::Surface(id) => eng
+                    .sync_surface(id, &slices, &mut frags)
+                    .map_err(|e| engine_err(Some(id), e))?,
             };
             let mut st = shared.status.lock().unwrap_or_else(|e| e.into_inner());
             st.last_dirty = dirty;
             Ok(false)
         }
-        Command::Input { target, event } => {
-            let outcome = match target {
-                InputTarget::Default => eng.input(event),
-                InputTarget::Surface(id) => eng.input_surface(id, event),
-            };
-            push_outcome(shared, outcome);
-            for o in eng.take_outcomes() {
-                push_outcome(shared, o);
+        Command::Input { surface, event } => {
+            let outcome = eng.input_surface(surface, event);
+            push_outcome(shared, surface, outcome);
+            for o in eng.take_surface_outcomes(surface) {
+                push_outcome(shared, surface, o);
             }
             Ok(false)
         }
         Command::Complete { request, result } => {
             eng.complete(request, result);
-            for o in eng.take_outcomes() {
-                push_outcome(shared, o);
+            for id in eng.surface_ids() {
+                for o in eng.take_surface_outcomes(id) {
+                    push_outcome(shared, id, o);
+                }
             }
             Ok(false)
         }
@@ -820,11 +1249,17 @@ fn process_command(
         Command::TestPanic => {
             panic!("hx_native paint worker test panic");
         }
+        Command::TestHold { release } => {
+            while !release.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Ok(false)
+        }
         Command::Shutdown => Ok(true),
     }
 }
 
-fn push_outcome(shared: &SharedState, outcome: InputOutcome) {
+fn push_outcome(shared: &SharedState, surface: SurfaceId, outcome: InputOutcome) {
     if matches!(outcome, InputOutcome::None) {
         return;
     }
@@ -832,7 +1267,7 @@ fn push_outcome(shared: &SharedState, outcome: InputOutcome) {
         .outcomes
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push(outcome);
+        .push(WorkerOutcome { surface, outcome });
 }
 
 fn paint_dirty(
@@ -844,12 +1279,16 @@ fn paint_dirty(
     let dirty = eng.dirty_surfaces();
     for id in dirty {
         let t0 = Instant::now();
-        let output = eng.paint_surface(id)?;
+        let output = eng.paint_surface(id).map_err(|e| engine_err(Some(id), e))?;
         let paint_ns = t0.elapsed().as_nanos() as u64;
         let stats = eng.last_paint_stats();
         if output.skipped && output.rgba.is_none() && output.damage.is_empty() {
             continue;
         }
+        let (width, height) = match &output.rgba {
+            Some(img) => (img.width, img.height),
+            None => continue,
+        };
         let gen = {
             let entry = generations.entry(id).or_insert(0);
             *entry = entry.saturating_add(1);
@@ -858,9 +1297,13 @@ fn paint_dirty(
         let frame = WorkerFrame {
             surface: id,
             output: Arc::new(output),
+            publish_damage: Vec::new(),
             stats: stats.clone(),
             generation: gen,
             paint_ns,
+            width,
+            height,
+            full_upload: false,
         };
         shared.buffer_for(id).publish(frame);
         shared.frame_input_seq.store(input_seq, Ordering::SeqCst);
@@ -868,9 +1311,12 @@ fn paint_dirty(
         st.frames_painted = st.frames_painted.saturating_add(1);
         st.paint_stats = stats;
         st.timings = eng.last_timings();
+        shared.bump_progress();
     }
-    for o in eng.take_outcomes() {
-        push_outcome(shared, o);
+    for id in eng.surface_ids() {
+        for o in eng.take_surface_outcomes(id) {
+            push_outcome(shared, id, o);
+        }
     }
     Ok(())
 }
@@ -886,7 +1332,6 @@ fn refresh_status(eng: &Engine, shared: &SharedState) {
 #[cfg(test)]
 mod mailbox_and_buffer_tests {
     use super::*;
-    use std::time::Duration;
 
     fn pkt(tag: &str) -> SyncPacket {
         let mut fragments = HashMap::new();
@@ -898,117 +1343,317 @@ mod mailbox_and_buffer_tests {
         }
     }
 
-    #[test]
-    fn triple_buffer_fast_producer_slow_consumer() {
-        let buf = TripleFrameBuffer::new();
-        let make = |gen: u64| WorkerFrame {
+    fn make_frame(gen: u64, damage: Vec<Rect>) -> WorkerFrame {
+        WorkerFrame {
             surface: SurfaceId::DEFAULT,
             output: Arc::new(PaintOutput {
                 rgba: Some(RgbaImage {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![gen as u8, 0, 0, 255],
+                    width: 4,
+                    height: 4,
+                    pixels: vec![gen as u8; 4 * 4 * 4],
                 }),
                 texture: None,
                 focus: FocusState::default(),
                 skipped: false,
-                damage: vec![Rect {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 1.0,
-                    height: 1.0,
-                }],
+                damage: damage.clone(),
             }),
+            publish_damage: damage,
             stats: PaintStats::default(),
             generation: gen,
             paint_ns: 0,
-        };
-
-        let mut last = 0u64;
-        for gen in 1..=100u64 {
-            buf.publish(make(gen));
-            if gen % 7 == 0 {
-                let frame = buf.take_latest().expect("frame");
-                assert!(frame.generation >= last);
-                last = frame.generation;
-                let px = frame.output.rgba.as_ref().unwrap().pixels[0];
-                assert_eq!(px, frame.generation as u8);
-            }
+            width: 4,
+            height: 4,
+            full_upload: false,
         }
-        let final_frame = buf.take_latest().unwrap();
-        assert_eq!(final_frame.generation, 100);
     }
 
     #[test]
-    fn mailbox_coalesces_same_target_syncs() {
-        let mb = Mailbox::new(8);
+    fn triple_buffer_untaken_damage_merges_on_publish() {
+        let buf = TripleFrameBuffer::new();
+        buf.publish(make_frame(
+            1,
+            vec![Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            }],
+        ));
+        // No take — publish gen 2 with different damage.
+        buf.publish(make_frame(
+            2,
+            vec![Rect {
+                x: 3.0,
+                y: 3.0,
+                width: 1.0,
+                height: 1.0,
+            }],
+        ));
+        let frame = buf.latest().unwrap();
+        assert_eq!(frame.generation, 2);
+        assert!(
+            frame.publish_damage.len() >= 2 || frame.full_upload,
+            "untaken gen1 damage must merge into gen2: {:?}",
+            frame.publish_damage
+        );
+    }
+
+    #[test]
+    fn mailbox_coalesces_syncs_and_moves_across_clicks() {
+        let mb = Mailbox::new();
         mb.push_sync(SyncTarget::All, pkt("a")).unwrap();
         mb.push_sync(SyncTarget::All, pkt("b")).unwrap();
-        mb.push_sync(SyncTarget::All, pkt("c")).unwrap();
-        let batch = mb.recv_batch().unwrap();
-        assert_eq!(batch.len(), 1, "three All syncs must coalesce to one");
-        match &batch[0] {
-            Command::Sync { packet, .. } => {
-                assert_eq!(packet.fragments.get("sec").map(String::as_str), Some("c"));
-            }
-            other => panic!("expected Sync, got {other:?}"),
-        }
-        // Input breaks the coalesce window.
-        mb.push_sync(SyncTarget::All, pkt("d")).unwrap();
-        mb.push(Command::Input {
-            target: InputTarget::Default,
-            event: InputEvent::PointerLeave,
+        mb.push_pointer_move(
+            SurfaceId::DEFAULT,
+            InputEvent::PointerMove {
+                x: 1.0,
+                y: 1.0,
+                mods: Modifiers::default(),
+            },
+        )
+        .unwrap();
+        mb.push_pointer_move(
+            SurfaceId::DEFAULT,
+            InputEvent::PointerMove {
+                x: 9.0,
+                y: 9.0,
+                mods: Modifiers::default(),
+            },
+        )
+        .unwrap();
+        mb.push_discrete(Command::Input {
+            surface: SurfaceId::DEFAULT,
+            event: InputEvent::PointerDown {
+                x: 9.0,
+                y: 9.0,
+                button: PointerButton::Primary,
+                mods: Modifiers::default(),
+            },
         })
         .unwrap();
-        mb.push_sync(SyncTarget::All, pkt("e")).unwrap();
+        mb.push_pointer_move(
+            SurfaceId::DEFAULT,
+            InputEvent::PointerMove {
+                x: 2.0,
+                y: 2.0,
+                mods: Modifiers::default(),
+            },
+        )
+        .unwrap();
         let batch = mb.recv_batch().unwrap();
-        assert_eq!(batch.len(), 3);
+        assert_eq!(batch.len(), 4);
         match &batch[0] {
             Command::Sync { packet, .. } => {
-                assert_eq!(packet.fragments.get("sec").map(String::as_str), Some("d"));
+                assert_eq!(packet.fragments.get("sec").map(String::as_str), Some("b"));
             }
-            _ => panic!("expected sync before input"),
+            other => panic!("{other:?}"),
         }
-        assert!(is_input(&batch[1]));
-        match &batch[2] {
-            Command::Sync { packet, .. } => {
-                assert_eq!(packet.fragments.get("sec").map(String::as_str), Some("e"));
+        match &batch[1] {
+            Command::Input {
+                event: InputEvent::PointerMove { x, y, .. },
+                ..
+            } => {
+                assert_eq!((*x, *y), (9.0, 9.0));
             }
-            _ => panic!("expected sync after input"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            batch[2],
+            Command::Input {
+                event: InputEvent::PointerDown { .. },
+                ..
+            }
+        ));
+        match &batch[3] {
+            Command::Input {
+                event: InputEvent::PointerMove { x, y, .. },
+                ..
+            } => {
+                assert_eq!((*x, *y), (2.0, 2.0));
+            }
+            other => panic!("{other:?}"),
         }
     }
 
     #[test]
-    fn mailbox_input_waits_instead_of_dropping() {
-        let mb = Arc::new(Mailbox::new(2));
-        mb.push(Command::Input {
-            target: InputTarget::Default,
-            event: InputEvent::PointerLeave,
-        })
-        .unwrap();
-        mb.push(Command::Input {
-            target: InputTarget::Default,
-            event: InputEvent::PointerLeave,
-        })
-        .unwrap();
-
-        let mb2 = Arc::clone(&mb);
-        let handle = thread::spawn(move || {
-            mb2.push(Command::Input {
-                target: InputTarget::Default,
-                event: InputEvent::PointerLeave,
-            })
-        });
-
-        thread::sleep(Duration::from_millis(20));
+    fn mailbox_saturated_burst_never_blocks() {
+        let mb = Mailbox::new();
+        let t0 = Instant::now();
+        for i in 0..10_000 {
+            mb.push_sync(SyncTarget::All, pkt(&format!("v{i}")))
+                .unwrap();
+            mb.push_pointer_move(
+                SurfaceId::DEFAULT,
+                InputEvent::PointerMove {
+                    x: i as f32,
+                    y: i as f32,
+                    mods: Modifiers::default(),
+                },
+            )
+            .unwrap();
+            mb.push_set_visible(SurfaceId(1), i % 2 == 0).unwrap();
+        }
         assert!(
-            !handle.is_finished(),
-            "third input must wait on full mailbox"
+            t0.elapsed() < Duration::from_millis(200),
+            "saturated coalescing burst blocked for {:?}",
+            t0.elapsed()
         );
-        let _ = mb.recv_batch();
-        handle.join().unwrap().unwrap();
         let batch = mb.recv_batch().unwrap();
-        assert_eq!(batch.len(), 1);
-        assert!(is_input(&batch[0]));
+        assert!(
+            batch.len() <= 4,
+            "expected heavy coalesce, got {}",
+            batch.len()
+        );
+    }
+
+    #[test]
+    fn mailbox_drag_keeps_every_move_and_surviving_mods() {
+        let mb = Mailbox::new();
+        let id = SurfaceId::DEFAULT;
+        mb.push_discrete(Command::Input {
+            surface: id,
+            event: InputEvent::PointerDown {
+                x: 0.0,
+                y: 0.0,
+                button: PointerButton::Primary,
+                mods: Modifiers::default(),
+            },
+        })
+        .unwrap();
+        for i in 0..8 {
+            mb.push_pointer_move(
+                id,
+                InputEvent::PointerMove {
+                    x: i as f32,
+                    y: 1.0,
+                    mods: Modifiers {
+                        shift: i == 7,
+                        ..Modifiers::default()
+                    },
+                },
+            )
+            .unwrap();
+        }
+        mb.push_discrete(Command::Input {
+            surface: id,
+            event: InputEvent::PointerUp {
+                x: 7.0,
+                y: 1.0,
+                button: PointerButton::Primary,
+                mods: Modifiers::default(),
+            },
+        })
+        .unwrap();
+        // After release, moves coalesce again; surviving move keeps its mods.
+        mb.push_pointer_move(
+            id,
+            InputEvent::PointerMove {
+                x: 1.0,
+                y: 2.0,
+                mods: Modifiers {
+                    alt: true,
+                    ..Modifiers::default()
+                },
+            },
+        )
+        .unwrap();
+        mb.push_pointer_move(
+            id,
+            InputEvent::PointerMove {
+                x: 9.0,
+                y: 9.0,
+                mods: Modifiers {
+                    ctrl: true,
+                    ..Modifiers::default()
+                },
+            },
+        )
+        .unwrap();
+        let batch = mb.recv_batch().unwrap();
+        let moves: Vec<_> = batch
+            .iter()
+            .filter_map(|c| match c {
+                Command::Input {
+                    event: InputEvent::PointerMove { x, y, mods },
+                    ..
+                } => Some((*x, *y, mods.shift, mods.alt, mods.ctrl)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            moves.len(),
+            9,
+            "8 drag moves + 1 coalesced post-up: {moves:?}"
+        );
+        for (i, m) in moves.iter().take(8).enumerate() {
+            assert_eq!(m.0, i as f32);
+            assert_eq!(m.2, i == 7, "drag move {i} keeps its own mods");
+        }
+        assert_eq!(moves[8], (9.0, 9.0, false, false, true));
+    }
+
+    #[test]
+    fn mailbox_close_open_barrier_blocks_set_visible_merge() {
+        let mb = Mailbox::new();
+        let id = SurfaceId(7);
+        mb.push_set_visible(id, false).unwrap();
+        mb.push_close(id).unwrap();
+        mb.push_discrete(Command::OpenSurface {
+            id,
+            html: "<html></html>".into(),
+            viewport: Viewport::new(10, 10),
+            opts: SurfaceOpts {
+                visible: false,
+                pinned: false,
+            },
+        })
+        .unwrap();
+        mb.push_set_visible(id, true).unwrap();
+        let batch = mb.recv_batch().unwrap();
+        let visibles: Vec<_> = batch
+            .iter()
+            .filter_map(|c| match c {
+                Command::SetVisible { id: s, visible } if *s == id => Some(*visible),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            batch
+                .iter()
+                .any(|c| matches!(c, Command::CloseSurface { id: s } if *s == id)),
+            "close must remain: {batch:?}"
+        );
+        assert!(
+            batch
+                .iter()
+                .any(|c| matches!(c, Command::OpenSurface { id: s, .. } if *s == id)),
+            "open must remain: {batch:?}"
+        );
+        assert_eq!(
+            visibles,
+            vec![true],
+            "pre-close set_visible must not survive; post-open true must: {batch:?}"
+        );
+    }
+
+    #[test]
+    fn mailbox_hard_cap_returns_stalled() {
+        let mb = Mailbox::new();
+        let leave = InputEvent::PointerLeave;
+        for _ in 0..PAINT_WORKER_DISCRETE_HARD_CAP {
+            mb.push_discrete(Command::Input {
+                surface: SurfaceId::DEFAULT,
+                event: leave.clone(),
+            })
+            .unwrap();
+        }
+        let err = mb
+            .push_discrete(Command::Input {
+                surface: SurfaceId::DEFAULT,
+                event: leave,
+            })
+            .expect_err("hard cap must stall");
+        assert!(matches!(err, WorkerError::Stalled), "{err:?}");
+        assert!(mb.discrete_over_cap.load(Ordering::Relaxed) > 0);
     }
 }
