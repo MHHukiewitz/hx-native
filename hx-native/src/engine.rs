@@ -863,6 +863,13 @@ impl Engine {
         self.paint_stats.clone()
     }
 
+    /// True when any live surface still has an in-flight or queued action.
+    pub fn has_pending(&self) -> bool {
+        self.surfaces
+            .values()
+            .any(|s| s.live.as_ref().is_some_and(|live| live.has_pending_work()))
+    }
+
     /// Number of style+layout resolve passes executed inside `paint` (any
     /// surface, including hidden pre-draws) since engine creation.
     pub fn style_layout_pass_count(&self) -> u64 {
