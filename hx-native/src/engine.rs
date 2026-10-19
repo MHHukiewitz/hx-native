@@ -175,13 +175,24 @@ impl Engine {
 
     /// Validate fragment HTML **before** applying a swap so a bad fragment is
     /// never silently inserted. Errors surface on `sync` via `EngineError`.
-    fn validate_fragment_html(&self, html: &str) -> Result<(), EngineError> {
+    ///
+    /// `hx-target` / `hx-indicator` `#id` refs resolve against the document **as
+    /// it will be after the swap**: current document ids, minus ids the swap
+    /// removes, plus ids introduced by the fragment. Sibling indicators outside
+    /// the swap target (e.g. `#tstrip-ind` next to `#tstrip-chips`) therefore
+    /// resolve; ids that only lived inside the replaced subtree do not.
+    fn validate_fragment_html(
+        &self,
+        html: &str,
+        target_nid: NodeId,
+        swap: SwapMode,
+    ) -> Result<(), EngineError> {
         let frag_doc = parse_html_document(html, self.layout_viewport);
-        let mut known_ids = self
-            .doc
-            .as_ref()
-            .map(collect_element_ids)
-            .unwrap_or_default();
+        let doc = self.doc.as_ref().ok_or(EngineError::NotLoaded)?;
+        let mut known_ids = collect_element_ids(doc);
+        for id in ids_removed_by_swap(doc, target_nid, swap) {
+            known_ids.remove(&id);
+        }
         for id in collect_element_ids(&frag_doc) {
             known_ids.insert(id);
         }
@@ -354,16 +365,16 @@ impl Engine {
             .cloned()
             .ok_or_else(|| EngineError::Internal(format!("unknown section `{section_id}`")))?;
 
-        // Same dialect rules as load_html; failure returns EngineError from sync
-        // and leaves the previous DOM in place for this section.
-        self.validate_fragment_html(html)?;
-
         let target_sel = binding
             .hx_target
             .clone()
             .unwrap_or_else(|| format!("#{section_id}"));
         let target_id = self.resolve_selector(&target_sel)?;
         let swap = binding.hx_swap;
+
+        // Same dialect rules as load_html; failure returns EngineError from sync
+        // and leaves the previous DOM in place for this section.
+        self.validate_fragment_html(html, target_id, swap)?;
 
         match swap {
             SwapMode::InnerHtml => {
@@ -1308,9 +1319,15 @@ fn parse_html_document(html: &str, layout_viewport: (u32, u32)) -> HtmlDocument 
 }
 
 fn collect_element_ids(doc: &HtmlDocument) -> HashSet<String> {
+    collect_subtree_ids(doc, doc.root_node().id, true)
+}
+
+/// Ids under `root` in document order walk. `include_root` controls whether
+/// `root`'s own `id` is included (outerHTML removes the target; innerHTML keeps it).
+fn collect_subtree_ids(doc: &HtmlDocument, root: NodeId, include_root: bool) -> HashSet<String> {
     let mut ids = HashSet::new();
-    let root = doc.root_node().id;
     let mut stack = vec![root];
+    let mut first = true;
     while let Some(nid) = stack.pop() {
         let Some(node) = doc.get_node(nid) else {
             continue;
@@ -1319,6 +1336,15 @@ fn collect_element_ids(doc: &HtmlDocument) -> HashSet<String> {
             stack.push(child);
         }
         if !node.is_element() {
+            continue;
+        }
+        let take = if first {
+            first = false;
+            include_root
+        } else {
+            true
+        };
+        if !take {
             continue;
         }
         if let Some(id) = node.attrs().and_then(|attrs| {
@@ -1333,6 +1359,15 @@ fn collect_element_ids(doc: &HtmlDocument) -> HashSet<String> {
         }
     }
     ids
+}
+
+fn ids_removed_by_swap(doc: &HtmlDocument, target: NodeId, swap: SwapMode) -> HashSet<String> {
+    match swap {
+        // innerHTML replaces descendants only; the target element (and siblings) stay.
+        SwapMode::InnerHtml => collect_subtree_ids(doc, target, false),
+        // outerHTML replaces the target node itself.
+        SwapMode::OuterHtml => collect_subtree_ids(doc, target, true),
+    }
 }
 
 fn element_id_and_attrs(node: &blitz_dom::Node) -> (String, Vec<(String, String)>) {

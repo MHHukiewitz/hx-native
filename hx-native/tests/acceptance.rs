@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex};
 use hx_native::*;
 
 const FIXTURE: &str = include_str!("fixtures/time_strip.html");
+const TSTRIP_SHELL: &str = include_str!("fixtures/tstrip_shell.html");
+const CHIPS_FRAGMENT: &str = include_str!("fixtures/chips.html");
 
 fn default_actions() -> &'static [&'static str] {
     &[
@@ -1334,6 +1336,58 @@ fn strict_bad_fragment_errors_on_sync_not_applied() {
         eng.serialize_html().unwrap(),
         "data-hx-reason fragment must not be applied"
     );
+}
+
+#[test]
+fn fragment_indicator_resolves_sibling_outside_swap_target() {
+    // Designer chips.html: every button has hx-indicator="#tstrip-ind", and
+    // #tstrip-ind is a sibling of #tstrip-chips (outside the fragment).
+    let mut eng = Engine::new(EngineConfig::default());
+    eng.declare_actions(&["time.pause", "time.resume", "time.set_speed"]);
+    eng.load_html(TSTRIP_SHELL).expect("load tstrip shell");
+
+    let slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    frags.set("time-strip", CHIPS_FRAGMENT);
+    eng.sync(&slices, &mut frags)
+        .expect("chips fragment must apply");
+
+    let html = eng.serialize_html().unwrap();
+    assert!(html.contains("id=\"tstrip-pause\""), "pause chip present");
+    assert!(html.contains("id=\"tstrip-month\""), "7th chip present");
+    assert!(html.contains("id=\"tstrip-ind\""), "sibling indicator kept");
+    assert!(
+        html.matches("hx-indicator=\"#tstrip-ind\"").count() >= 7,
+        "all chips keep hx-indicator to sibling"
+    );
+    // No greying attrs in the Designer sample fragment.
+    assert!(!html.contains("data-hx-reason"));
+}
+
+#[test]
+fn fragment_indicator_missing_id_fails_sync() {
+    let mut eng = Engine::new(EngineConfig::default());
+    eng.declare_actions(&["time.pause", "time.resume", "time.set_speed"]);
+    eng.load_html(TSTRIP_SHELL).expect("load tstrip shell");
+
+    let mut slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    eng.sync(&slices, &mut frags).unwrap();
+    let before = eng.serialize_html().unwrap();
+
+    frags.set(
+        "time-strip",
+        r##"<button id="tstrip-pause" hx-post="time.pause" hx-trigger="click" hx-indicator="#nowhere">Pause</button>"##,
+    );
+    slices.bump("time");
+    let err = eng
+        .sync(&slices, &mut frags)
+        .expect_err("missing indicator id");
+    assert!(
+        matches!(err, EngineError::InvalidAttribute { ref attr, .. } if attr == "hx-indicator"),
+        "got {err:?}"
+    );
+    assert_eq!(before, eng.serialize_html().unwrap());
 }
 
 #[test]

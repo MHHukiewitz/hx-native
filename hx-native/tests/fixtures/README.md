@@ -8,3 +8,8 @@ The time-strip-like shell (`time_strip.html`) exercises the locked attribute
 dialect (`hx-post`, `hx-target`, `hx-swap`, `hx-trigger`, `hx-indicator`,
 `hx-sync` only — HTML contract §2) against a `time` slice section and a few
 buttons.
+
+`tstrip_shell.html` + `chips.html` mirror the Designer time-strip shape
+(Mainnet PR #686 sample): section swaps into `#tstrip-chips`, and
+`#tstrip-ind` is a **sibling** outside the fragment so fragment validation
+must resolve indicators against the post-swap document.
