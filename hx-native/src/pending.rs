@@ -64,17 +64,6 @@ pub struct PendingState {
 }
 
 impl PendingState {
-    pub fn clear_all(&mut self) {
-        self.by_source.clear();
-        self.by_request.clear();
-        self.queued.clear();
-        self.timed_out.clear();
-        // Keep timeout_failures / unknown_completes for harness inspection across reload? Spec:
-        // load_html drops all pending. Failures are harness-side.
-        self.timeout_failures.clear();
-        self.unknown_completes.clear();
-    }
-
     pub fn is_pending(&self, source_id: &str) -> bool {
         self.by_source.contains_key(source_id)
     }

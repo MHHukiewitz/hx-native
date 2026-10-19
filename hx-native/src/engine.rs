@@ -1,6 +1,6 @@
-//! Core `Engine`: load, sync, input, complete, paint.
+//! Core `Engine`: surfaces, load, sync, input, complete, paint.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -22,8 +22,9 @@ use crate::form_args::{
     collect_action_args, is_numeric_input, is_range_input, set_range_value_from_x,
     step_numeric_value,
 };
+use crate::memory::estimate_surface_engine_bytes;
 use crate::paint::{paint_damage_into, paint_rgba};
-use crate::pending::{PendingEntry, PendingState, QueuedRelease};
+use crate::pending::{PendingEntry, PendingState, PendingTimeout, QueuedRelease};
 use crate::trigger::{
     filter_ctx_from_key, keydown_repeat_allowed, FilterCtx, FromTarget, TriggerEvent,
 };
@@ -39,10 +40,114 @@ pub struct DirtySet {
     pub total_element_count: usize,
 }
 
-pub struct Engine {
-    config: EngineConfig,
-    declared_actions: HashSet<String>,
-    doc: Option<HtmlDocument>,
+impl DirtySet {
+    fn absorb(&mut self, other: DirtySet) {
+        self.sections.extend(other.sections);
+        self.damaged_node_count += other.damaged_node_count;
+        self.total_element_count += other.total_element_count;
+    }
+}
+
+static NO_FOCUS: FocusState = FocusState { focused_id: None };
+
+/// Engine-wide RequestId counter plus the surface that owns each in-flight request.
+#[derive(Debug)]
+struct RequestLedger {
+    next: u64,
+    owners: HashMap<RequestId, SurfaceId>,
+}
+
+impl RequestLedger {
+    fn issue(&mut self, surface: SurfaceId) -> RequestId {
+        let request = RequestId(self.next);
+        self.next += 1;
+        self.owners.insert(request, surface);
+        request
+    }
+
+    fn forget_surface(&mut self, surface: SurfaceId) {
+        self.owners.retain(|_, owner| *owner != surface);
+    }
+}
+
+/// Engine state a surface needs while handling input or completions.
+struct ActionCtx<'a> {
+    surface: SurfaceId,
+    declared_actions: &'a HashSet<String>,
+    requests: &'a mut RequestLedger,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct SurfaceSize {
+    width: u32,
+    height: u32,
+    scale: f64,
+}
+
+impl SurfaceSize {
+    fn from_viewport(viewport: &Viewport) -> Self {
+        Self {
+            width: viewport.width,
+            height: viewport.height,
+            scale: if viewport.scale > 0.0 {
+                viewport.scale
+            } else {
+                1.0
+            },
+        }
+    }
+}
+
+impl Default for SurfaceSize {
+    fn default() -> Self {
+        Self {
+            width: DEFAULT_SURFACE_WIDTH,
+            height: DEFAULT_SURFACE_HEIGHT,
+            scale: 1.0,
+        }
+    }
+}
+
+/// One host surface. `live` is `None` once evicted; the metadata here is kept so
+/// `set_visible(true)` can rebuild it.
+struct Surface {
+    source_html: String,
+    size: SurfaceSize,
+    visible: bool,
+    pinned: bool,
+    /// LRU stamp from `Engine::lru_clock`.
+    last_used: u64,
+    /// Next visible paint must report full-surface damage (host dropped its texture).
+    needs_full_host_upload: bool,
+    live: Option<LiveSurface>,
+}
+
+impl Surface {
+    fn estimated_bytes(&self) -> u64 {
+        if self.live.is_some() {
+            estimate_surface_engine_bytes(self.size.width, self.size.height, &self.source_html)
+        } else {
+            0
+        }
+    }
+
+    fn is_evictable(&self) -> bool {
+        !self.visible
+            && !self.pinned
+            && self
+                .live
+                .as_ref()
+                .is_some_and(|live| !live.has_pending_work())
+    }
+
+    fn counts_against_hidden_budget(&self) -> bool {
+        !self.visible && !self.pinned && self.live.is_some()
+    }
+}
+
+/// Parsed document plus all per-document interaction and paint state.
+struct LiveSurface {
+    doc: HtmlDocument,
     bindings: HashMap<String, ElementBinding>,
     /// section_id -> subscribed slice names
     sections: HashMap<String, Vec<String>>,
@@ -50,14 +155,11 @@ pub struct Engine {
     slice_versions: HashMap<String, u64>,
     /// action name -> Disabled reason (from actions slice)
     disabled_actions: HashMap<String, String>,
-    next_request_id: u64,
     pending: PendingState,
     released_outcomes: Vec<InputOutcome>,
     hover_id: Option<String>,
     press: Option<PressState>,
     focus: FocusState,
-    timings: Timings,
-    paint_stats: PaintStats,
     /// Physical viewport size used for layout / hit-testing (updated on paint).
     layout_viewport: (u32, u32),
     /// Last paint scale factor (hidpi). Full repaint when this changes.
@@ -70,11 +172,6 @@ pub struct Engine {
     cached_rgba: Option<RgbaImage>,
     /// Per-node own/ink bounds from the last painted frame (device pixels).
     last_bounds: BoundsSnapshot,
-    /// Counts style+layout resolve passes that run inside `paint` (batching test).
-    style_layout_passes: u64,
-    /// Test harness: assert pending timeouts were observed.
-    pub(crate) frame_count: u32,
-    loaded_html: Option<String>,
     /// Primary-button drag on an `<input type="range">`.
     range_drag_id: Option<String>,
 }
@@ -87,46 +184,66 @@ struct PressState {
     mods: Modifiers,
 }
 
+/// Result of one `LiveSurface::render` call.
+struct RenderResult {
+    /// `None` when raster was skipped (clean frame).
+    plan: Option<DamagePlan>,
+    style_layout_passes: u64,
+}
+
+pub struct Engine {
+    config: EngineConfig,
+    declared_actions: HashSet<String>,
+    surfaces: BTreeMap<SurfaceId, Surface>,
+    requests: RequestLedger,
+    /// Surface that last received a pointer event; it gets a leave when another surface does.
+    hover_surface: Option<SurfaceId>,
+    lru_clock: u64,
+    timings: Timings,
+    paint_stats: PaintStats,
+    /// Counts style+layout resolve passes that run inside `paint` (batching test).
+    style_layout_passes: u64,
+    /// Test harness: assert pending timeouts were observed.
+    pub(crate) frame_count: u32,
+    eviction_count: u64,
+    last_eviction_ns: u64,
+    rebuild_count: u64,
+    last_rebuild_ns: u64,
+    /// Set while pinned bytes are above [`PINNED_SURFACE_WARN_BYTES`] so the warning logs once per crossing.
+    pinned_warned: bool,
+}
+
 impl Engine {
     pub fn new(config: EngineConfig) -> Self {
         Self {
             config,
             declared_actions: HashSet::new(),
-            doc: None,
-            bindings: HashMap::new(),
-            sections: HashMap::new(),
-            slice_versions: HashMap::new(),
-            disabled_actions: HashMap::new(),
-            next_request_id: 1,
-            pending: PendingState::default(),
-            released_outcomes: Vec::new(),
-            hover_id: None,
-            press: None,
-            focus: FocusState::default(),
+            surfaces: BTreeMap::new(),
+            requests: RequestLedger {
+                next: 1,
+                owners: HashMap::new(),
+            },
+            hover_surface: None,
+            lru_clock: 0,
             timings: Timings::default(),
             paint_stats: PaintStats::default(),
-            layout_viewport: (800, 120),
-            layout_scale: 1.0,
-            needs_resolve: false,
-            paint_dirty: true,
-            force_full_repaint: true,
-            cached_rgba: None,
-            last_bounds: BoundsSnapshot::new(),
             style_layout_passes: 0,
             frame_count: 0,
-            loaded_html: None,
-            range_drag_id: None,
+            eviction_count: 0,
+            last_eviction_ns: 0,
+            rebuild_count: 0,
+            last_rebuild_ns: 0,
+            pinned_warned: false,
         }
     }
 
-    fn mark_paint_dirty(&mut self) {
-        self.paint_dirty = true;
-    }
-
-    /// Host calls this after a theme or stylesheet change. Next paint is a full repaint.
+    /// Host calls this after a theme or stylesheet change. Next paint of every
+    /// live surface is a full repaint.
     pub fn mark_theme_or_stylesheet_changed(&mut self) {
-        self.force_full_repaint = true;
-        self.mark_paint_dirty();
+        for live in self.surfaces.values_mut().filter_map(|s| s.live.as_mut()) {
+            live.force_full_repaint = true;
+            live.paint_dirty = true;
+        }
     }
 
     pub fn declare_actions(&mut self, names: &[&str]) {
@@ -135,76 +252,780 @@ impl Engine {
         }
     }
 
-    pub fn load_html(&mut self, html: &str) -> Result<(), EngineError> {
-        // Drop pending + restart request counter semantics: counter restarts only
-        // in a *new* engine per spec ("counter restarts at 1 in a new engine").
-        // load_html drops pending but keeps the same engine's counter? Spec:
-        // "load_html drops all pending requests as part of its one full render,
-        // and the counter restarts at 1 in a new engine."
-        // So load_html does NOT reset the counter — only new Engine does.
-        self.pending.clear_all();
-        self.released_outcomes.clear();
-        self.hover_id = None;
-        self.press = None;
-        self.range_drag_id = None;
-        self.focus = FocusState::default();
-        self.slice_versions.clear();
-        self.disabled_actions.clear();
-        self.bindings.clear();
-        self.sections.clear();
+    // ------------------------------------------------------------------
+    // Surfaces
+    // ------------------------------------------------------------------
 
-        let mut doc = parse_html_document(html, self.layout_viewport);
+    /// Open (or replace) surface `id` with `html` laid out at `viewport`.
+    ///
+    /// Parses, validates the dialect, and runs style + layout. A hidden surface
+    /// (`opts.visible == false`) also runs its first raster here so it is
+    /// pre-drawn when shown. Replacing an open id drops its pending requests,
+    /// like `load_html`. On a dialect error the previous surface (if any) is kept.
+    ///
+    /// May evict least-recently-used hidden, unpinned surfaces (never `id`
+    /// itself, never one with a pending action) to stay within
+    /// [`EngineConfig::hidden_surface_budget_bytes`].
+    pub fn open_surface(
+        &mut self,
+        id: SurfaceId,
+        html: &str,
+        viewport: Viewport,
+        opts: SurfaceOpts,
+    ) -> Result<(), EngineError> {
+        let size = SurfaceSize::from_viewport(&viewport);
+        let mut live = LiveSurface::build(&self.declared_actions, html, size)?;
+        if !opts.visible {
+            let result = live.render(size, self.config.paint_mode)?;
+            self.style_layout_passes = self
+                .style_layout_passes
+                .saturating_add(result.style_layout_passes);
+        }
 
-        // HTML contract §2: strict dialect on loaded HTML, then index bindings.
-        let known_ids = collect_element_ids(&doc);
-        self.validate_loaded_tree(&doc, &known_ids)?;
-        self.index_document(&doc)?;
-
-        doc.resolve(0.0);
-        self.doc = Some(doc);
-        self.loaded_html = Some(html.to_string());
-        self.needs_resolve = false;
-        self.cached_rgba = None;
-        self.last_bounds.clear();
-        self.force_full_repaint = true;
-        self.mark_paint_dirty();
+        self.requests.forget_surface(id);
+        if self.hover_surface == Some(id) {
+            self.hover_surface = None;
+        }
+        let last_used = self.touch_lru();
+        self.surfaces.insert(
+            id,
+            Surface {
+                source_html: html.to_string(),
+                size,
+                visible: opts.visible,
+                pinned: opts.pinned,
+                last_used,
+                needs_full_host_upload: true,
+                live: Some(live),
+            },
+        );
+        self.enforce_hidden_budget(Some(id));
+        self.check_pinned_bytes();
         Ok(())
     }
 
-    /// Walk a freshly parsed tree (document or fragment) and enforce the locked
-    /// attribute dialect. Does **not** run on live-DOM reindex after the engine
-    /// writes `data-hx-reason`.
-    fn validate_loaded_tree(
-        &self,
-        doc: &HtmlDocument,
-        known_ids: &HashSet<String>,
-    ) -> Result<(), EngineError> {
-        let root = doc.root_node().id;
-        let mut stack = vec![root];
-        while let Some(nid) = stack.pop() {
-            let Some(node) = doc.get_node(nid) else {
-                continue;
+    /// Show or hide a surface. Visibility, position and z-order are host-owned;
+    /// hiding never repaints.
+    ///
+    /// Showing (`false` -> `true`) makes the next [`Self::paint_surface`] return
+    /// **full-surface damage** with the whole RGBA buffer: the host should drop
+    /// the GPU texture of a hidden surface and re-upload it on show. A pre-drawn
+    /// surface with nothing dirty is not re-rastered; its cached buffer is returned.
+    ///
+    /// Showing an evicted surface rebuilds it cold from the HTML given to
+    /// `open_surface` (parse + style + layout); slice versions start empty so
+    /// the next `sync` re-renders every section from current slices, and the
+    /// next paint is a full repaint.
+    ///
+    /// Hiding may evict least-recently-used hidden, unpinned surfaces without a
+    /// pending action (including this one) to stay within
+    /// [`EngineConfig::hidden_surface_budget_bytes`].
+    pub fn set_visible(&mut self, id: SurfaceId, visible: bool) -> Result<(), EngineError> {
+        let last_used = self.touch_lru();
+        let surface = self
+            .surfaces
+            .get_mut(&id)
+            .ok_or(EngineError::UnknownSurface(id))?;
+        surface.last_used = last_used;
+        if visible {
+            if surface.visible {
+                return Ok(());
+            }
+            if surface.live.is_none() {
+                let t0 = Instant::now();
+                let live =
+                    LiveSurface::build(&self.declared_actions, &surface.source_html, surface.size)?;
+                surface.live = Some(live);
+                self.rebuild_count = self.rebuild_count.saturating_add(1);
+                self.last_rebuild_ns = t0.elapsed().as_nanos() as u64;
+            }
+            surface.visible = true;
+            surface.needs_full_host_upload = true;
+            self.check_pinned_bytes();
+        } else {
+            if surface.visible {
+                surface.visible = false;
+                surface.needs_full_host_upload = true;
+            }
+            self.enforce_hidden_budget(None);
+        }
+        Ok(())
+    }
+
+    /// Change a surface's layout size / scale. A changed size or scale makes the
+    /// next paint a full repaint; an unchanged one is a no-op (moving a window
+    /// never repaints). Evicted surfaces just record the new size.
+    ///
+    /// May evict least-recently-used hidden, unpinned surfaces (never `id`
+    /// itself, never one with a pending action).
+    pub fn resize_surface(&mut self, id: SurfaceId, viewport: Viewport) -> Result<(), EngineError> {
+        let size = SurfaceSize::from_viewport(&viewport);
+        let last_used = self.touch_lru();
+        let surface = self
+            .surfaces
+            .get_mut(&id)
+            .ok_or(EngineError::UnknownSurface(id))?;
+        surface.last_used = last_used;
+        if surface.size != size {
+            surface.size = size;
+            if let Some(live) = surface.live.as_mut() {
+                live.force_full_repaint = true;
+                live.paint_dirty = true;
+            }
+        }
+        self.enforce_hidden_budget(Some(id));
+        self.check_pinned_bytes();
+        Ok(())
+    }
+
+    /// Close a surface: its document and RGBA buffer are dropped immediately,
+    /// along with its pending requests (a later `complete` for them is a no-op).
+    pub fn close_surface(&mut self, id: SurfaceId) -> Result<(), EngineError> {
+        self.surfaces
+            .remove(&id)
+            .ok_or(EngineError::UnknownSurface(id))?;
+        self.requests.forget_surface(id);
+        if self.hover_surface == Some(id) {
+            self.hover_surface = None;
+        }
+        self.check_pinned_bytes();
+        Ok(())
+    }
+
+    /// Paint one surface into its CPU RGBA buffer (spec `paint(id)`).
+    ///
+    /// Clean frames skip raster and return `skipped: true`, `rgba: None`, empty
+    /// `damage`. Never evicts.
+    ///
+    /// The first paint of a visible surface after it was opened, shown with
+    /// [`Self::set_visible`], or rebuilt from eviction returns **full-surface
+    /// damage** and the full buffer, even when nothing was re-rastered. The host
+    /// is expected to have dropped the GPU texture while the surface was hidden.
+    ///
+    /// Painting a hidden surface keeps the pre-drawn buffer current; the full
+    /// upload is still reported on the first paint after it becomes visible.
+    pub fn paint_surface(&mut self, id: SurfaceId) -> Result<PaintOutput, EngineError> {
+        let t0 = Instant::now();
+        let last_used = self.touch_lru();
+        self.frame_count = self.frame_count.saturating_add(1);
+        let paint_mode = self.config.paint_mode;
+        let timeout_frames = self.config.pending_timeout_frames;
+
+        let surface = self
+            .surfaces
+            .get_mut(&id)
+            .ok_or(EngineError::UnknownSurface(id))?;
+        surface.last_used = last_used;
+        let size = surface.size;
+        let full_upload = surface.visible && surface.needs_full_host_upload;
+        let live = surface
+            .live
+            .as_mut()
+            .ok_or(EngineError::SurfaceEvicted(id))?;
+
+        live.pending.tick_frames(timeout_frames);
+        let result = live.render(size, paint_mode)?;
+        self.style_layout_passes = self
+            .style_layout_passes
+            .saturating_add(result.style_layout_passes);
+
+        if result.plan.is_none() && !full_upload {
+            self.timings.paint_ns = t0.elapsed().as_nanos() as u64;
+            self.timings.paint_skipped = true;
+            self.paint_stats = PaintStats::default();
+            return Ok(PaintOutput {
+                rgba: None,
+                texture: None,
+                focus: live.focus.clone(),
+                skipped: true,
+                damage: Vec::new(),
+            });
+        }
+
+        let rgba = live
+            .cached_rgba
+            .clone()
+            .ok_or_else(|| EngineError::Internal(format!("{id} has no raster after paint")))?;
+        let focus = live.focus.clone();
+        if surface.visible {
+            surface.needs_full_host_upload = false;
+        }
+
+        let (damage, stats) = if full_upload {
+            let stats = match &result.plan {
+                Some(plan) => PaintStats {
+                    damage_rect_count: 1,
+                    merged_to_bbox: plan.merged_to_bbox,
+                    full_repaint_area_fallback: plan.full_repaint_area_fallback,
+                    full_repaint: plan.full_repaint,
+                    full_host_upload: true,
+                },
+                None => PaintStats {
+                    damage_rect_count: 1,
+                    full_host_upload: true,
+                    ..PaintStats::default()
+                },
             };
-            for &child in &node.children {
-                stack.push(child);
+            (
+                vec![IntRect::full_surface(rgba.width, rgba.height).to_rect()],
+                stats,
+            )
+        } else {
+            let plan = result
+                .plan
+                .as_ref()
+                .ok_or_else(|| EngineError::Internal("missing damage plan".into()))?;
+            (
+                plan.rects.iter().map(|r| r.to_rect()).collect(),
+                PaintStats {
+                    damage_rect_count: plan.rects.len(),
+                    merged_to_bbox: plan.merged_to_bbox,
+                    full_repaint_area_fallback: plan.full_repaint_area_fallback,
+                    full_repaint: plan.full_repaint,
+                    full_host_upload: false,
+                },
+            )
+        };
+
+        self.timings.paint_ns = t0.elapsed().as_nanos() as u64;
+        self.timings.paint_skipped = false;
+        self.paint_stats = stats;
+        Ok(PaintOutput {
+            rgba: Some(rgba),
+            texture: None,
+            focus,
+            skipped: false,
+            damage,
+        })
+    }
+
+    /// Surfaces whose next `paint_surface` would produce pixels. Cheap (no
+    /// style/layout). Never reports hidden unpinned surfaces, nor evicted ones.
+    pub fn dirty_surfaces(&self) -> Vec<SurfaceId> {
+        self.surfaces
+            .iter()
+            .filter_map(|(id, s)| {
+                let live = s.live.as_ref()?;
+                if !s.visible && !s.pinned {
+                    return None;
+                }
+                let dirty = live.paint_dirty
+                    || live.force_full_repaint
+                    || live.cached_rgba.is_none()
+                    || live.layout_viewport != (s.size.width, s.size.height)
+                    || (live.layout_scale - s.size.scale).abs() > f64::EPSILON
+                    || (s.visible && s.needs_full_host_upload);
+                dirty.then_some(*id)
+            })
+            .collect()
+    }
+
+    /// Run `sync` on one surface only.
+    pub fn sync_surface(
+        &mut self,
+        id: SurfaceId,
+        slices: &dyn SliceSource,
+        frags: &mut dyn FragmentSource,
+    ) -> Result<DirtySet, EngineError> {
+        let t0 = Instant::now();
+        let surface = self
+            .surfaces
+            .get_mut(&id)
+            .ok_or(EngineError::UnknownSurface(id))?;
+        let live = surface
+            .live
+            .as_mut()
+            .ok_or(EngineError::SurfaceEvicted(id))?;
+        let dirty = live.sync(&self.declared_actions, slices, frags)?;
+        self.timings.sync_ns = t0.elapsed().as_nanos() as u64;
+        Ok(dirty)
+    }
+
+    /// Deliver input the host routed to surface `id`. Pointer events on a
+    /// different surface than the last one first send that surface a
+    /// pointer-leave, so only one surface is hovered at a time.
+    pub fn input_surface(&mut self, id: SurfaceId, ev: InputEvent) -> InputOutcome {
+        let is_pointer = matches!(
+            ev,
+            InputEvent::PointerMove { .. }
+                | InputEvent::PointerDown { .. }
+                | InputEvent::PointerUp { .. }
+        );
+        if is_pointer && self.hover_surface != Some(id) {
+            if let Some(prev) = self.hover_surface.take() {
+                let _ = self.route_input(prev, InputEvent::PointerLeave);
             }
-            if !node.is_element() {
+        }
+        if is_pointer {
+            self.hover_surface = Some(id);
+        } else if matches!(ev, InputEvent::PointerLeave) && self.hover_surface == Some(id) {
+            self.hover_surface = None;
+        }
+        self.route_input(id, ev)
+    }
+
+    fn route_input(&mut self, id: SurfaceId, ev: InputEvent) -> InputOutcome {
+        let Self {
+            surfaces,
+            declared_actions,
+            requests,
+            ..
+        } = self;
+        match surfaces.get_mut(&id).and_then(|s| s.live.as_mut()) {
+            Some(live) => {
+                let mut ctx = ActionCtx {
+                    surface: id,
+                    declared_actions,
+                    requests,
+                };
+                live.input(&mut ctx, ev)
+            }
+            None => unrouted_outcome(ev),
+        }
+    }
+
+    /// Queued releases emitted by `complete` on surface `id`.
+    pub fn take_surface_outcomes(&mut self, id: SurfaceId) -> Vec<InputOutcome> {
+        self.surfaces
+            .get_mut(&id)
+            .and_then(|s| s.live.as_mut())
+            .map(|live| std::mem::take(&mut live.released_outcomes))
+            .unwrap_or_default()
+    }
+
+    /// Borrowed view of surface `id`'s last rasterized frame, if any.
+    pub fn surface_last_frame(&self, id: SurfaceId) -> Option<&RgbaImage> {
+        self.live(id)?.cached_rgba.as_ref()
+    }
+
+    /// Read an attribute from an element by id on surface `id`.
+    pub fn surface_attr(&self, id: SurfaceId, elem_id: &str, name: &str) -> Option<String> {
+        self.live(id)?.attr(elem_id, name)
+    }
+
+    /// Serialize surface `id`'s document HTML (root element outerHTML).
+    pub fn surface_serialize_html(&self, id: SurfaceId) -> Result<String, EngineError> {
+        let surface = self
+            .surfaces
+            .get(&id)
+            .ok_or(EngineError::UnknownSurface(id))?;
+        let live = surface
+            .live
+            .as_ref()
+            .ok_or(EngineError::SurfaceEvicted(id))?;
+        Ok(live.doc.root_element().outer_html())
+    }
+
+    /// Open surface ids in ascending order (including evicted ones).
+    pub fn surface_ids(&self) -> Vec<SurfaceId> {
+        self.surfaces.keys().copied().collect()
+    }
+
+    pub fn surface_info(&self, id: SurfaceId) -> Option<SurfaceInfo> {
+        let s = self.surfaces.get(&id)?;
+        Some(SurfaceInfo {
+            visible: s.visible,
+            pinned: s.pinned,
+            evicted: s.live.is_none(),
+            width: s.size.width,
+            height: s.size.height,
+            scale: s.size.scale,
+            estimated_bytes: s.estimated_bytes(),
+        })
+    }
+
+    /// Estimated engine bytes of all live pinned surfaces. Above
+    /// [`PINNED_SURFACE_WARN_BYTES`] the engine logs a warning.
+    pub fn pinned_bytes(&self) -> u64 {
+        self.surfaces
+            .values()
+            .filter(|s| s.pinned)
+            .map(Surface::estimated_bytes)
+            .sum()
+    }
+
+    pub fn surface_memory_stats(&self) -> SurfaceMemoryStats {
+        let mut stats = SurfaceMemoryStats {
+            hidden_budget_bytes: self.config.hidden_surface_budget_bytes,
+            eviction_count: self.eviction_count,
+            last_eviction_ns: self.last_eviction_ns,
+            rebuild_count: self.rebuild_count,
+            last_rebuild_ns: self.last_rebuild_ns,
+            ..SurfaceMemoryStats::default()
+        };
+        for s in self.surfaces.values() {
+            if s.live.is_none() {
+                stats.evicted_surfaces += 1;
                 continue;
             }
-            let (id_attr, attrs) = element_id_and_attrs(node);
-            validate_loaded_attrs(&id_attr, &attrs, known_ids)?;
-            if let Some(binding) = ElementBinding::from_attrs(&id_attr, &attrs)? {
-                if let Some(ref action) = binding.hx_post {
-                    if !self.declared_actions.contains(action) {
-                        return Err(EngineError::UndeclaredAction {
-                            name: action.clone(),
-                            source_id: binding.id.clone(),
-                        });
-                    }
+            let bytes = s.estimated_bytes();
+            stats.live_surfaces += 1;
+            stats.live_bytes += bytes;
+            if s.pinned {
+                stats.pinned_bytes += bytes;
+            }
+            if s.counts_against_hidden_budget() {
+                stats.hidden_unpinned_bytes += bytes;
+            }
+        }
+        stats
+    }
+
+    fn touch_lru(&mut self) -> u64 {
+        self.lru_clock += 1;
+        self.lru_clock
+    }
+
+    fn live(&self, id: SurfaceId) -> Option<&LiveSurface> {
+        self.surfaces.get(&id)?.live.as_ref()
+    }
+
+    fn hidden_unpinned_bytes(&self) -> u64 {
+        self.surfaces
+            .values()
+            .filter(|s| s.counts_against_hidden_budget())
+            .map(Surface::estimated_bytes)
+            .sum()
+    }
+
+    /// Evict LRU hidden, unpinned surfaces with no pending work until the
+    /// hidden budget holds (or nothing evictable is left). Only called from
+    /// `open_surface`, `set_visible(false)` and `resize_surface`.
+    fn enforce_hidden_budget(&mut self, protect: Option<SurfaceId>) {
+        let budget = self.config.hidden_surface_budget_bytes;
+        let mut hidden = self.hidden_unpinned_bytes();
+        while hidden > budget {
+            let victim = self
+                .surfaces
+                .iter()
+                .filter(|(id, s)| Some(**id) != protect && s.is_evictable())
+                .min_by_key(|(_, s)| s.last_used)
+                .map(|(id, _)| *id);
+            let Some(victim) = victim else {
+                break;
+            };
+            hidden = hidden.saturating_sub(self.evict(victim));
+        }
+    }
+
+    /// Drop a surface's document and buffer, keeping HTML / size / opts. Returns
+    /// the estimated bytes freed.
+    fn evict(&mut self, id: SurfaceId) -> u64 {
+        let t0 = Instant::now();
+        let Some(surface) = self.surfaces.get_mut(&id) else {
+            return 0;
+        };
+        let freed = surface.estimated_bytes();
+        drop(surface.live.take());
+        surface.needs_full_host_upload = true;
+        self.last_eviction_ns = t0.elapsed().as_nanos() as u64;
+        self.eviction_count = self.eviction_count.saturating_add(1);
+        self.requests.forget_surface(id);
+        if self.hover_surface == Some(id) {
+            self.hover_surface = None;
+        }
+        freed
+    }
+
+    fn check_pinned_bytes(&mut self) {
+        let pinned = self.pinned_bytes();
+        if pinned > PINNED_SURFACE_WARN_BYTES {
+            if !self.pinned_warned {
+                eprintln!(
+                    "hx_native: pinned surfaces hold ~{pinned} bytes (warn above \
+                     {PINNED_SURFACE_WARN_BYTES}); pinned surfaces are never evicted"
+                );
+                self.pinned_warned = true;
+            }
+        } else {
+            self.pinned_warned = false;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Single-document API (operates on SurfaceId::DEFAULT)
+    // ------------------------------------------------------------------
+
+    /// Load (or replace) the default surface as visible + pinned. Drops all of
+    /// its pending requests; the RequestId counter does not restart (only a new
+    /// engine restarts it at 1).
+    pub fn load_html(&mut self, html: &str) -> Result<(), EngineError> {
+        let size = self
+            .surfaces
+            .get(&SurfaceId::DEFAULT)
+            .map(|s| s.size)
+            .unwrap_or_default();
+        self.open_surface(
+            SurfaceId::DEFAULT,
+            html,
+            Viewport::with_scale(size.width, size.height, size.scale),
+            SurfaceOpts {
+                visible: true,
+                pinned: true,
+            },
+        )
+    }
+
+    /// Sync every live (non-evicted) surface in ascending id order against the
+    /// same slices. The returned set aggregates all surfaces.
+    pub fn sync(
+        &mut self,
+        slices: &dyn SliceSource,
+        frags: &mut dyn FragmentSource,
+    ) -> Result<DirtySet, EngineError> {
+        let t0 = Instant::now();
+        let mut total = DirtySet::default();
+        let mut any_live = false;
+        for live in self.surfaces.values_mut().filter_map(|s| s.live.as_mut()) {
+            any_live = true;
+            total.absorb(live.sync(&self.declared_actions, slices, frags)?);
+        }
+        if !any_live {
+            return Err(EngineError::NotLoaded);
+        }
+        self.timings.sync_ns = t0.elapsed().as_nanos() as u64;
+        Ok(total)
+    }
+
+    pub fn input(&mut self, ev: InputEvent) -> InputOutcome {
+        self.input_surface(SurfaceId::DEFAULT, ev)
+    }
+
+    /// Complete a request emitted by any surface. Unknown requests are logged in
+    /// debug builds; requests that timed out (or whose surface was closed) are no-ops.
+    pub fn complete(&mut self, request: RequestId, result: Result<(), Reason>) {
+        let Some(&owner) = self.requests.owners.get(&request) else {
+            #[cfg(debug_assertions)]
+            eprintln!("hx_native: complete() for unknown request {request}");
+            return;
+        };
+        let Self {
+            surfaces,
+            declared_actions,
+            requests,
+            ..
+        } = self;
+        let Some(live) = surfaces.get_mut(&owner).and_then(|s| s.live.as_mut()) else {
+            requests.owners.remove(&request);
+            return;
+        };
+        let mut ctx = ActionCtx {
+            surface: owner,
+            declared_actions,
+            requests,
+        };
+        live.complete(&mut ctx, request, result);
+    }
+
+    /// Drain queued releases emitted by `complete` across all surfaces, in
+    /// ascending surface id order.
+    pub fn take_outcomes(&mut self) -> Vec<InputOutcome> {
+        self.surfaces
+            .values_mut()
+            .filter_map(|s| s.live.as_mut())
+            .flat_map(|live| std::mem::take(&mut live.released_outcomes))
+            .collect()
+    }
+
+    /// Borrowed view of the default surface's last rasterized frame, if any.
+    ///
+    /// Prefer this (or the host's own last texture) over expecting
+    /// [`PaintOutput::rgba`] on a skipped paint — skipped paints return
+    /// `rgba: None` so the engine never copies the buffer.
+    pub fn last_frame(&self) -> Option<&RgbaImage> {
+        self.surface_last_frame(SurfaceId::DEFAULT)
+    }
+
+    /// Paint the default surface at `viewport` (updates its stored size first).
+    ///
+    /// Clean frames (nothing dirty, viewport size/scale unchanged) skip
+    /// raster and return [`PaintOutput`] with `skipped: true`, `rgba: None`, and
+    /// empty `damage` — no buffer copy. The host must keep its previous texture;
+    /// see [`Self::last_frame`] for a borrowed look at the cache.
+    ///
+    /// Style, layout and paint run once here. `sync` / swaps only record changes.
+    pub fn paint(&mut self, viewport: Viewport) -> Result<PaintOutput, EngineError> {
+        let _ = viewport.holes;
+        let surface = self
+            .surfaces
+            .get_mut(&SurfaceId::DEFAULT)
+            .ok_or(EngineError::NotLoaded)?;
+        surface.size = SurfaceSize::from_viewport(&viewport);
+        self.paint_surface(SurfaceId::DEFAULT)
+    }
+
+    pub fn last_timings(&self) -> Timings {
+        self.timings.clone()
+    }
+
+    /// Diagnostics for the last non-skipped paint (merge / full-repaint fallbacks).
+    pub fn last_paint_stats(&self) -> PaintStats {
+        self.paint_stats.clone()
+    }
+
+    /// Number of style+layout resolve passes executed inside `paint` (any
+    /// surface, including hidden pre-draws) since engine creation.
+    pub fn style_layout_pass_count(&self) -> u64 {
+        self.style_layout_passes
+    }
+
+    pub fn config(&self) -> &EngineConfig {
+        &self.config
+    }
+
+    /// Test helper: serialize current document HTML (root element outerHTML).
+    pub fn serialize_html(&self) -> Result<String, EngineError> {
+        let live = self
+            .live(SurfaceId::DEFAULT)
+            .ok_or(EngineError::NotLoaded)?;
+        Ok(live.doc.root_element().outer_html())
+    }
+
+    /// Test helper: read an attribute from an element by id.
+    pub fn attr(&self, id: &str, name: &str) -> Option<String> {
+        self.surface_attr(SurfaceId::DEFAULT, id, name)
+    }
+
+    /// Test helper: whether element has class token.
+    pub fn has_class(&self, id: &str, class: &str) -> bool {
+        self.attr(id, "class")
+            .map(|c| class_tokens(&c).any(|t| t == class))
+            .unwrap_or(false)
+    }
+
+    /// Test helper: pending timeout failures (A3c).
+    pub fn pending_timeout_failures(&self) -> &[PendingTimeout] {
+        self.live(SurfaceId::DEFAULT)
+            .map(|live| live.pending.timeout_failures.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Test helper: force a frame tick on every live surface without painting
+    /// (for timeout tests).
+    pub fn test_tick_frame(&mut self) {
+        self.frame_count = self.frame_count.saturating_add(1);
+        let timeout_frames = self.config.pending_timeout_frames;
+        for live in self.surfaces.values_mut().filter_map(|s| s.live.as_mut()) {
+            live.pending.tick_frames(timeout_frames);
+        }
+    }
+
+    /// Test helper: current focus.
+    pub fn focus_state(&self) -> &FocusState {
+        self.live(SurfaceId::DEFAULT)
+            .map(|live| &live.focus)
+            .unwrap_or(&NO_FOCUS)
+    }
+
+    /// Test helper: set focus by element id (for keyboard tests without Tab walking).
+    pub fn test_set_focus(&mut self, id: &str) {
+        if let Some(live) = self
+            .surfaces
+            .get_mut(&SurfaceId::DEFAULT)
+            .and_then(|s| s.live.as_mut())
+        {
+            if let Some(nid) = live.doc.get_element_by_id(id) {
+                live.doc.set_focus_to(nid);
+                live.focus.focused_id = Some(id.to_string());
+            }
+        }
+    }
+
+    /// Test helper: subscribed slice names the engine will ask `version` for.
+    pub fn subscribed_slices(&self) -> HashSet<String> {
+        let mut s = HashSet::new();
+        s.insert("actions".into());
+        if let Some(live) = self.live(SurfaceId::DEFAULT) {
+            for subs in live.sections.values() {
+                for n in subs {
+                    s.insert(n.clone());
                 }
             }
         }
-        Ok(())
+        s
+    }
+
+    /// Test helper: section ids.
+    pub fn section_ids(&self) -> Vec<String> {
+        self.live(SurfaceId::DEFAULT)
+            .map(|live| live.sections.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Test helper: engine focus order.
+    pub fn focusable_ids_for_test(&self) -> Vec<String> {
+        self.live(SurfaceId::DEFAULT)
+            .map(|live| focusable_ids(&live.doc))
+            .unwrap_or_default()
+    }
+}
+
+/// Outcome for input routed to a surface that is not live.
+fn unrouted_outcome(ev: InputEvent) -> InputOutcome {
+    match ev {
+        InputEvent::Key(key) => InputOutcome::Unhandled(key),
+        InputEvent::Text(s) => InputOutcome::Unhandled(KeyEvent {
+            key: s,
+            code: String::new(),
+            mods: Modifiers::default(),
+            repeat: false,
+            pressed: true,
+        }),
+        InputEvent::PointerLeave => InputOutcome::Hover { id: None },
+        InputEvent::PointerDown { .. } | InputEvent::PointerUp { .. } => {
+            InputOutcome::Press { id: None }
+        }
+        InputEvent::PointerMove { .. } => InputOutcome::None,
+    }
+}
+
+impl LiveSurface {
+    /// Parse + validate + index + one style/layout pass.
+    fn build(
+        declared_actions: &HashSet<String>,
+        html: &str,
+        size: SurfaceSize,
+    ) -> Result<Self, EngineError> {
+        let layout_viewport = (size.width, size.height);
+        let mut doc = parse_html_document(html, layout_viewport);
+
+        // HTML contract §2: strict dialect on loaded HTML, then index bindings.
+        let known_ids = collect_element_ids(&doc);
+        validate_loaded_tree(declared_actions, &doc, &known_ids)?;
+        let (bindings, sections) = index_bindings(declared_actions, &doc)?;
+
+        doc.resolve(0.0);
+        Ok(Self {
+            doc,
+            bindings,
+            sections,
+            slice_versions: HashMap::new(),
+            disabled_actions: HashMap::new(),
+            pending: PendingState::default(),
+            released_outcomes: Vec::new(),
+            hover_id: None,
+            press: None,
+            focus: FocusState::default(),
+            layout_viewport,
+            layout_scale: 1.0,
+            needs_resolve: false,
+            paint_dirty: true,
+            force_full_repaint: true,
+            cached_rgba: None,
+            last_bounds: BoundsSnapshot::new(),
+            range_drag_id: None,
+        })
+    }
+
+    /// Waiting on `complete()` (or a queued release the host has not taken yet).
+    fn has_pending_work(&self) -> bool {
+        !self.pending.by_source.is_empty()
+            || !self.pending.queued.is_empty()
+            || !self.released_outcomes.is_empty()
+    }
+
+    fn mark_paint_dirty(&mut self) {
+        self.paint_dirty = true;
     }
 
     /// Validate fragment HTML **before** applying a swap so a bad fragment is
@@ -217,103 +1038,36 @@ impl Engine {
     /// resolve; ids that only lived inside the replaced subtree do not.
     fn validate_fragment_html(
         &self,
+        declared_actions: &HashSet<String>,
         html: &str,
         target_nid: NodeId,
         swap: SwapMode,
     ) -> Result<(), EngineError> {
         let frag_doc = parse_html_document(html, self.layout_viewport);
-        let doc = self.doc.as_ref().ok_or(EngineError::NotLoaded)?;
-        let mut known_ids = collect_element_ids(doc);
-        for id in ids_removed_by_swap(doc, target_nid, swap) {
+        let mut known_ids = collect_element_ids(&self.doc);
+        for id in ids_removed_by_swap(&self.doc, target_nid, swap) {
             known_ids.remove(&id);
         }
         for id in collect_element_ids(&frag_doc) {
             known_ids.insert(id);
         }
-        self.validate_loaded_tree(&frag_doc, &known_ids)
-    }
-
-    fn index_document(&mut self, doc: &HtmlDocument) -> Result<(), EngineError> {
-        let root = doc.root_node().id;
-        let mut stack = vec![root];
-        while let Some(nid) = stack.pop() {
-            let Some(node) = doc.get_node(nid) else {
-                continue;
-            };
-            for &child in &node.children {
-                stack.push(child);
-            }
-            if !node.is_element() {
-                continue;
-            }
-            let (id_attr, attrs) = element_id_and_attrs(node);
-            if let Some(binding) = ElementBinding::from_attrs(&id_attr, &attrs)? {
-                if let Some(ref action) = binding.hx_post {
-                    if !self.declared_actions.contains(action) {
-                        return Err(EngineError::UndeclaredAction {
-                            name: action.clone(),
-                            source_id: binding.id.clone(),
-                        });
-                    }
-                }
-                if binding.is_section() {
-                    self.sections
-                        .insert(binding.id.clone(), binding.slice_subs.clone());
-                }
-                self.bindings.insert(binding.id.clone(), binding);
-            }
-        }
-        Ok(())
+        validate_loaded_tree(declared_actions, &frag_doc, &known_ids)
     }
 
     /// Re-index bindings after a DOM mutation (swap / attribute edits).
-    fn reindex_bindings(&mut self) -> Result<(), EngineError> {
-        let doc = self.doc.as_ref().ok_or(EngineError::NotLoaded)?;
-        self.bindings.clear();
-        let mut sections = HashMap::new();
-        let root = doc.root_node().id;
-        let mut stack = vec![root];
-        while let Some(nid) = stack.pop() {
-            let Some(node) = doc.get_node(nid) else {
-                continue;
-            };
-            for &child in &node.children {
-                stack.push(child);
-            }
-            if !node.is_element() {
-                continue;
-            }
-            let (id_attr, attrs) = element_id_and_attrs(node);
-            if let Some(binding) = ElementBinding::from_attrs(&id_attr, &attrs)? {
-                if let Some(ref action) = binding.hx_post {
-                    if !self.declared_actions.contains(action) {
-                        // Click-time unknown still fails loudly; keep load-time rule on reindex.
-                        return Err(EngineError::UndeclaredAction {
-                            name: action.clone(),
-                            source_id: binding.id.clone(),
-                        });
-                    }
-                }
-                if binding.is_section() {
-                    sections.insert(binding.id.clone(), binding.slice_subs.clone());
-                }
-                self.bindings.insert(binding.id.clone(), binding);
-            }
-        }
+    fn reindex_bindings(&mut self, declared_actions: &HashSet<String>) -> Result<(), EngineError> {
+        let (bindings, sections) = index_bindings(declared_actions, &self.doc)?;
+        self.bindings = bindings;
         self.sections = sections;
         Ok(())
     }
 
-    pub fn sync(
+    fn sync(
         &mut self,
+        declared_actions: &HashSet<String>,
         slices: &dyn SliceSource,
         frags: &mut dyn FragmentSource,
     ) -> Result<DirtySet, EngineError> {
-        let t0 = Instant::now();
-        if self.doc.is_none() {
-            return Err(EngineError::NotLoaded);
-        }
-
         // Always subscribe to `actions` for greying.
         let mut subscribed: HashSet<String> = HashSet::new();
         subscribed.insert("actions".into());
@@ -344,7 +1098,7 @@ impl Engine {
             for (section_id, subs) in section_list {
                 let slice_refs: Vec<&str> = subs.iter().map(|s| s.as_str()).collect();
                 let html = frags.render(&section_id, &slice_refs);
-                self.swap_section(&section_id, &html)?;
+                self.swap_section(declared_actions, &section_id, &html)?;
                 dirty_sections.push(section_id);
             }
         } else {
@@ -364,7 +1118,7 @@ impl Engine {
                 if subs.iter().any(|s| dirty_slices.contains(s)) {
                     let slice_refs: Vec<&str> = subs.iter().map(|s| s.as_str()).collect();
                     let html = frags.render(&section_id, &slice_refs);
-                    self.swap_section(&section_id, &html)?;
+                    self.swap_section(declared_actions, &section_id, &html)?;
                     dirty_sections.push(section_id);
                 }
             }
@@ -378,7 +1132,7 @@ impl Engine {
         self.apply_action_states(
             slices.action_states(),
             !dirty_sections.is_empty() || initial,
-        )?;
+        );
 
         // Count mutation damage before any resolve (A5). Style/layout run once
         // in `paint()` — sync and swaps only record changes (issue #8 step 1).
@@ -394,7 +1148,6 @@ impl Engine {
             self.mark_paint_dirty();
         }
 
-        self.timings.sync_ns = t0.elapsed().as_nanos() as u64;
         Ok(DirtySet {
             sections: dirty_sections,
             damaged_node_count,
@@ -402,7 +1155,12 @@ impl Engine {
         })
     }
 
-    fn swap_section(&mut self, section_id: &str, html: &str) -> Result<(), EngineError> {
+    fn swap_section(
+        &mut self,
+        declared_actions: &HashSet<String>,
+        section_id: &str,
+        html: &str,
+    ) -> Result<(), EngineError> {
         let binding = self
             .bindings
             .get(section_id)
@@ -418,31 +1176,26 @@ impl Engine {
 
         // Same dialect rules as load_html; failure returns EngineError from sync
         // and leaves the previous DOM in place for this section.
-        self.validate_fragment_html(html, target_id, swap)?;
+        self.validate_fragment_html(declared_actions, html, target_id, swap)?;
 
         match swap {
             SwapMode::InnerHtml => {
-                let doc = self.doc.as_mut().unwrap();
-                let mut mutr = doc.mutate();
+                let mut mutr = self.doc.mutate();
                 mutr.set_inner_html(target_id, html);
             }
             SwapMode::OuterHtml => {
                 let wrapper_id = {
-                    let doc = self.doc.as_mut().unwrap();
-                    let mut mutr = doc.mutate();
+                    let mut mutr = self.doc.mutate();
                     let wrapper_id = mutr.create_element(qual_name!("div"), vec![]);
                     mutr.set_inner_html(wrapper_id, html);
                     wrapper_id
                 };
                 let children: Vec<NodeId> = self
                     .doc
-                    .as_ref()
-                    .unwrap()
                     .get_node(wrapper_id)
-                    .map(|n| n.children.iter().copied().collect())
+                    .map(|n| n.children.to_vec())
                     .unwrap_or_default();
-                let doc = self.doc.as_mut().unwrap();
-                let mut mutr = doc.mutate();
+                let mut mutr = self.doc.mutate();
                 if children.is_empty() {
                     mutr.remove_and_drop_node(target_id);
                 } else {
@@ -455,12 +1208,12 @@ impl Engine {
         self.needs_resolve = true;
         self.mark_paint_dirty();
         // Reindex after swap so new hx-* inside fragments are visible.
-        self.reindex_bindings()?;
+        self.reindex_bindings(declared_actions)?;
         Ok(())
     }
 
     fn resolve_selector(&self, sel: &str) -> Result<NodeId, EngineError> {
-        let doc = self.doc.as_ref().ok_or(EngineError::NotLoaded)?;
+        let doc = &self.doc;
         let sel = sel.trim();
         if let Some(id) = sel.strip_prefix('#') {
             return doc
@@ -483,11 +1236,7 @@ impl Engine {
     /// may have replaced elements that still need the current greying written.
     /// When the desired disabled/reason map matches `disabled_actions` and no
     /// DOM pass is forced, this is a no-op: no attribute writes and no paint dirty.
-    fn apply_action_states(
-        &mut self,
-        states: Vec<(String, ActionState)>,
-        force_dom_pass: bool,
-    ) -> Result<(), EngineError> {
+    fn apply_action_states(&mut self, states: Vec<(String, ActionState)>, force_dom_pass: bool) {
         let mut new_disabled: HashMap<String, String> = HashMap::new();
         for (name, state) in &states {
             if let ActionState::Disabled { reason } = state {
@@ -497,22 +1246,20 @@ impl Engine {
 
         let map_changed = new_disabled != self.disabled_actions;
         if !map_changed && !force_dom_pass {
-            return Ok(());
+            return;
         }
 
         // Desired reason per element with hx-post (None = enabled / clear greying).
-        let desired: Vec<(String, NodeId, Option<String>)> = {
-            let doc = self.doc.as_ref().unwrap();
-            self.bindings
-                .values()
-                .filter_map(|b| {
-                    let action = b.hx_post.as_ref()?;
-                    let nid = doc.get_element_by_id(&b.id)?;
-                    let reason = new_disabled.get(action).cloned();
-                    Some((b.id.clone(), nid, reason))
-                })
-                .collect()
-        };
+        let desired: Vec<(String, NodeId, Option<String>)> = self
+            .bindings
+            .values()
+            .filter_map(|b| {
+                let action = b.hx_post.as_ref()?;
+                let nid = self.doc.get_element_by_id(&b.id)?;
+                let reason = new_disabled.get(action).cloned();
+                Some((b.id.clone(), nid, reason))
+            })
+            .collect();
 
         // Compare against attributes already on the element; only write diffs.
         let mut node_updates: Vec<(NodeId, Option<String>)> = Vec::new();
@@ -536,12 +1283,11 @@ impl Engine {
         self.disabled_actions = new_disabled;
 
         if node_updates.is_empty() {
-            return Ok(());
+            return;
         }
 
         {
-            let doc = self.doc.as_mut().unwrap();
-            let mut mutr = doc.mutate();
+            let mut mutr = self.doc.mutate();
             for (elem_id, reason) in node_updates {
                 match reason {
                     Some(r) => {
@@ -573,13 +1319,10 @@ impl Engine {
         }
         self.needs_resolve = true;
         self.mark_paint_dirty();
-        Ok(())
     }
 
     fn count_damage(&self) -> (usize, usize) {
-        let Some(doc) = self.doc.as_ref() else {
-            return (0, 0);
-        };
+        let doc = &self.doc;
         let mut damaged = 0usize;
         let mut total = 0usize;
         let root = doc.root_node().id;
@@ -602,15 +1345,13 @@ impl Engine {
     }
 
     fn ensure_resolved(&mut self) {
-        if let Some(doc) = self.doc.as_mut() {
-            if self.needs_resolve {
-                doc.resolve(0.0);
-                self.needs_resolve = false;
-            }
+        if self.needs_resolve {
+            self.doc.resolve(0.0);
+            self.needs_resolve = false;
         }
     }
 
-    pub fn input(&mut self, ev: InputEvent) -> InputOutcome {
+    fn input(&mut self, ctx: &mut ActionCtx<'_>, ev: InputEvent) -> InputOutcome {
         match ev {
             InputEvent::Text(s) => {
                 // Reserved — first scope has no text fields.
@@ -627,14 +1368,16 @@ impl Engine {
             InputEvent::PointerDown { x, y, button, mods } => {
                 self.on_pointer_down(x, y, button, mods)
             }
-            InputEvent::PointerUp { x, y, button, mods } => self.on_pointer_up(x, y, button, mods),
-            InputEvent::Key(key) => self.on_key(key),
+            InputEvent::PointerUp { x, y, button, mods } => {
+                self.on_pointer_up(ctx, x, y, button, mods)
+            }
+            InputEvent::Key(key) => self.on_key(ctx, key),
         }
     }
 
     fn hit_id(&mut self, x: f32, y: f32) -> Option<String> {
         self.ensure_resolved();
-        let doc = self.doc.as_ref()?;
+        let doc = &self.doc;
         let nid = doc.element_from_point(x, y)?;
         // Walk up to nearest element with an id that we know about, else any id.
         let mut cur = Some(nid);
@@ -659,7 +1402,7 @@ impl Engine {
     fn on_pointer_leave(&mut self) -> InputOutcome {
         self.press = None;
         self.range_drag_id = None;
-        if self.clear_blitz_hover() {
+        if self.doc.clear_hover() {
             self.mark_paint_dirty();
         }
         self.hover_id = None;
@@ -678,9 +1421,9 @@ impl Engine {
         let out_of_bounds = x < 0.0 || y < 0.0 || x >= vw as f32 || y >= vh as f32;
 
         let hover_changed = if out_of_bounds {
-            self.clear_blitz_hover()
+            self.doc.clear_hover()
         } else {
-            self.set_blitz_hover(x, y)
+            self.doc.set_hover_to(x, y)
         };
         if hover_changed {
             self.mark_paint_dirty();
@@ -699,20 +1442,6 @@ impl Engine {
         }
     }
 
-    fn set_blitz_hover(&mut self, x: f32, y: f32) -> bool {
-        self.doc
-            .as_mut()
-            .map(|doc| doc.set_hover_to(x, y))
-            .unwrap_or(false)
-    }
-
-    fn clear_blitz_hover(&mut self) -> bool {
-        self.doc
-            .as_mut()
-            .map(|doc| doc.clear_hover())
-            .unwrap_or(false)
-    }
-
     fn on_pointer_down(
         &mut self,
         x: f32,
@@ -723,11 +1452,9 @@ impl Engine {
         let id = self.hit_id(x, y);
         if let Some(ref eid) = id {
             // Focus the element on press.
-            if let Some(doc) = self.doc.as_mut() {
-                if let Some(nid) = doc.get_element_by_id(eid) {
-                    doc.set_focus_to(nid);
-                    self.focus.focused_id = Some(eid.clone());
-                }
+            if let Some(nid) = self.doc.get_element_by_id(eid) {
+                self.doc.set_focus_to(nid);
+                self.focus.focused_id = Some(eid.clone());
             }
             // Primary press on a range: set value from x and begin drag.
             self.range_drag_id = None;
@@ -750,6 +1477,7 @@ impl Engine {
 
     fn on_pointer_up(
         &mut self,
+        ctx: &mut ActionCtx<'_>,
         x: f32,
         y: f32,
         button: PointerButton,
@@ -792,6 +1520,7 @@ impl Engine {
         };
 
         self.fire_pointer_or_key_on(
+            ctx,
             &press.id,
             trigger_event,
             FilterCtx {
@@ -808,6 +1537,7 @@ impl Engine {
 
     fn fire_pointer_or_key_on(
         &mut self,
+        ctx: &mut ActionCtx<'_>,
         source_id: &str,
         event: TriggerEvent,
         filter_ctx: FilterCtx<'_>,
@@ -815,6 +1545,7 @@ impl Engine {
         clicked_fallback: Option<InputOutcome>,
     ) -> InputOutcome {
         self.fire_on(
+            ctx,
             source_id,
             event,
             filter_ctx,
@@ -825,8 +1556,10 @@ impl Engine {
     }
 
     /// `allow_from_body`: when true, match triggers that declared `from:body`/`from:document`.
+    #[allow(clippy::too_many_arguments)]
     fn fire_on(
         &mut self,
+        ctx: &mut ActionCtx<'_>,
         source_id: &str,
         event: TriggerEvent,
         filter_ctx: FilterCtx<'_>,
@@ -867,6 +1600,7 @@ impl Engine {
         {
             if let Some(parent_id) = self.parent_element_id(source_id) {
                 return self.fire_on(
+                    ctx,
                     &parent_id,
                     event,
                     filter_ctx,
@@ -888,7 +1622,7 @@ impl Engine {
         };
 
         // Click-time undeclared check.
-        if !self.declared_actions.contains(&action_name) {
+        if !ctx.declared_actions.contains(&action_name) {
             panic!("hx_native: unknown action `{action_name}` at click time (test failure)");
         }
 
@@ -927,6 +1661,7 @@ impl Engine {
         }
 
         self.emit_action(
+            ctx,
             source_id,
             &action_name,
             args,
@@ -936,25 +1671,19 @@ impl Engine {
     }
 
     fn action_args_for(&self, source_id: &str) -> Vec<(String, String)> {
-        match self.doc.as_ref() {
-            Some(doc) => collect_action_args(doc, source_id),
-            None => Vec::new(),
-        }
+        collect_action_args(&self.doc, source_id)
     }
 
     fn element_is_range(&self, id: &str) -> bool {
         self.doc
-            .as_ref()
-            .and_then(|doc| doc.get_element_by_id(id).and_then(|nid| doc.get_node(nid)))
+            .get_element_by_id(id)
+            .and_then(|nid| self.doc.get_node(nid))
             .is_some_and(is_range_input)
     }
 
     fn apply_range_from_x(&mut self, id: &str, x: f32) -> bool {
         self.ensure_resolved();
-        let changed = match self.doc.as_mut() {
-            Some(doc) => set_range_value_from_x(doc, id, x),
-            None => false,
-        };
+        let changed = set_range_value_from_x(&mut self.doc, id, x);
         if changed {
             self.needs_resolve = true;
             self.mark_paint_dirty();
@@ -968,11 +1697,8 @@ impl Engine {
         };
         let is_numeric = self
             .doc
-            .as_ref()
-            .and_then(|doc| {
-                doc.get_element_by_id(&fid)
-                    .and_then(|nid| doc.get_node(nid))
-            })
+            .get_element_by_id(&fid)
+            .and_then(|nid| self.doc.get_node(nid))
             .is_some_and(is_numeric_input);
         if !is_numeric {
             return false;
@@ -982,11 +1708,7 @@ impl Engine {
             "ArrowDown" | "ArrowLeft" => -1,
             _ => return false,
         };
-        let changed = match self.doc.as_mut() {
-            Some(doc) => step_numeric_value(doc, &fid, dir),
-            None => false,
-        };
-        if changed {
+        if step_numeric_value(&mut self.doc, &fid, dir) {
             self.needs_resolve = true;
             self.mark_paint_dirty();
         }
@@ -994,7 +1716,7 @@ impl Engine {
     }
 
     fn parent_element_id(&self, id: &str) -> Option<String> {
-        let doc = self.doc.as_ref()?;
+        let doc = &self.doc;
         let nid = doc.get_element_by_id(id)?;
         let mut parent = doc.get_node(nid)?.parent;
         while let Some(pid) = parent {
@@ -1016,14 +1738,14 @@ impl Engine {
 
     fn emit_action(
         &mut self,
+        ctx: &mut ActionCtx<'_>,
         source_id: &str,
         action_name: &str,
         args: Vec<(String, String)>,
         trigger: TriggerInfo,
         indicator_id: Option<String>,
     ) -> InputOutcome {
-        let request = RequestId(self.next_request_id);
-        self.next_request_id += 1;
+        let request = ctx.requests.issue(ctx.surface);
 
         self.pending.insert(PendingEntry {
             request,
@@ -1054,10 +1776,7 @@ impl Engine {
             }
             v
         };
-        let doc = match self.doc.as_mut() {
-            Some(d) => d,
-            None => return,
-        };
+        let doc = &mut self.doc;
         for eid in ids {
             let Some(nid) = doc.get_element_by_id(&eid) else {
                 continue;
@@ -1103,7 +1822,7 @@ impl Engine {
         self.mark_paint_dirty();
     }
 
-    fn on_key(&mut self, key: KeyEvent) -> InputOutcome {
+    fn on_key(&mut self, ctx: &mut ActionCtx<'_>, key: KeyEvent) -> InputOutcome {
         let event = if key.pressed {
             TriggerEvent::KeyDown
         } else {
@@ -1135,7 +1854,7 @@ impl Engine {
                 })
                 .unwrap_or_default();
 
-            let ctx = filter_ctx_from_key(&key);
+            let filter_ctx = filter_ctx_from_key(&key);
             let mut matched_filter_ok = false;
             for t in &triggers {
                 if matches!(event, TriggerEvent::KeyDown)
@@ -1144,7 +1863,11 @@ impl Engine {
                 {
                     continue;
                 }
-                let ok = t.filter.as_ref().map(|f| f.eval(&ctx)).unwrap_or(true);
+                let ok = t
+                    .filter
+                    .as_ref()
+                    .map(|f| f.eval(&filter_ctx))
+                    .unwrap_or(true);
                 if ok {
                     matched_filter_ok = true;
                     break;
@@ -1158,23 +1881,28 @@ impl Engine {
                     mods: key.mods,
                     repeat: key.repeat,
                 };
-                return self.fire_pointer_or_key_on(fid, event.clone(), ctx, trigger_info, None);
+                return self.fire_pointer_or_key_on(
+                    ctx,
+                    fid,
+                    event.clone(),
+                    filter_ctx,
+                    trigger_info,
+                    None,
+                );
             }
         }
 
         // (b) Tab / Shift+Tab focus order (engine-owned document-order walk).
         if key.pressed && key.key == "Tab" {
             self.ensure_resolved();
-            let order = self.doc.as_ref().map(focusable_ids).unwrap_or_default();
+            let order = focusable_ids(&self.doc);
             let next = step_focus(&order, self.focus.focused_id.as_deref(), key.mods.shift);
             if let Some(ref nid_str) = next {
-                if let Some(doc) = self.doc.as_mut() {
-                    if let Some(nid) = doc.get_element_by_id(nid_str) {
-                        doc.set_focus_to(nid);
-                    }
+                if let Some(nid) = self.doc.get_element_by_id(nid_str) {
+                    self.doc.set_focus_to(nid);
                 }
-            } else if let Some(doc) = self.doc.as_mut() {
-                doc.clear_focus();
+            } else {
+                self.doc.clear_focus();
             }
             self.focus.focused_id = next;
             self.mark_paint_dirty();
@@ -1199,7 +1927,7 @@ impl Engine {
                     };
                     // Activate like click: use Click event matching on the element,
                     // but TriggerInfo::Key as required.
-                    return self.activate_like_click(fid, trigger_info);
+                    return self.activate_like_click(ctx, fid, trigger_info);
                 }
             }
         }
@@ -1209,12 +1937,8 @@ impl Engine {
         // matches are skipped; if every match is greyed → Blocked with the first
         // greyed match's reason (Designer pause/resume Space pattern).
         {
-            let ctx = filter_ctx_from_key(&key);
-            let order = self
-                .doc
-                .as_ref()
-                .map(ids_in_document_order)
-                .unwrap_or_default();
+            let filter_ctx = filter_ctx_from_key(&key);
+            let order = ids_in_document_order(&self.doc);
             let trigger_info = TriggerInfo::Key {
                 event: if key.pressed { "keydown" } else { "keyup" },
                 key: key.key.clone(),
@@ -1241,7 +1965,11 @@ impl Engine {
                     {
                         continue;
                     }
-                    let ok = t.filter.as_ref().map(|f| f.eval(&ctx)).unwrap_or(true);
+                    let ok = t
+                        .filter
+                        .as_ref()
+                        .map(|f| f.eval(&filter_ctx))
+                        .unwrap_or(true);
                     if ok {
                         matched = true;
                         break;
@@ -1256,7 +1984,7 @@ impl Engine {
                     }
                     continue;
                 }
-                return self.fire_on(&id, event, ctx, trigger_info, None, true);
+                return self.fire_on(ctx, &id, event, filter_ctx, trigger_info, None, true);
             }
             if let Some((source_id, name, reason)) = first_greyed {
                 return InputOutcome::Blocked {
@@ -1272,7 +2000,12 @@ impl Engine {
         InputOutcome::Unhandled(key)
     }
 
-    fn activate_like_click(&mut self, source_id: &str, trigger_info: TriggerInfo) -> InputOutcome {
+    fn activate_like_click(
+        &mut self,
+        ctx: &mut ActionCtx<'_>,
+        source_id: &str,
+        trigger_info: TriggerInfo,
+    ) -> InputOutcome {
         let binding = match self.bindings.get(source_id).cloned() {
             Some(b) => b,
             None => return InputOutcome::None,
@@ -1280,7 +2013,7 @@ impl Engine {
         let Some(action_name) = binding.hx_post.clone() else {
             return InputOutcome::None;
         };
-        if !self.declared_actions.contains(&action_name) {
+        if !ctx.declared_actions.contains(&action_name) {
             panic!("hx_native: unknown action `{action_name}` at activation time");
         }
         if let Some(reason) = self.disabled_actions.get(&action_name).cloned() {
@@ -1311,6 +2044,7 @@ impl Engine {
             }
         }
         self.emit_action(
+            ctx,
             source_id,
             &action_name,
             args,
@@ -1319,11 +2053,17 @@ impl Engine {
         )
     }
 
-    pub fn complete(&mut self, request: RequestId, result: Result<(), Reason>) {
+    fn complete(
+        &mut self,
+        ctx: &mut ActionCtx<'_>,
+        request: RequestId,
+        result: Result<(), Reason>,
+    ) {
         if self.pending.timed_out.contains_key(&request) {
             // Late complete after timeout: no-op.
             return;
         }
+        ctx.requests.owners.remove(&request);
         let Some(source_id) = self.pending.by_request.remove(&request) else {
             self.pending.unknown_completes.push(request);
             #[cfg(debug_assertions)]
@@ -1336,15 +2076,13 @@ impl Engine {
 
         if let Err(reason) = result {
             // Show like Blocked: set data-hx-reason on the source element.
-            if let Some(doc) = self.doc.as_mut() {
-                if let Some(nid) = doc.get_element_by_id(&source_id) {
-                    let mut mutr = doc.mutate();
-                    mutr.set_attribute(
-                        nid,
-                        QualName::new(None, ns!(), LocalName::from("data-hx-reason")),
-                        &reason.0,
-                    );
-                }
+            if let Some(nid) = self.doc.get_element_by_id(&source_id) {
+                let mut mutr = self.doc.mutate();
+                mutr.set_attribute(
+                    nid,
+                    QualName::new(None, ns!(), LocalName::from("data-hx-reason")),
+                    &reason.0,
+                );
             }
             self.needs_resolve = true;
             self.mark_paint_dirty();
@@ -1353,6 +2091,7 @@ impl Engine {
         // Release queued action if any.
         if let Some(q) = self.pending.queued.remove(&source_id) {
             let outcome = self.emit_action(
+                ctx,
                 &q.source_id,
                 &q.action_name,
                 q.args,
@@ -1363,103 +2102,59 @@ impl Engine {
         }
     }
 
-    pub fn take_outcomes(&mut self) -> Vec<InputOutcome> {
-        std::mem::take(&mut self.released_outcomes)
-    }
-
-    /// Borrowed view of the last rasterized frame, if any.
-    ///
-    /// Prefer this (or the host's own last texture) over expecting
-    /// [`PaintOutput::rgba`] on a skipped paint — skipped paints return
-    /// `rgba: None` so the engine never copies the buffer.
-    pub fn last_frame(&self) -> Option<&RgbaImage> {
-        self.cached_rgba.as_ref()
-    }
-
-    /// Paint into a CPU RGBA buffer the host composites.
-    ///
-    /// Clean frames (`paint_dirty` false, viewport size/scale unchanged) skip
-    /// raster and return [`PaintOutput`] with `skipped: true`, `rgba: None`, and
-    /// empty `damage` — no buffer copy. The host must keep its previous texture;
-    /// see [`Self::last_frame`] for a borrowed look at the cache.
-    ///
-    /// Style, layout and paint run once here. `sync` / swaps only record changes.
-    pub fn paint(&mut self, viewport: Viewport) -> Result<PaintOutput, EngineError> {
-        let t0 = Instant::now();
-        let scale = if viewport.scale > 0.0 {
-            viewport.scale
-        } else {
-            1.0
-        };
-        let size_changed = self.layout_viewport != (viewport.width, viewport.height);
+    /// Style + layout + raster when dirty (or forced). `plan == None` means the
+    /// frame was clean and raster was skipped.
+    fn render(
+        &mut self,
+        size: SurfaceSize,
+        paint_mode: PaintMode,
+    ) -> Result<RenderResult, EngineError> {
+        let SurfaceSize {
+            width,
+            height,
+            scale,
+        } = size;
+        let size_changed = self.layout_viewport != (width, height);
         let scale_changed = (self.layout_scale - scale).abs() > f64::EPSILON;
         let first_frame = self.cached_rgba.is_none();
         let force_full = self.force_full_repaint || first_frame || size_changed || scale_changed;
 
-        self.layout_viewport = (viewport.width, viewport.height);
+        self.layout_viewport = (width, height);
         self.layout_scale = scale;
-
-        // Frame tick for pending timeout backstop (always advances).
-        self.frame_count = self.frame_count.saturating_add(1);
-        self.pending.tick_frames(self.config.pending_timeout_frames);
 
         // Spec: skip clean frames — no raster when nothing is damaged and size is unchanged.
         if !self.paint_dirty && !force_full {
-            self.timings.paint_ns = t0.elapsed().as_nanos() as u64;
-            self.timings.paint_skipped = true;
-            self.paint_stats = PaintStats::default();
-            let _ = viewport.holes;
-            return Ok(PaintOutput {
-                rgba: None,
-                texture: None,
-                focus: self.focus.clone(),
-                skipped: true,
-                damage: Vec::new(),
+            return Ok(RenderResult {
+                plan: None,
+                style_layout_passes: 0,
             });
         }
 
-        let plan =
-            self.resolve_and_plan_damage(viewport.width, viewport.height, scale, force_full)?;
+        let (plan, passes) = self.resolve_and_plan_damage(width, height, scale, force_full);
+        let rgba = self.rasterize_plan(&plan, width, height, scale, paint_mode)?;
 
-        let rgba = self.rasterize_plan(&plan, viewport.width, viewport.height, scale)?;
-
-        self.timings.paint_ns = t0.elapsed().as_nanos() as u64;
-        self.timings.paint_skipped = false;
         self.paint_dirty = false;
         self.force_full_repaint = false;
-        self.paint_stats = PaintStats {
-            damage_rect_count: plan.rects.len(),
-            merged_to_bbox: plan.merged_to_bbox,
-            full_repaint_area_fallback: plan.full_repaint_area_fallback,
-            full_repaint: plan.full_repaint,
-        };
-        self.cached_rgba = Some(rgba.clone());
-
-        // Holes: Layer 1 crate unit does not composite host textures (UI owns that).
-        let _ = viewport.holes;
-
-        let damage: Vec<Rect> = plan.rects.iter().map(|r| r.to_rect()).collect();
-        Ok(PaintOutput {
-            rgba: Some(rgba),
-            texture: None,
-            focus: self.focus.clone(),
-            skipped: false,
-            damage,
+        self.cached_rgba = Some(rgba);
+        Ok(RenderResult {
+            plan: Some(plan),
+            style_layout_passes: passes,
         })
     }
 
-    /// Run style + layout once, then compute a damage plan.
+    /// Run style + layout once, then compute a damage plan. Returns the plan and
+    /// the number of style+layout passes run.
     fn resolve_and_plan_damage(
         &mut self,
         width: u32,
         height: u32,
         scale: f64,
         force_full: bool,
-    ) -> Result<DamagePlan, EngineError> {
+    ) -> (DamagePlan, u64) {
         let had_previous = !self.last_bounds.is_empty() && self.cached_rgba.is_some();
         let previous = std::mem::take(&mut self.last_bounds);
 
-        let doc = self.doc.as_mut().ok_or(EngineError::NotLoaded)?;
+        let doc = &mut self.doc;
         doc.set_viewport(BlitzViewport::new(
             width,
             height,
@@ -1480,12 +2175,12 @@ impl Engine {
         // node changes (Graph: at most 2 passes total per paint).
         let hover_before = doc.get_hover_node_id();
         doc.resolve(0.0);
-        self.style_layout_passes = self.style_layout_passes.saturating_add(1);
+        let mut passes = 1;
         // resolve() ends with refresh_hover(); compare hover node to decide follow-up.
         let hover_changed = doc.get_hover_node_id() != hover_before;
         if hover_changed {
             doc.resolve(0.0);
-            self.style_layout_passes = self.style_layout_passes.saturating_add(1);
+            passes += 1;
         }
         self.needs_resolve = false;
 
@@ -1503,7 +2198,7 @@ impl Engine {
         };
 
         self.last_bounds = snapshot_bounds(doc, scale);
-        Ok(plan)
+        (plan, passes)
     }
 
     fn rasterize_plan(
@@ -1512,12 +2207,12 @@ impl Engine {
         width: u32,
         height: u32,
         scale: f64,
+        paint_mode: PaintMode,
     ) -> Result<RgbaImage, EngineError> {
-        let doc = self.doc.as_mut().ok_or(EngineError::NotLoaded)?;
         if plan.full_repaint
             || plan.rects.len() == 1 && plan.rects[0] == IntRect::full_surface(width, height)
         {
-            return paint_rgba(doc, width, height, scale);
+            return paint_rgba(&mut self.doc, width, height, scale);
         }
 
         let mut frame = self.cached_rgba.take().unwrap_or_else(|| RgbaImage {
@@ -1532,40 +2227,14 @@ impl Engine {
                 pixels: vec![0u8; (width as usize) * (height as usize) * 4],
             };
         }
-        paint_damage_into(doc, &mut frame, scale, &plan.rects, self.config.paint_mode)?;
+        paint_damage_into(&mut self.doc, &mut frame, scale, &plan.rects, paint_mode)?;
         Ok(frame)
     }
 
-    pub fn last_timings(&self) -> Timings {
-        self.timings.clone()
-    }
-
-    /// Diagnostics for the last non-skipped paint (merge / full-repaint fallbacks).
-    pub fn last_paint_stats(&self) -> PaintStats {
-        self.paint_stats.clone()
-    }
-
-    /// Number of style+layout resolve passes executed inside `paint` since engine creation.
-    pub fn style_layout_pass_count(&self) -> u64 {
-        self.style_layout_passes
-    }
-
-    pub fn config(&self) -> &EngineConfig {
-        &self.config
-    }
-
-    /// Test helper: serialize current document HTML (root element outerHTML).
-    pub fn serialize_html(&self) -> Result<String, EngineError> {
-        let doc = self.doc.as_ref().ok_or(EngineError::NotLoaded)?;
-        let root = doc.root_element();
-        Ok(root.outer_html())
-    }
-
-    /// Test helper: read an attribute from an element by id.
-    pub fn attr(&self, id: &str, name: &str) -> Option<String> {
-        let doc = self.doc.as_ref()?;
-        let nid = doc.get_element_by_id(id)?;
-        let node = doc.get_node(nid)?;
+    /// Read an attribute from an element by id.
+    fn attr(&self, id: &str, name: &str) -> Option<String> {
+        let nid = self.doc.get_element_by_id(id)?;
+        let node = self.doc.get_node(nid)?;
         node.attrs().and_then(|attrs| {
             attrs
                 .iter()
@@ -1573,61 +2242,86 @@ impl Engine {
                 .map(|a| a.value.to_string())
         })
     }
+}
 
-    /// Test helper: whether element has class token.
-    pub fn has_class(&self, id: &str, class: &str) -> bool {
-        self.attr(id, "class")
-            .map(|c| class_tokens(&c).any(|t| t == class))
-            .unwrap_or(false)
-    }
-
-    /// Test helper: pending timeout failures (A3c).
-    pub fn pending_timeout_failures(&self) -> &[crate::pending::PendingTimeout] {
-        &self.pending.timeout_failures
-    }
-
-    /// Test helper: force a frame tick without painting (for timeout tests).
-    pub fn test_tick_frame(&mut self) {
-        self.frame_count = self.frame_count.saturating_add(1);
-        self.pending.tick_frames(self.config.pending_timeout_frames);
-    }
-
-    /// Test helper: current focus.
-    pub fn focus_state(&self) -> &FocusState {
-        &self.focus
-    }
-
-    /// Test helper: set focus by element id (for keyboard tests without Tab walking).
-    pub fn test_set_focus(&mut self, id: &str) {
-        if let Some(doc) = self.doc.as_mut() {
-            if let Some(nid) = doc.get_element_by_id(id) {
-                doc.set_focus_to(nid);
-                self.focus.focused_id = Some(id.to_string());
+/// Walk a freshly parsed tree (document or fragment) and enforce the locked
+/// attribute dialect. Does **not** run on live-DOM reindex after the engine
+/// writes `data-hx-reason`.
+fn validate_loaded_tree(
+    declared_actions: &HashSet<String>,
+    doc: &HtmlDocument,
+    known_ids: &HashSet<String>,
+) -> Result<(), EngineError> {
+    let root = doc.root_node().id;
+    let mut stack = vec![root];
+    while let Some(nid) = stack.pop() {
+        let Some(node) = doc.get_node(nid) else {
+            continue;
+        };
+        for &child in &node.children {
+            stack.push(child);
+        }
+        if !node.is_element() {
+            continue;
+        }
+        let (id_attr, attrs) = element_id_and_attrs(node);
+        validate_loaded_attrs(&id_attr, &attrs, known_ids)?;
+        if let Some(binding) = ElementBinding::from_attrs(&id_attr, &attrs)? {
+            if let Some(ref action) = binding.hx_post {
+                if !declared_actions.contains(action) {
+                    return Err(EngineError::UndeclaredAction {
+                        name: action.clone(),
+                        source_id: binding.id.clone(),
+                    });
+                }
             }
         }
     }
+    Ok(())
+}
 
-    /// Test helper: subscribed slice names the engine will ask `version` for.
-    pub fn subscribed_slices(&self) -> HashSet<String> {
-        let mut s = HashSet::new();
-        s.insert("actions".into());
-        for subs in self.sections.values() {
-            for n in subs {
-                s.insert(n.clone());
-            }
+type BindingIndex = (
+    HashMap<String, ElementBinding>,
+    HashMap<String, Vec<String>>,
+);
+
+/// Index element bindings and sections (section_id -> subscribed slices).
+fn index_bindings(
+    declared_actions: &HashSet<String>,
+    doc: &HtmlDocument,
+) -> Result<BindingIndex, EngineError> {
+    let mut bindings = HashMap::new();
+    let mut sections = HashMap::new();
+    let root = doc.root_node().id;
+    let mut stack = vec![root];
+    while let Some(nid) = stack.pop() {
+        let Some(node) = doc.get_node(nid) else {
+            continue;
+        };
+        for &child in &node.children {
+            stack.push(child);
         }
-        s
+        if !node.is_element() {
+            continue;
+        }
+        let (id_attr, attrs) = element_id_and_attrs(node);
+        if let Some(binding) = ElementBinding::from_attrs(&id_attr, &attrs)? {
+            if let Some(ref action) = binding.hx_post {
+                if !declared_actions.contains(action) {
+                    // Click-time unknown still fails loudly; keep load-time rule on reindex.
+                    return Err(EngineError::UndeclaredAction {
+                        name: action.clone(),
+                        source_id: binding.id.clone(),
+                    });
+                }
+            }
+            if binding.is_section() {
+                sections.insert(binding.id.clone(), binding.slice_subs.clone());
+            }
+            bindings.insert(binding.id.clone(), binding);
+        }
     }
-
-    /// Test helper: section ids.
-    pub fn section_ids(&self) -> Vec<String> {
-        self.sections.keys().cloned().collect()
-    }
-
-    /// Test helper: engine focus order.
-    pub fn focusable_ids_for_test(&self) -> Vec<String> {
-        self.doc.as_ref().map(focusable_ids).unwrap_or_default()
-    }
+    Ok((bindings, sections))
 }
 
 fn parse_html_document(html: &str, layout_viewport: (u32, u32)) -> HtmlDocument {

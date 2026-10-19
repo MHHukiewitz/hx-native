@@ -13,6 +13,7 @@ fn boot(html: &str) -> Engine {
         max_paint_ns: 50_000_000,
         pending_timeout_frames: 5,
         paint_mode: PaintMode::Exact,
+        ..Default::default()
     });
     eng.declare_actions(&[
         "time.pause",

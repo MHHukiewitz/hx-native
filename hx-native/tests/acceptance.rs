@@ -28,6 +28,7 @@ fn boot(html: &str) -> Engine {
         max_paint_ns: 50_000_000,
         pending_timeout_frames: 5,
         paint_mode: PaintMode::Exact,
+        ..Default::default()
     });
     eng.declare_actions(default_actions());
     eng.load_html(html).expect("load_html");
@@ -359,6 +360,7 @@ fn a3c_pending_lifecycle() {
         max_paint_ns: 50_000_000,
         pending_timeout_frames: 2,
         paint_mode: PaintMode::Exact,
+        ..Default::default()
     });
     eng2.declare_actions(default_actions());
     eng2.load_html(FIXTURE).unwrap();
@@ -1510,6 +1512,7 @@ fn boot_tooltip(css: &str, button_attrs: &str) -> Engine {
         max_paint_ns: 50_000_000,
         pending_timeout_frames: 5,
         paint_mode: PaintMode::Exact,
+        ..Default::default()
     });
     eng.declare_actions(&["x"]);
     eng.load_html(&tooltip_page(css, button_attrs))
@@ -1655,6 +1658,7 @@ button { height: 36px; margin-right: 4px; position: relative; }
         max_paint_ns: 50_000_000,
         pending_timeout_frames: 5,
         paint_mode: PaintMode::Exact,
+        ..Default::default()
     });
     eng.declare_actions(&["time.pause", "time.resume", "time.set_speed"]);
     eng.load_html(&shell).expect("load shell");
@@ -1932,6 +1936,7 @@ fn boot_form(html: &str, actions: &[&str]) -> Engine {
         max_paint_ns: 50_000_000,
         pending_timeout_frames: 5,
         paint_mode: PaintMode::Exact,
+        ..Default::default()
     });
     eng.declare_actions(actions);
     let wrapped = format!("<!DOCTYPE html><html><body>{html}</body></html>");

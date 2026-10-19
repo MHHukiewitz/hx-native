@@ -48,9 +48,17 @@ path = "tests/a8_release_timing.rs"
 name = "partial_repaint"
 path = "tests/partial_repaint.rs"
 
+[[test]]
+name = "multi_surface"
+path = "tests/multi_surface.rs"
+
 [[example]]
 name = "paint_bench"
 path = "examples/paint_bench.rs"
+
+[[example]]
+name = "surface_probe"
+path = "examples/surface_probe.rs"
 
 [[bin]]
 name = "check_deps"
