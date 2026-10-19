@@ -1774,6 +1774,45 @@ fn paint_view(eng: &mut Engine) -> PaintOutput {
 }
 
 #[test]
+fn no_hover_time_slice_swap_dirties_paint_and_pixels() {
+    // No pointer hover: bumping `time` must still mark paint dirty via the
+    // fragment swap path (not via hover refresh).
+    let mut eng = boot(FIXTURE);
+    let mut slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    frags.set("time-strip", r#"<span id="time-label">DATE AAA</span>"#);
+    eng.sync(&slices, &mut frags).unwrap();
+    let first = paint_view(&mut eng);
+    assert!(!first.skipped);
+    let before = first.rgba.as_ref().unwrap().pixels.clone();
+
+    // Confirm a clean sync+paint stays skipped (no hover).
+    eng.sync(&slices, &mut frags).unwrap();
+    assert!(paint_view(&mut eng).skipped);
+
+    frags.set(
+        "time-strip",
+        r#"<span id="time-label">DATE BBB · different</span>"#,
+    );
+    slices.bump("time");
+    let dirty = eng.sync(&slices, &mut frags).unwrap();
+    assert!(
+        dirty.sections.iter().any(|s| s == "time-strip"),
+        "time bump must swap the time-strip fragment"
+    );
+    let second = paint_view(&mut eng);
+    assert!(
+        !second.skipped,
+        "fragment swap with no hover must not skip the next paint"
+    );
+    let after = second.rgba.as_ref().unwrap().pixels.clone();
+    assert_ne!(
+        before, after,
+        "swapped fragment content must change painted pixels"
+    );
+}
+
+#[test]
 fn sync_unchanged_mem_slices_leaves_paint_skipped() {
     let mut eng = boot(FIXTURE);
     let slices = MemSlices::new();

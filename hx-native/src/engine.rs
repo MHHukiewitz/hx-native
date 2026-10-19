@@ -358,6 +358,16 @@ impl Engine {
             self.mark_paint_dirty();
         }
 
+        // Belt-and-suspenders: a section swap must dirty paint even with no
+        // hover (swap_section already marks; keep this so sync stays honest if
+        // that path changes). Do NOT mark from `damaged_node_count` — Blitz can
+        // leave stale damage flags after resolve, which made every clean sync
+        // look dirty. Action-state writes mark dirty inside apply_action_states
+        // when `node_updates` is non-empty.
+        if !dirty_sections.is_empty() {
+            self.mark_paint_dirty();
+        }
+
         self.timings.sync_ns = t0.elapsed().as_nanos() as u64;
         Ok(DirtySet {
             sections: dirty_sections,
