@@ -346,6 +346,12 @@ impl Engine {
 
         self.ensure_resolved();
 
+        // Re-resolve Blitz :hover after swaps / actions-slice rewrites so a
+        // tooltip survives a chip refresh and follows a reason change.
+        if self.refresh_blitz_hover() {
+            self.mark_paint_dirty();
+        }
+
         if !dirty_sections.is_empty() || damaged_node_count > 0 {
             self.mark_paint_dirty();
         }
@@ -551,11 +557,7 @@ impl Engine {
                     pressed: true,
                 })
             }
-            InputEvent::PointerLeave => {
-                self.hover_id = None;
-                self.press = None;
-                InputOutcome::Hover { id: None }
-            }
+            InputEvent::PointerLeave => self.on_pointer_leave(),
             InputEvent::PointerMove { x, y, .. } => self.on_pointer_move(x, y),
             InputEvent::PointerDown { x, y, button, mods } => {
                 self.on_pointer_down(x, y, button, mods)
@@ -588,14 +590,67 @@ impl Engine {
         None
     }
 
+    /// Forward pointer leave to Blitz so `:hover` styles and CSS tooltips clear.
+    fn on_pointer_leave(&mut self) -> InputOutcome {
+        self.press = None;
+        if self.clear_blitz_hover() {
+            self.mark_paint_dirty();
+        }
+        self.hover_id = None;
+        InputOutcome::Hover { id: None }
+    }
+
+    /// Forward pointer move to Blitz `:hover` state. Paint is marked dirty only
+    /// when the hovered element actually changes, so a still pointer keeps the
+    /// clean-frame skip.
     fn on_pointer_move(&mut self, x: f32, y: f32) -> InputOutcome {
-        let id = self.hit_id(x, y);
+        self.ensure_resolved();
+        let (vw, vh) = self.layout_viewport;
+        let out_of_bounds = x < 0.0 || y < 0.0 || x >= vw as f32 || y >= vh as f32;
+
+        let hover_changed = if out_of_bounds {
+            self.clear_blitz_hover()
+        } else {
+            self.set_blitz_hover(x, y)
+        };
+        if hover_changed {
+            self.mark_paint_dirty();
+        }
+
+        let id = if out_of_bounds {
+            None
+        } else {
+            self.hit_id(x, y)
+        };
         if id != self.hover_id {
             self.hover_id = id.clone();
             InputOutcome::Hover { id }
         } else {
             InputOutcome::None
         }
+    }
+
+    fn set_blitz_hover(&mut self, x: f32, y: f32) -> bool {
+        self.doc
+            .as_mut()
+            .map(|doc| doc.set_hover_to(x, y))
+            .unwrap_or(false)
+    }
+
+    fn clear_blitz_hover(&mut self) -> bool {
+        self.doc
+            .as_mut()
+            .map(|doc| doc.clear_hover())
+            .unwrap_or(false)
+    }
+
+    /// Re-resolve Blitz hover after DOM mutations using the last pointer position
+    /// recorded by `set_hover_to`. Returns true when the hovered node changed.
+    fn refresh_blitz_hover(&mut self) -> bool {
+        self.doc
+            .as_mut()
+            .map(|doc| doc.refresh_hover())
+            .unwrap_or(false)
     }
 
     fn on_pointer_down(
