@@ -12,6 +12,7 @@ use blitz_traits::shell::{ColorScheme, Viewport as BlitzViewport};
 
 use crate::dialect::{ElementBinding, SwapMode, SyncMode};
 use crate::error::EngineError;
+use crate::focus::{focusable_ids, step_focus};
 use crate::fonts::bundled_font_context;
 use crate::paint::paint_rgba;
 use crate::pending::{PendingEntry, PendingState, QueuedRelease};
@@ -51,6 +52,9 @@ pub struct Engine {
     /// Viewport used for layout / hit-testing (updated on paint).
     layout_viewport: (u32, u32),
     needs_resolve: bool,
+    /// Spec: skip clean frames — only raster when something is damaged.
+    paint_dirty: bool,
+    cached_rgba: Option<RgbaImage>,
     /// Test harness: assert pending timeouts were observed.
     pub(crate) frame_count: u32,
     loaded_html: Option<String>,
@@ -83,9 +87,15 @@ impl Engine {
             timings: Timings::default(),
             layout_viewport: (800, 120),
             needs_resolve: false,
+            paint_dirty: true,
+            cached_rgba: None,
             frame_count: 0,
             loaded_html: None,
         }
+    }
+
+    fn mark_paint_dirty(&mut self) {
+        self.paint_dirty = true;
     }
 
     pub fn declare_actions(&mut self, names: &[&str]) {
@@ -133,6 +143,8 @@ impl Engine {
         self.doc = Some(doc);
         self.loaded_html = Some(html.to_string());
         self.needs_resolve = false;
+        self.cached_rgba = None;
+        self.mark_paint_dirty();
         Ok(())
     }
 
@@ -317,6 +329,10 @@ impl Engine {
 
         self.ensure_resolved();
 
+        if !dirty_sections.is_empty() || damaged_node_count > 0 {
+            self.mark_paint_dirty();
+        }
+
         self.timings.sync_ns = t0.elapsed().as_nanos() as u64;
         Ok(DirtySet {
             sections: dirty_sections,
@@ -372,6 +388,7 @@ impl Engine {
         }
 
         self.needs_resolve = true;
+        self.mark_paint_dirty();
         // Reindex after swap so new hx-* inside fragments are visible.
         self.reindex_bindings()?;
         Ok(())
@@ -463,6 +480,7 @@ impl Engine {
             }
         }
         self.needs_resolve = true;
+        self.mark_paint_dirty();
         Ok(())
     }
 
@@ -873,6 +891,7 @@ impl Engine {
             }
         }
         self.needs_resolve = true;
+        self.mark_paint_dirty();
     }
 
     fn on_key(&mut self, key: KeyEvent) -> InputOutcome {
@@ -923,36 +942,23 @@ impl Engine {
             }
         }
 
-        // (b) Tab / Shift+Tab focus order.
+        // (b) Tab / Shift+Tab focus order (engine-owned document-order walk).
         if key.pressed && key.key == "Tab" {
             self.ensure_resolved();
-            let doc = self.doc.as_mut();
-            if let Some(doc) = doc {
-                let nid = if key.mods.shift {
-                    doc.focus_prev_node()
-                } else {
-                    // If nothing focused, focus first focussable via next from root-ish.
-                    if self.focus.focused_id.is_none() {
-                        // Blitz focus_next needs an existing focus; set to root-ish first.
-                        if let Some(body) = doc.query_selector("body").ok().flatten() {
-                            doc.set_focus_to(body);
-                        }
+            let order = self.doc.as_ref().map(focusable_ids).unwrap_or_default();
+            let next = step_focus(&order, self.focus.focused_id.as_deref(), key.mods.shift);
+            if let Some(ref nid_str) = next {
+                if let Some(doc) = self.doc.as_mut() {
+                    if let Some(nid) = doc.get_element_by_id(nid_str) {
+                        doc.set_focus_to(nid);
                     }
-                    doc.focus_next_node()
-                };
-                if let Some(nid) = nid {
-                    let id = doc.get_node(nid).and_then(|n| {
-                        n.attrs().and_then(|attrs| {
-                            attrs
-                                .iter()
-                                .find(|a| &*a.name.local == "id")
-                                .map(|a| a.value.to_string())
-                        })
-                    });
-                    self.focus.focused_id = id;
-                    return InputOutcome::FocusChanged(self.focus.clone());
                 }
+            } else if let Some(doc) = self.doc.as_mut() {
+                doc.clear_focus();
             }
+            self.focus.focused_id = next;
+            self.mark_paint_dirty();
+            return InputOutcome::FocusChanged(self.focus.clone());
         }
 
         // (c) Enter / Space on focused hx-post button → like primary click.
@@ -1091,6 +1097,7 @@ impl Engine {
                 }
             }
             self.needs_resolve = true;
+            self.mark_paint_dirty();
         }
 
         // Release queued action if any.
@@ -1112,7 +1119,27 @@ impl Engine {
 
     pub fn paint(&mut self, viewport: Viewport) -> Result<PaintOutput, EngineError> {
         let t0 = Instant::now();
+        let size_changed =
+            self.layout_viewport != (viewport.width, viewport.height) || self.cached_rgba.is_none();
         self.layout_viewport = (viewport.width, viewport.height);
+
+        // Frame tick for pending timeout backstop (always advances).
+        self.frame_count = self.frame_count.saturating_add(1);
+        self.pending.tick_frames(self.config.pending_timeout_frames);
+
+        // Spec: skip clean frames — no raster when nothing is damaged and size is unchanged.
+        if !self.paint_dirty && !size_changed {
+            self.timings.paint_ns = t0.elapsed().as_nanos() as u64;
+            self.timings.paint_skipped = true;
+            let _ = viewport.holes;
+            return Ok(PaintOutput {
+                rgba: self.cached_rgba.clone(),
+                texture: None,
+                focus: self.focus.clone(),
+                skipped: true,
+            });
+        }
+
         let doc = self.doc.as_mut().ok_or(EngineError::NotLoaded)?;
         doc.set_viewport(BlitzViewport::new(
             viewport.width,
@@ -1125,10 +1152,9 @@ impl Engine {
 
         let rgba = paint_rgba(doc, viewport.width, viewport.height, 1.0)?;
         self.timings.paint_ns = t0.elapsed().as_nanos() as u64;
-
-        // Frame tick for pending timeout backstop.
-        self.frame_count = self.frame_count.saturating_add(1);
-        self.pending.tick_frames(self.config.pending_timeout_frames);
+        self.timings.paint_skipped = false;
+        self.paint_dirty = false;
+        self.cached_rgba = Some(rgba.clone());
 
         // Holes: Layer 1 crate unit does not composite host textures (UI owns that).
         let _ = viewport.holes;
@@ -1137,6 +1163,7 @@ impl Engine {
             rgba: Some(rgba),
             texture: None,
             focus: self.focus.clone(),
+            skipped: false,
         })
     }
 
@@ -1216,6 +1243,11 @@ impl Engine {
     /// Test helper: section ids.
     pub fn section_ids(&self) -> Vec<String> {
         self.sections.keys().cloned().collect()
+    }
+
+    /// Test helper: engine focus order.
+    pub fn focusable_ids_for_test(&self) -> Vec<String> {
+        self.doc.as_ref().map(focusable_ids).unwrap_or_default()
     }
 }
 

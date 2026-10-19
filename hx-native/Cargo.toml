@@ -35,6 +35,10 @@ serde_json = "1"
 name = "acceptance"
 path = "tests/acceptance.rs"
 
+[[test]]
+name = "a8_release_timing"
+path = "tests/a8_release_timing.rs"
+
 [[bin]]
 name = "check_deps"
 path = "src/bin/check_deps.rs"

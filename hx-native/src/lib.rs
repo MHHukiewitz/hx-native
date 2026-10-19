@@ -7,6 +7,7 @@
 mod dialect;
 mod engine;
 mod error;
+mod focus;
 mod fonts;
 mod paint;
 mod pending;

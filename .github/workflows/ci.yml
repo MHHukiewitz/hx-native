@@ -29,3 +29,6 @@ jobs:
 
       - name: cargo test
         run: cargo test --all
+
+      - name: A8 release paint timings
+        run: cargo test -p hx-native --release --test a8_release_timing -- --nocapture

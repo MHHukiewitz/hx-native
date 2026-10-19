@@ -687,34 +687,61 @@ fn a6b_blocked_race_fallback() {
 }
 
 // ---------------------------------------------------------------------------
-// A8 — Paint budget (measure + report)
+// A8 — Paint budget (debug smoke) + clean-frame skip
 // ---------------------------------------------------------------------------
+/// Debug-profile smoke only. It does **not** claim FRAME_BUDGET compliance.
+/// What it guards: paint completes, reports timing when dirty, and respects
+/// `max_paint_ns` as a generous debug ceiling (50 ms via `boot`). Real chrome
+/// budget numbers: `cargo test --release --test a8_release_timing`.
 #[test]
 fn a8_paint_budget() {
     let mut eng = boot(FIXTURE);
     let slices = MemSlices::new();
     let mut frags = SpyFrags::new();
     eng.sync(&slices, &mut frags).unwrap();
-    eng.paint(Viewport {
-        width: 800,
-        height: 120,
-        holes: vec![],
-    })
-    .unwrap();
+    let out = eng
+        .paint(Viewport {
+            width: 800,
+            height: 120,
+            holes: vec![],
+        })
+        .unwrap();
+    assert!(!out.skipped, "first paint after sync must raster");
     let t = eng.last_timings();
     eprintln!(
-        "A8 time-strip fixture paint_ns={} sync_ns={} max_paint_ns={}",
+        "A8(debug) time-strip paint_ns={} sync_ns={} skipped={} max_paint_ns={} (debug ceiling only; see a8_release_timing)",
         t.paint_ns,
         t.sync_ns,
+        t.paint_skipped,
         eng.config().max_paint_ns
     );
     assert!(
         t.paint_ns <= eng.config().max_paint_ns,
-        "paint_ns {} exceeded max_paint_ns {}",
+        "paint_ns {} exceeded debug max_paint_ns {}",
         t.paint_ns,
         eng.config().max_paint_ns
     );
-    assert!(t.paint_ns > 0, "paint timing must be measured");
+    assert!(t.paint_ns > 0, "dirty paint timing must be measured");
+    assert!(!t.paint_skipped);
+
+    let out2 = eng
+        .paint(Viewport {
+            width: 800,
+            height: 120,
+            holes: vec![],
+        })
+        .unwrap();
+    assert!(out2.skipped);
+    assert!(eng.last_timings().paint_skipped);
+    assert!(
+        eng.last_timings().paint_ns < 1_000_000,
+        "skipped paint must be cheap, got {} ns",
+        eng.last_timings().paint_ns
+    );
+    assert!(
+        out2.rgba.is_some(),
+        "skipped paint still returns cached RGBA"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1016,8 +1043,21 @@ fn a20_esc_passthrough() {
 }
 
 // ---------------------------------------------------------------------------
-// A21 — Keyboard activation
+// A21 — Keyboard activation + Tab / Shift+Tab focus order
 // ---------------------------------------------------------------------------
+fn tab_key(shift: bool) -> KeyEvent {
+    KeyEvent {
+        key: "Tab".into(),
+        code: "Tab".into(),
+        mods: Modifiers {
+            shift,
+            ..Modifiers::default()
+        },
+        repeat: false,
+        pressed: true,
+    }
+}
+
 #[test]
 fn a21_keyboard_activation() {
     let mut eng = boot(FIXTURE);
@@ -1066,4 +1106,108 @@ fn a21_keyboard_activation() {
             ..
         } if name == "time.pause"
     ));
+}
+
+#[test]
+fn a21_tab_focus_order() {
+    // Document order: button a, tabindex div, button b; skip disabled/greyed + tabindex=-1.
+    // Blitz's HTML parser drops a bare `disabled` attribute from markup, so we
+    // grey via the `actions` slice (same path as A6) which sets disabled + aria-disabled.
+    let html = r##"<!DOCTYPE html><html><body>
+      <button id="a" hx-post="act.a">A</button>
+      <div id="skip-neg" tabindex="-1">no</div>
+      <div id="t0" tabindex="0">tab0</div>
+      <button id="disabled" hx-post="act.x">X</button>
+      <button id="greyed" hx-post="act.g">G</button>
+      <button id="b" hx-post="act.b">B</button>
+    </body></html>"##;
+    let mut eng = Engine::new(EngineConfig::default());
+    eng.declare_actions(&["act.a", "act.b", "act.x", "act.g"]);
+    eng.load_html(html).unwrap();
+    let mut slices = MemSlices::new();
+    slices.actions.push((
+        "act.x".into(),
+        ActionState::Disabled {
+            reason: "off".into(),
+        },
+    ));
+    slices.actions.push((
+        "act.g".into(),
+        ActionState::Disabled {
+            reason: "grey".into(),
+        },
+    ));
+    let mut frags = SpyFrags::new();
+    eng.sync(&slices, &mut frags).unwrap();
+    eng.paint(Viewport {
+        width: 400,
+        height: 200,
+        holes: vec![],
+    })
+    .unwrap();
+
+    assert!(eng.attr("disabled", "disabled").is_some());
+    assert_eq!(eng.attr("greyed", "aria-disabled").as_deref(), Some("true"));
+    assert_eq!(eng.focusable_ids_for_test(), ["a", "t0", "b"]);
+
+    let expected = ["a", "t0", "b"];
+
+    let out = eng.input(InputEvent::Key(tab_key(false)));
+    match out {
+        InputOutcome::FocusChanged(FocusState {
+            focused_id: Some(ref id),
+        }) => assert_eq!(id, "a"),
+        other => panic!("Tab from nowhere → first focusable, got {other:?}"),
+    }
+
+    let out = eng.input(InputEvent::Key(tab_key(false)));
+    match out {
+        InputOutcome::FocusChanged(FocusState {
+            focused_id: Some(ref id),
+        }) => assert_eq!(id, "t0"),
+        other => panic!("expected t0, got {other:?}"),
+    }
+
+    let out = eng.input(InputEvent::Key(tab_key(false)));
+    match out {
+        InputOutcome::FocusChanged(FocusState {
+            focused_id: Some(ref id),
+        }) => assert_eq!(id, "b"),
+        other => panic!("expected b, got {other:?}"),
+    }
+
+    // Wrap forward
+    let out = eng.input(InputEvent::Key(tab_key(false)));
+    match out {
+        InputOutcome::FocusChanged(FocusState {
+            focused_id: Some(ref id),
+        }) => assert_eq!(id, "a"),
+        other => panic!("wrap to a, got {other:?}"),
+    }
+
+    // Shift+Tab reverse
+    let out = eng.input(InputEvent::Key(tab_key(true)));
+    match out {
+        InputOutcome::FocusChanged(FocusState {
+            focused_id: Some(ref id),
+        }) => assert_eq!(id, "b"),
+        other => panic!("Shift+Tab to b, got {other:?}"),
+    }
+
+    // Disabled / greyed / tabindex=-1 never receive focus via Tab.
+    for _ in 0..6 {
+        let out = eng.input(InputEvent::Key(tab_key(false)));
+        if let InputOutcome::FocusChanged(FocusState {
+            focused_id: Some(ref id),
+        }) = out
+        {
+            assert!(
+                expected.contains(&id.as_str()),
+                "focused unexpected id {id}"
+            );
+            assert_ne!(id, "disabled");
+            assert_ne!(id, "greyed");
+            assert_ne!(id, "skip-neg");
+        }
+    }
 }

@@ -156,6 +156,8 @@ pub struct FocusState {
 pub struct Timings {
     pub sync_ns: u64,
     pub paint_ns: u64,
+    /// True when `paint` skipped raster because nothing was dirty (spec: skip clean frames).
+    pub paint_skipped: bool,
 }
 
 /// RGBA8 image buffer (software / G1 path).
@@ -176,9 +178,12 @@ pub struct HostTextureRef {
 
 #[derive(Clone, Debug)]
 pub struct PaintOutput {
+    /// Fresh or cached RGBA buffer. Present even on skipped paints (last good frame).
     pub rgba: Option<RgbaImage>,
     pub texture: Option<HostTextureRef>,
     pub focus: FocusState,
+    /// True when raster was skipped (clean frame).
+    pub skipped: bool,
 }
 
 #[derive(Clone, Debug)]
