@@ -30,3 +30,16 @@ pub use types::*;
 
 /// Crate version string.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Paint-state types that step 3 must move across threads. A Blitz bump that
+/// makes any of these `!Send` fails the build of this crate (not only a test).
+const _: () = {
+    fn assert_send<T: Send>() {}
+    fn check() {
+        assert_send::<RgbaImage>();
+        assert_send::<PaintOutput>();
+        assert_send::<PaintStats>();
+        assert_send::<Timings>();
+    }
+    let _ = check;
+};

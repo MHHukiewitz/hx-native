@@ -2,9 +2,9 @@
 //!
 //! Runs a scripted sequence at 720p, 1080p and 1440p in Exact mode: ticker,
 //! hover, action greying, slice swaps, and opening a window during a slice
-//! update. Reports mean / p95 / p99 (eviction time is included in those
-//! percentiles when eviction runs), eviction counts, pinned/live memory
-//! estimates, and cold / pre-drawn / evicted-then-reopened open paths.
+//! update. Reports mean / p95 / p99 overall and **per event type**, so the
+//! slowest 1% can be attributed. The scripted sequence deliberately cold-opens
+//! a non-pinned window every 8th frame; a "steady-play" row excludes those.
 //!
 //! Usage: `cargo run -p hx-native --example paint_bench --release`
 
@@ -17,6 +17,38 @@ const FRAMES: usize = 200;
 
 const CHROME: SurfaceId = SurfaceId(1);
 const WIN: SurfaceId = SurfaceId(2);
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+enum EventKind {
+    /// Ticker / actions / chips slice sync + paint.
+    SliceUpdate,
+    /// Pointer move or leave on chrome.
+    Hover,
+    /// `open_surface(visible:true)` of a non-pinned window during a slice tick.
+    ColdOpen,
+    /// Hide window (`set_visible(false)`); may include eviction under pressure.
+    HideWindow,
+    /// Dedicated path: open hidden then show (pre-drawn).
+    PredrawnShow,
+    /// Dedicated path: rebuild after eviction then paint.
+    EvictedReopen,
+    /// Frame that performed at least one surface eviction (pressure run).
+    Eviction,
+}
+
+impl EventKind {
+    fn label(self) -> &'static str {
+        match self {
+            EventKind::SliceUpdate => "slice update",
+            EventKind::Hover => "hover",
+            EventKind::ColdOpen => "cold open",
+            EventKind::HideWindow => "hide window",
+            EventKind::PredrawnShow => "pre-drawn show",
+            EventKind::EvictedReopen => "evicted reopen",
+            EventKind::Eviction => "eviction",
+        }
+    }
+}
 
 struct MemSlices {
     versions: HashMap<String, u64>,
@@ -155,21 +187,50 @@ fn ticker(offset: i32) -> String {
     )
 }
 
+fn pct(samples: &[u64], p: f64) -> u64 {
+    if samples.is_empty() {
+        return 0;
+    }
+    let mut v = samples.to_vec();
+    v.sort_unstable();
+    let idx = ((v.len() as f64) * p) as usize;
+    v[idx.min(v.len() - 1)]
+}
+
+fn mean(samples: &[u64]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    samples.iter().sum::<u64>() as f64 / samples.len() as f64
+}
+
+fn report_row(label: &str, samples: &[u64]) {
+    if samples.is_empty() {
+        println!("| {label} | 0 | — | — | — |");
+        return;
+    }
+    println!(
+        "| {label} | {} | {:.3} | {:.3} | {:.3} |",
+        samples.len(),
+        mean(samples) / 1e6,
+        pct(samples, 0.95) as f64 / 1e6,
+        pct(samples, 0.99) as f64 / 1e6,
+    );
+}
+
 #[derive(Default)]
 struct Acc {
-    times_ns: Vec<u64>,
+    /// (kind, frame_ns) for every measured frame in the scripted sequence.
+    frames: Vec<(EventKind, u64)>,
     merge_to_bbox: u32,
     full_repaint: u32,
     full_area_fallback: u32,
-    frames: u32,
     evictions: u64,
-    eviction_ns_samples: Vec<u64>,
 }
 
 impl Acc {
-    fn record(&mut self, eng: &Engine, frame_ns: u64) {
-        self.times_ns.push(frame_ns);
-        self.frames += 1;
+    fn record(&mut self, eng: &Engine, kind: EventKind, frame_ns: u64) {
+        self.frames.push((kind, frame_ns));
         let s = eng.last_paint_stats();
         if s.merged_to_bbox {
             self.merge_to_bbox += 1;
@@ -181,52 +242,112 @@ impl Acc {
             self.full_area_fallback += 1;
         }
         let mem = eng.surface_memory_stats();
-        if mem.eviction_count > self.evictions {
-            self.eviction_ns_samples.push(mem.last_eviction_ns);
-            self.evictions = mem.eviction_count;
+        self.evictions = mem.eviction_count;
+    }
+
+    fn times(&self) -> Vec<u64> {
+        self.frames.iter().map(|(_, t)| *t).collect()
+    }
+
+    fn times_excluding(&self, skip: EventKind) -> Vec<u64> {
+        self.frames
+            .iter()
+            .filter(|(k, _)| *k != skip)
+            .map(|(_, t)| *t)
+            .collect()
+    }
+
+    fn by_kind(&self, kind: EventKind) -> Vec<u64> {
+        self.frames
+            .iter()
+            .filter(|(k, _)| *k == kind)
+            .map(|(_, t)| *t)
+            .collect()
+    }
+
+    /// Name what sits in the overall slowest 1% (by event kind).
+    fn p99_drivers(&self) -> String {
+        let all = self.times();
+        if all.is_empty() {
+            return "n/a".into();
         }
+        let threshold = pct(&all, 0.99);
+        let mut counts: HashMap<&'static str, usize> = HashMap::new();
+        for (k, t) in &self.frames {
+            if *t >= threshold {
+                *counts.entry(k.label()).or_insert(0) += 1;
+            }
+        }
+        let mut parts: Vec<_> = counts.into_iter().collect();
+        parts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        parts
+            .iter()
+            .map(|(name, n)| format!("{name}×{n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     fn report(&mut self, label: &str, eng: &Engine) {
-        self.times_ns.sort_unstable();
-        let n = self.times_ns.len();
-        let mean = self.times_ns.iter().sum::<u64>() as f64 / n as f64;
-        let p95 = self.times_ns[((n as f64) * 0.95) as usize].min(self.times_ns[n - 1]);
-        let p99 = self.times_ns[((n as f64) * 0.99) as usize].min(self.times_ns[n - 1]);
+        let all = self.times();
+        let steady = self.times_excluding(EventKind::ColdOpen);
         let mem = eng.surface_memory_stats();
+        println!();
+        println!("### {label}");
         println!(
-            "{label}: mean={:.3} ms  p95={:.3} ms  p99={:.3} ms  frames={}  merge_to_bbox={}  full_repaint={}  area_fallback={}  evictions={}  last_eviction={:.3} ms  pinned={:.2} MiB  live={:.2} MiB",
-            mean / 1e6,
-            p95 as f64 / 1e6,
-            p99 as f64 / 1e6,
-            self.frames,
+            "Overall: mean={:.3} ms  p95={:.3} ms  p99={:.3} ms  frames={}  merge_to_bbox={}  full_repaint={}  area_fallback={}  evictions={}  pinned={:.2} MiB  live={:.2} MiB",
+            mean(&all) / 1e6,
+            pct(&all, 0.95) as f64 / 1e6,
+            pct(&all, 0.99) as f64 / 1e6,
+            all.len(),
             self.merge_to_bbox,
             self.full_repaint,
             self.full_area_fallback,
             self.evictions,
-            mem.last_eviction_ns as f64 / 1e6,
             mem.pinned_bytes as f64 / (1024.0 * 1024.0),
             mem.live_bytes as f64 / (1024.0 * 1024.0),
         );
+        println!(
+            "Steady-play (excludes deliberate cold opens): mean={:.3} ms  p95={:.3} ms  p99={:.3} ms  frames={}",
+            mean(&steady) / 1e6,
+            pct(&steady, 0.95) as f64 / 1e6,
+            pct(&steady, 0.99) as f64 / 1e6,
+            steady.len(),
+        );
+        println!(
+            "p99 drivers (≥ overall p99 threshold): {}",
+            self.p99_drivers()
+        );
+        println!("| Event | n | mean ms | p95 ms | p99 ms |");
+        println!("|---|---|---|---|---|");
+        for kind in [
+            EventKind::SliceUpdate,
+            EventKind::Hover,
+            EventKind::ColdOpen,
+            EventKind::HideWindow,
+        ] {
+            report_row(kind.label(), &self.by_kind(kind));
+        }
+        report_row("steady-play (no cold open)", &steady);
+        report_row("all frames", &all);
     }
 }
 
-/// Scripted Week-speed frame. Opening a window during a slice update uses a
-/// separate surface (step 2). Frame time includes any eviction done in
-/// open/hide/resize paths that run before paint.
+/// Scripted Week-speed frame. Every 8th step cold-opens a non-pinned window
+/// during a slice update (deliberate; Mainnet Pause family is pinned/pre-drawn).
 fn step_sequence(
     i: usize,
     eng: &mut Engine,
     slices: &mut MemSlices,
     frags: &mut Frags,
     win_view: &Viewport,
-) -> u64 {
+) -> (EventKind, u64) {
     let t0 = std::time::Instant::now();
-    match i % 8 {
+    let kind = match i % 8 {
         0 => {
             slices.bump("ticker");
             frags.set("sec-ticker", &ticker(-((i as i32 % 40) * 3)));
             eng.sync_surface(CHROME, slices, frags).unwrap();
+            EventKind::SliceUpdate
         }
         1 => {
             let _ = eng.input_surface(
@@ -237,9 +358,11 @@ fn step_sequence(
                     mods: Modifiers::default(),
                 },
             );
+            EventKind::Hover
         }
         2 => {
             let _ = eng.input_surface(CHROME, InputEvent::PointerLeave);
+            EventKind::Hover
         }
         3 => {
             slices.actions = vec![(
@@ -250,11 +373,13 @@ fn step_sequence(
             )];
             slices.bump("actions");
             eng.sync_surface(CHROME, slices, frags).unwrap();
+            EventKind::SliceUpdate
         }
         4 => {
             slices.actions.clear();
             slices.bump("actions");
             eng.sync_surface(CHROME, slices, frags).unwrap();
+            EventKind::SliceUpdate
         }
         5 => {
             let active = ["1x", "2x", "Week", "Month"][i % 4];
@@ -262,9 +387,10 @@ fn step_sequence(
             frags.set("sec-chips", &chips(active));
             frags.set("sec-date", &date((i % 28) as u32 + 1));
             eng.sync_surface(CHROME, slices, frags).unwrap();
+            EventKind::SliceUpdate
         }
         6 => {
-            // Window opens during a sim tick (time bump + open_surface together).
+            // Cold open of a non-pinned window during a sim tick.
             slices.bump("time");
             frags.set("sec-chips", &chips("Week"));
             frags.set("sec-date", &date(15));
@@ -280,22 +406,22 @@ fn step_sequence(
                 },
             )
             .unwrap();
+            EventKind::ColdOpen
         }
         _ => {
-            // Hide the window (may evict under a tight budget in dedicated runs).
             if eng.surface_info(WIN).is_some() {
                 eng.set_visible(WIN, false).unwrap();
             }
+            EventKind::HideWindow
         }
-    }
+    };
     for id in eng.dirty_surfaces() {
         let _ = eng.paint_surface(id).unwrap();
     }
-    // Always paint chrome so skipped frames are still timed.
     if !eng.dirty_surfaces().contains(&CHROME) {
         let _ = eng.paint_surface(CHROME).unwrap();
     }
-    t0.elapsed().as_nanos() as u64
+    (kind, t0.elapsed().as_nanos() as u64)
 }
 
 fn boot_engine(phys_w: u32, phys_h: u32, budget: u64) -> (Engine, MemSlices, Frags, Viewport) {
@@ -338,9 +464,9 @@ fn bench_resolution(label: &str, phys_w: u32, phys_h: u32) {
 
     let mut acc = Acc::default();
     for i in 0..(WARMUP + FRAMES) {
-        let frame_ns = step_sequence(i, &mut eng, &mut slices, &mut frags, &win_view);
+        let (kind, frame_ns) = step_sequence(i, &mut eng, &mut slices, &mut frags, &win_view);
         if i >= WARMUP {
-            acc.record(&eng, frame_ns);
+            acc.record(&eng, kind, frame_ns);
         }
     }
     acc.report(label, &eng);
@@ -357,7 +483,6 @@ fn bench_open_paths(phys_w: u32, phys_h: u32) {
     let mut reopened = Vec::new();
 
     for i in 0..(W + N) {
-        // Cold open + first paint.
         let mut eng = Engine::new(EngineConfig {
             max_paint_ns: 50_000_000,
             paint_mode: PaintMode::Exact,
@@ -378,7 +503,6 @@ fn bench_open_paths(phys_w: u32, phys_h: u32) {
         let _ = eng.paint_surface(WIN).unwrap();
         let cold_ns = t0.elapsed().as_nanos() as u64;
 
-        // Pre-drawn: open hidden (first raster inside open), then show + paint.
         let mut eng2 = Engine::new(EngineConfig {
             max_paint_ns: 50_000_000,
             paint_mode: PaintMode::Exact,
@@ -400,7 +524,6 @@ fn bench_open_paths(phys_w: u32, phys_h: u32) {
         let _ = eng2.paint_surface(WIN).unwrap();
         let pre_ns = t1.elapsed().as_nanos() as u64;
 
-        // Evicted then reopened: force eviction with a tiny budget, then show.
         let tiny = estimate_surface_engine_bytes(560, 360, &html) / 2;
         let mut eng3 = Engine::new(EngineConfig {
             max_paint_ns: 50_000_000,
@@ -419,7 +542,6 @@ fn bench_open_paths(phys_w: u32, phys_h: u32) {
             },
         )
         .unwrap();
-        // Second surface forces eviction of WIN.
         eng3.open_surface(
             SurfaceId(9),
             &html,
@@ -444,35 +566,27 @@ fn bench_open_paths(phys_w: u32, phys_h: u32) {
         let _ = (eng, eng2, eng3, phys_w, phys_h);
     }
 
-    fn report(name: &str, samples: &mut [u64]) {
-        samples.sort_unstable();
-        let n = samples.len();
-        let mean = samples.iter().sum::<u64>() as f64 / n as f64;
-        let p95 = samples[((n as f64) * 0.95) as usize].min(samples[n - 1]);
-        let p99 = samples[((n as f64) * 0.99) as usize].min(samples[n - 1]);
-        println!(
-            "  {name}: mean={:.3} ms  p95={:.3} ms  p99={:.3} ms",
-            mean / 1e6,
-            p95 as f64 / 1e6,
-            p99 as f64 / 1e6
-        );
-    }
-
-    println!("Open paths at {phys_w}x{phys_h} window 560x360:");
-    report("cold", &mut cold);
-    report("pre-drawn show", &mut predrawn);
-    report("evicted-then-reopened", &mut reopened);
+    println!();
+    println!("### Dedicated open paths (560×360 window, {phys_w}×{phys_h} chrome context unused)");
+    println!("| Event | n | mean ms | p95 ms | p99 ms |");
+    println!("|---|---|---|---|---|");
+    report_row(EventKind::ColdOpen.label(), &cold);
+    report_row(EventKind::PredrawnShow.label(), &predrawn);
+    report_row(EventKind::EvictedReopen.label(), &reopened);
 }
 
 fn bench_eviction_pressure(phys_w: u32, phys_h: u32) {
-    // Tiny budget so hide/open paths pay eviction; times fold into p95/p99.
     let html = win_page("evac");
     let one = estimate_surface_engine_bytes(560, 360, &html);
     let (mut eng, mut slices, mut frags, win_view) = boot_engine(phys_w, phys_h, one + 1024);
 
-    let mut acc = Acc::default();
+    let mut eviction_frames = Vec::new();
+    let mut other_frames = Vec::new();
+    let mut prev_evictions = eng.surface_memory_stats().eviction_count;
+
     for i in 0..(WARMUP + FRAMES) {
-        // Cycle several hidden windows to force LRU eviction every few frames.
+        let before = eng.surface_memory_stats().eviction_count;
+        // Cycle hidden windows to force LRU eviction.
         if i % 3 == 0 {
             let sid = SurfaceId(100 + (i % 5) as u64);
             let _ = eng.close_surface(sid);
@@ -487,13 +601,43 @@ fn bench_eviction_pressure(phys_w: u32, phys_h: u32) {
             )
             .unwrap();
         }
-        let frame_ns = step_sequence(i, &mut eng, &mut slices, &mut frags, &win_view);
+        let (kind, frame_ns) = step_sequence(i, &mut eng, &mut slices, &mut frags, &win_view);
+        let after = eng.surface_memory_stats().eviction_count;
         if i >= WARMUP {
-            acc.record(&eng, frame_ns);
+            if after > before || after > prev_evictions {
+                eviction_frames.push(frame_ns);
+            } else {
+                other_frames.push((kind, frame_ns));
+            }
+            prev_evictions = after;
         }
     }
-    println!("Eviction-pressure run (budget ≈ one mid window):");
-    acc.report(&format!("{phys_w}x{phys_h}"), &eng);
+
+    println!();
+    println!("### Eviction-pressure run (budget ≈ one mid window, {phys_w}×{phys_h})");
+    println!(
+        "evictions total={}  last_eviction={:.3} ms",
+        eng.surface_memory_stats().eviction_count,
+        eng.surface_memory_stats().last_eviction_ns as f64 / 1e6
+    );
+    println!("| Event | n | mean ms | p95 ms | p99 ms |");
+    println!("|---|---|---|---|---|");
+    report_row(EventKind::Eviction.label(), &eviction_frames);
+    let mut by: HashMap<EventKind, Vec<u64>> = HashMap::new();
+    for (k, t) in other_frames {
+        by.entry(k).or_default().push(t);
+    }
+    for kind in [
+        EventKind::SliceUpdate,
+        EventKind::Hover,
+        EventKind::ColdOpen,
+        EventKind::HideWindow,
+    ] {
+        report_row(
+            kind.label(),
+            by.get(&kind).map(|v| v.as_slice()).unwrap_or(&[]),
+        );
+    }
 }
 
 fn main() {
@@ -507,12 +651,14 @@ fn main() {
         .unwrap_or_else(|| "unknown CPU".into());
     println!("paint_bench step 2 (Exact mode, multi-surface) — CPU: {cpu}");
     println!("warmup={WARMUP} measured_frames={FRAMES}");
-    println!();
+    println!(
+        "Note: the scripted sequence cold-opens a non-pinned window on every 8th frame \
+         (case 6). Mainnet Pause-family windows are pinned/pre-drawn; steady-play p99 \
+         excludes those cold opens."
+    );
     bench_resolution("720p  (1280x720)", 1280, 720);
     bench_resolution("1080p (1920x1080)", 1920, 1080);
     bench_resolution("1440p (2560x1440)", 2560, 1440);
-    println!();
     bench_open_paths(1920, 1080);
-    println!();
     bench_eviction_pressure(1920, 1080);
 }
