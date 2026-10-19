@@ -741,8 +741,12 @@ fn a8_paint_budget() {
         eng.last_timings().paint_ns
     );
     assert!(
-        out2.rgba.is_some(),
-        "skipped paint still returns cached RGBA"
+        out2.rgba.is_none(),
+        "skipped paint must not copy the RGBA buffer"
+    );
+    assert!(
+        eng.last_frame().is_some(),
+        "last_frame still exposes the cached buffer without a copy"
     );
 }
 
@@ -1754,4 +1758,112 @@ fn hover_title_tooltip_on_enabled_element() {
     );
     assert!(eng.attr("b", "data-hx-reason").is_none());
     assert_eq!(eng.attr("b", "title").as_deref(), Some("1 min/s"));
+}
+
+// ---------------------------------------------------------------------------
+// Clean-frame sync / skipped paint (full-window bench bugs)
+// ---------------------------------------------------------------------------
+
+fn paint_view(eng: &mut Engine) -> PaintOutput {
+    eng.paint(Viewport {
+        width: 800,
+        height: 120,
+        holes: vec![],
+    })
+    .unwrap()
+}
+
+#[test]
+fn sync_unchanged_mem_slices_leaves_paint_skipped() {
+    let mut eng = boot(FIXTURE);
+    let slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    eng.sync(&slices, &mut frags).unwrap();
+    let first = paint_view(&mut eng);
+    assert!(!first.skipped);
+    assert!(first.rgba.is_some());
+
+    for _ in 0..8 {
+        let dirty = eng.sync(&slices, &mut frags).unwrap();
+        assert!(
+            dirty.sections.is_empty(),
+            "unchanged MemSlices must not re-render sections"
+        );
+    }
+
+    let out = paint_view(&mut eng);
+    assert!(
+        out.skipped,
+        "sync with unchanged MemSlices must leave the next paint skipped"
+    );
+    assert!(out.rgba.is_none());
+}
+
+#[test]
+fn action_reason_change_dirties_paint() {
+    let mut eng = boot(FIXTURE);
+    let mut slices = MemSlices::new();
+    slices.actions.push((
+        "time.pause".into(),
+        ActionState::Disabled {
+            reason: "Already paused".into(),
+        },
+    ));
+    let mut frags = SpyFrags::new();
+    eng.sync(&slices, &mut frags).unwrap();
+    let _ = paint_view(&mut eng);
+
+    // Same MemSlices again — still clean.
+    eng.sync(&slices, &mut frags).unwrap();
+    assert!(paint_view(&mut eng).skipped);
+
+    // Change only the reason string (and bump the actions version).
+    slices.actions.clear();
+    slices.actions.push((
+        "time.pause".into(),
+        ActionState::Disabled {
+            reason: "Paused while a dialog is open".into(),
+        },
+    ));
+    slices.bump("actions");
+    eng.sync(&slices, &mut frags).unwrap();
+    let out = paint_view(&mut eng);
+    assert!(!out.skipped, "changing one action reason must dirty paint");
+    assert!(out.rgba.is_some());
+    assert_eq!(
+        eng.attr("btn-pause", "data-hx-reason").as_deref(),
+        Some("Paused while a dialog is open")
+    );
+}
+
+#[test]
+fn skipped_paint_does_no_buffer_copy() {
+    let mut eng = boot(FIXTURE);
+    let slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    eng.sync(&slices, &mut frags).unwrap();
+    let _ = paint_view(&mut eng);
+
+    // Warm the skip path.
+    let _ = paint_view(&mut eng);
+
+    let t0 = std::time::Instant::now();
+    let out = paint_view(&mut eng);
+    let ns = t0.elapsed().as_nanos() as u64;
+
+    assert!(out.skipped);
+    assert!(
+        out.rgba.is_none(),
+        "API: skipped paint returns rgba: None (host keeps last texture)"
+    );
+    assert!(eng.last_frame().is_some());
+    assert!(
+        ns < 50_000,
+        "skipped paint must stay under 50 us (no buffer copy), got {ns} ns"
+    );
+    assert!(
+        eng.last_timings().paint_ns < 50_000,
+        "engine paint_ns on skip must stay under 50 us, got {}",
+        eng.last_timings().paint_ns
+    );
 }
