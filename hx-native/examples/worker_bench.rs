@@ -2,6 +2,8 @@
 //!
 //! Reports mean / p95 / p99 at 720p, 1080p and 1440p with other CPU cores idle
 //! and with them busy (spin threads on every other core to simulate the sim).
+//! Also reports a sync [`Engine`] paint row at each resolution in the same
+//! session for comparison.
 //!
 //! Usage: `cargo run -p hx-native --example worker_bench --release`
 
@@ -13,7 +15,10 @@ use std::time::{Duration, Instant};
 
 use hx_native::*;
 
-const WARMUP: usize = 10;
+/// Discarded frames after open / before samples. Raised from 10 after the
+/// 1440p idle p95≈15 ms outlier: that spike was the first cold 1440p pass in
+/// the session (fonts / raster / CPU clocks), not a real idle>busy effect.
+const WARMUP: usize = 30;
 const FRAMES: usize = 200;
 
 fn section_page(css_w: u32, css_h: u32) -> String {
@@ -68,6 +73,50 @@ fn packet(ver: u64, offset: i32) -> SyncPacket {
     }
 }
 
+struct MemSlices {
+    versions: HashMap<String, u64>,
+    actions: Vec<(String, ActionState)>,
+}
+
+impl MemSlices {
+    fn from_packet(p: &SyncPacket) -> Self {
+        Self {
+            versions: p.versions.clone(),
+            actions: p.actions.clone(),
+        }
+    }
+}
+
+impl SliceSource for MemSlices {
+    fn version(&self, name: &str) -> Option<u64> {
+        self.versions.get(name).copied()
+    }
+    fn action_states(&self) -> Vec<(String, ActionState)> {
+        self.actions.clone()
+    }
+}
+
+struct Frags {
+    bodies: HashMap<String, String>,
+}
+
+impl Frags {
+    fn from_packet(p: &SyncPacket) -> Self {
+        Self {
+            bodies: p.fragments.clone(),
+        }
+    }
+}
+
+impl FragmentSource for Frags {
+    fn render(&mut self, section_id: &str, _slices: &[&str]) -> String {
+        self.bodies
+            .get(section_id)
+            .cloned()
+            .unwrap_or_else(|| format!("<!-- {section_id} -->"))
+    }
+}
+
 fn pct(samples: &[u64], p: f64) -> u64 {
     if samples.is_empty() {
         return 0;
@@ -117,7 +166,6 @@ impl LoadGuard {
             let stop = Arc::clone(&stop);
             joins.push(thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
-                    // Spin to occupy the core (synthetic sim load).
                     let mut x = 0u64;
                     for i in 0..10_000u64 {
                         x = x.wrapping_mul(i).wrapping_add(1);
@@ -126,6 +174,8 @@ impl LoadGuard {
                 }
             }));
         }
+        // Let the package leave deep idle before the first measured paint.
+        thread::sleep(Duration::from_millis(50));
         Self { stop, joins }
     }
 }
@@ -139,15 +189,19 @@ impl Drop for LoadGuard {
     }
 }
 
-fn run_res(label: &str, width: u32, height: u32, busy: bool) {
+struct WorkerStats {
+    host_ns: Vec<u64>,
+    paint_ns: Vec<u64>,
+    input_latency_frames: Vec<u64>,
+}
+
+fn run_worker(width: u32, height: u32, busy: bool) -> WorkerStats {
     let _load = if busy {
         Some(LoadGuard::spawn_busy())
     } else {
         None
     };
 
-    let css_w = width;
-    let css_h = height;
     let worker = PaintWorker::spawn(EngineConfig {
         max_paint_ns: 50_000_000,
         paint_mode: PaintMode::Exact,
@@ -157,7 +211,7 @@ fn run_res(label: &str, width: u32, height: u32, busy: bool) {
     worker
         .open_surface(
             SurfaceId::DEFAULT,
-            &section_page(css_w, css_h),
+            &section_page(width, height),
             Viewport::new(width, height),
             SurfaceOpts {
                 visible: true,
@@ -166,7 +220,10 @@ fn run_res(label: &str, width: u32, height: u32, busy: bool) {
         )
         .unwrap();
     worker.flush().unwrap();
-    let _ = worker.take_frame(SurfaceId::DEFAULT);
+    let mut last_gen = worker
+        .take_frame(SurfaceId::DEFAULT)
+        .map(|f| f.generation)
+        .unwrap_or(0);
 
     let mut host_ns = Vec::with_capacity(FRAMES);
     let mut paint_ns = Vec::with_capacity(FRAMES);
@@ -185,12 +242,9 @@ fn run_res(label: &str, width: u32, height: u32, busy: bool) {
                     mods: Modifiers::default(),
                 })
                 .unwrap();
-            // Non-blocking host path: take the latest finished frame now.
             let _ = worker.take_frame(SurfaceId::DEFAULT);
             let host_cost = t_host0.elapsed().as_nanos() as u64;
 
-            // Wait for the worker to publish a frame that observed this input
-            // (bench only — Mainnet does not wait).
             let mut frames_waited = 0u64;
             let deadline = Instant::now() + Duration::from_secs(2);
             loop {
@@ -206,8 +260,6 @@ fn run_res(label: &str, width: u32, height: u32, busy: bool) {
             }
             if i >= WARMUP {
                 input_latency_frames.push(frames_waited.max(1));
-            }
-            if i >= WARMUP {
                 host_ns.push(host_cost);
             }
         } else {
@@ -220,40 +272,101 @@ fn run_res(label: &str, width: u32, height: u32, busy: bool) {
         }
 
         if let Some(frame) = worker.take_frame(SurfaceId::DEFAULT) {
-            if i >= WARMUP {
-                paint_ns.push(frame.paint_ns);
+            // Only record when the worker published a new paint. Re-reading the
+            // same generation repeated a prior paint_ns and skewed percentiles.
+            if frame.generation > last_gen {
+                last_gen = frame.generation;
+                if i >= WARMUP {
+                    paint_ns.push(frame.paint_ns);
+                }
             }
         }
     }
 
+    drop(worker);
+    WorkerStats {
+        host_ns,
+        paint_ns,
+        input_latency_frames,
+    }
+}
+
+fn run_sync_engine(width: u32, height: u32) -> Vec<u64> {
+    let mut eng = Engine::new(EngineConfig {
+        max_paint_ns: 50_000_000,
+        paint_mode: PaintMode::Exact,
+        ..EngineConfig::default()
+    });
+    eng.declare_actions(&["act.do"]);
+    eng.open_surface(
+        SurfaceId::DEFAULT,
+        &section_page(width, height),
+        Viewport::new(width, height),
+        SurfaceOpts {
+            visible: true,
+            pinned: true,
+        },
+    )
+    .unwrap();
+    let _ = eng.paint(Viewport::new(width, height)).unwrap();
+
+    let mut paint_ns = Vec::with_capacity(FRAMES);
+    for i in 0..(WARMUP + FRAMES) {
+        let ver = (i as u64) + 1;
+        let pkt = packet(ver, -((i as i32 % 40) * 3));
+        let slices = MemSlices::from_packet(&pkt);
+        let mut frags = Frags::from_packet(&pkt);
+        eng.sync(&slices, &mut frags).unwrap();
+        if i % 8 == 0 {
+            let _ = eng.input(InputEvent::PointerMove {
+                x: 40.0,
+                y: 60.0,
+                mods: Modifiers::default(),
+            });
+        }
+        let t0 = Instant::now();
+        let out = eng.paint(Viewport::new(width, height)).unwrap();
+        let ns = t0.elapsed().as_nanos() as u64;
+        if i >= WARMUP && !out.skipped {
+            paint_ns.push(ns);
+        }
+    }
+    paint_ns
+}
+
+fn print_worker(label: &str, width: u32, height: u32, busy: bool, stats: &WorkerStats) {
     println!();
     println!("### {label} ({width}x{height}, busy_cores={busy})");
     println!("| Metric | n | mean ms | p95 ms | p99 ms |");
     println!("|---|---|---|---|---|");
-    report_row("host frame (enqueue + take_frame)", &host_ns);
-    report_row("worker paint", &paint_ns);
-    if !input_latency_frames.is_empty() {
+    report_row("host frame (enqueue + take_frame)", &stats.host_ns);
+    report_row("worker paint (new gens)", &stats.paint_ns);
+    if !stats.input_latency_frames.is_empty() {
         println!(
             "input→visible latency (frames): mean={:.2}  p95={}  p99={}  n={}",
-            mean(&input_latency_frames),
-            pct(&input_latency_frames, 0.95),
-            pct(&input_latency_frames, 0.99),
-            input_latency_frames.len(),
+            mean(&stats.input_latency_frames),
+            pct(&stats.input_latency_frames, 0.95),
+            pct(&stats.input_latency_frames, 0.99),
+            stats.input_latency_frames.len(),
         );
     }
-
-    drop(worker);
 }
 
 fn main() {
     println!("hx-native worker_bench (issue #8 step 3)");
     println!(
-        "cores={}  command_capacity={}  frame_slots={}",
+        "cores={}  command_capacity={}  frame_slots={}  warmup={}  frames={}",
         thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(0),
         PAINT_WORKER_COMMAND_CAPACITY,
         PAINT_WORKER_FRAME_SLOTS,
+        WARMUP,
+        FRAMES,
+    );
+    println!(
+        "Order: per resolution, discarded prime → idle worker → busy worker → sync Engine \
+         (avoids counting the first cold 1440p pass as the idle result)."
     );
 
     let resolutions = [
@@ -262,12 +375,24 @@ fn main() {
         ("1440p", 2560, 1440),
     ];
 
-    for busy in [false, true] {
-        let load = if busy { "busy" } else { "idle" };
+    for (name, w, h) in resolutions {
         println!();
-        println!("## Other cores {load}");
-        for (name, w, h) in resolutions {
-            run_res(name, w, h, busy);
-        }
+        println!("## {name}");
+
+        // Discarded prime at this resolution so idle is not the first cold pass.
+        let _prime = run_worker(w, h, false);
+
+        let idle = run_worker(w, h, false);
+        print_worker(name, w, h, false, &idle);
+
+        let busy = run_worker(w, h, true);
+        print_worker(name, w, h, true, &busy);
+
+        let sync_ns = run_sync_engine(w, h);
+        println!();
+        println!("### {name} sync Engine (same session)");
+        println!("| Metric | n | mean ms | p95 ms | p99 ms |");
+        println!("|---|---|---|---|---|");
+        report_row("sync Engine paint", &sync_ns);
     }
 }
