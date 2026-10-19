@@ -1460,3 +1460,298 @@ fn from_body_prefers_first_enabled_in_document_order() {
         other => panic!("expected Action time.pause after flip, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Hover passthrough — CSS :hover / attr() tooltips paint through the engine
+// ---------------------------------------------------------------------------
+
+fn dark_px(pixels: &[u8]) -> usize {
+    pixels
+        .chunks(4)
+        .filter(|c| c[3] > 0 && (c[0] as u32 + c[1] as u32 + c[2] as u32) < 300)
+        .count()
+}
+
+fn tooltip_page(css: &str, button_attrs: &str) -> String {
+    // Concatenate CSS (it contains `{`/`}`) so `format!` does not treat rules as placeholders.
+    let mut html = String::from(
+        r##"<!DOCTYPE html><html><head><style>
+body{margin:0;font-family:"DejaVu Sans",sans-serif;font-size:14px;width:300px;height:60px}
+#b{display:block;width:40px;height:20px;border:0;padding:0;background:#fff;position:relative}
+"##,
+    );
+    html.push_str(css);
+    html.push_str("\n</style></head><body>\n<button id=\"b\" hx-post=\"x\" hx-trigger=\"click\" ");
+    html.push_str(button_attrs);
+    html.push_str("></button>\n</body></html>");
+    html
+}
+
+const REASON_TOOLTIP_CSS: &str = r#"[data-hx-reason]:hover::after{content:attr(data-hx-reason);position:absolute;left:44px;top:0;white-space:nowrap;color:#000;background:#ffffe1;border:1px solid #000}"#;
+const TITLE_TOOLTIP_CSS: &str = r#"[title]:not([data-hx-reason]):hover::after{content:attr(title);position:absolute;left:44px;top:0;white-space:nowrap;color:#000;background:#ffffe1;border:1px solid #000}"#;
+
+fn boot_tooltip(css: &str, button_attrs: &str) -> Engine {
+    let mut eng = Engine::new(EngineConfig {
+        max_paint_ns: 50_000_000,
+        pending_timeout_frames: 5,
+    });
+    eng.declare_actions(&["x"]);
+    eng.load_html(&tooltip_page(css, button_attrs))
+        .expect("load tooltip page");
+    eng
+}
+
+fn paint_small(eng: &mut Engine) -> PaintOutput {
+    eng.paint(Viewport {
+        width: 300,
+        height: 60,
+        holes: vec![],
+    })
+    .unwrap()
+}
+
+fn disable_x(eng: &mut Engine, reason: &str) {
+    let mut slices = MemSlices::new();
+    slices.actions.push((
+        "x".into(),
+        ActionState::Disabled {
+            reason: reason.into(),
+        },
+    ));
+    let mut frags = SpyFrags::new();
+    eng.sync(&slices, &mut frags).unwrap();
+}
+
+#[test]
+fn hover_reason_tooltip_paints_and_clears() {
+    let mut eng = boot_tooltip(REASON_TOOLTIP_CSS, "");
+    disable_x(&mut eng, "Already paused");
+
+    let before = paint_small(&mut eng);
+    let before_dark = dark_px(&before.rgba.as_ref().unwrap().pixels);
+    assert_eq!(
+        before_dark, 0,
+        "unhovered disabled chip must not show tooltip"
+    );
+
+    let hover = eng.input(InputEvent::PointerMove {
+        x: 10.0,
+        y: 10.0,
+        mods: Modifiers::default(),
+    });
+    assert!(matches!(hover, InputOutcome::Hover { id: Some(ref id) } if id == "b"));
+
+    let hovered = paint_small(&mut eng);
+    assert!(!hovered.skipped, "hover enter must dirty paint");
+    let hovered_dark = dark_px(&hovered.rgba.as_ref().unwrap().pixels);
+    assert!(
+        hovered_dark > 100,
+        "hovered data-hx-reason tooltip must paint (dark_px={hovered_dark})"
+    );
+
+    let leave = eng.input(InputEvent::PointerLeave);
+    assert!(matches!(leave, InputOutcome::Hover { id: None }));
+    let after = paint_small(&mut eng);
+    assert!(!after.skipped, "hover leave must dirty paint");
+    let after_dark = dark_px(&after.rgba.as_ref().unwrap().pixels);
+    assert_eq!(
+        after_dark, before_dark,
+        "leaving must restore unhovered pixels (before={before_dark} after={after_dark})"
+    );
+}
+
+#[test]
+fn hover_reason_follows_sync_rewrite() {
+    let mut eng = boot_tooltip(REASON_TOOLTIP_CSS, "");
+    disable_x(&mut eng, "Already paused");
+    let _ = paint_small(&mut eng);
+    eng.input(InputEvent::PointerMove {
+        x: 10.0,
+        y: 10.0,
+        mods: Modifiers::default(),
+    });
+    let old = paint_small(&mut eng);
+    let old_dark = dark_px(&old.rgba.as_ref().unwrap().pixels);
+
+    // Rewrite reason while still hovered.
+    let mut slices = MemSlices::new();
+    slices.actions.push((
+        "x".into(),
+        ActionState::Disabled {
+            reason: "Paused while a dialog is open".into(),
+        },
+    ));
+    slices.bump("actions");
+    let mut frags = SpyFrags::new();
+    eng.sync(&slices, &mut frags).unwrap();
+    let updated = paint_small(&mut eng);
+    let updated_px = updated.rgba.as_ref().unwrap().pixels.clone();
+    let updated_dark = dark_px(&updated_px);
+    assert!(
+        updated_dark > old_dark,
+        "longer reason must paint more dark pixels (old={old_dark} new={updated_dark})"
+    );
+
+    // Fresh engine with the new reason, hovered — pixel match.
+    let mut fresh = boot_tooltip(REASON_TOOLTIP_CSS, "");
+    disable_x(&mut fresh, "Paused while a dialog is open");
+    let _ = paint_small(&mut fresh);
+    fresh.input(InputEvent::PointerMove {
+        x: 10.0,
+        y: 10.0,
+        mods: Modifiers::default(),
+    });
+    let fresh_out = paint_small(&mut fresh);
+    assert_eq!(
+        updated_px,
+        fresh_out.rgba.as_ref().unwrap().pixels,
+        "sync reason rewrite while hovered must match a fresh hovered load"
+    );
+}
+
+#[test]
+fn hover_tooltip_survives_chip_swap() {
+    // tstrip_shell + chips.html: swap replaces the hovered chip fragment while
+    // the pointer stays over it; tooltip must still paint.
+    let mut shell = String::from(
+        r##"<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/>
+<style>
+body { width: 800px; height: 120px; margin: 0; font-family: "DejaVu Sans", sans-serif; }
+#tstrip-chips { position: absolute; left: 8px; top: 8px; height: 40px; }
+#tstrip-ind { position: absolute; left: 8px; top: 60px; width: 24px; height: 24px; }
+button { height: 36px; margin-right: 4px; position: relative; }
+"##,
+    );
+    shell.push_str(REASON_TOOLTIP_CSS);
+    shell.push_str(
+        r##"
+</style></head><body>
+<section id="time-strip" hx-trigger="slice:time" hx-target="#tstrip-chips" hx-swap="innerHTML">
+  <div id="tstrip-chips"><!-- chips --></div>
+</section>
+<div id="tstrip-ind" aria-hidden="true"></div>
+</body></html>"##,
+    );
+
+    let mut eng = Engine::new(EngineConfig {
+        max_paint_ns: 50_000_000,
+        pending_timeout_frames: 5,
+    });
+    eng.declare_actions(&["time.pause", "time.resume", "time.set_speed"]);
+    eng.load_html(&shell).expect("load shell");
+
+    let mut slices = MemSlices::new();
+    slices.actions.push((
+        "time.pause".into(),
+        ActionState::Disabled {
+            reason: "Already paused".into(),
+        },
+    ));
+    let mut frags = SpyFrags::new();
+    frags.set("time-strip", CHIPS_FRAGMENT);
+    eng.sync(&slices, &mut frags).unwrap();
+
+    let vp = Viewport {
+        width: 800,
+        height: 120,
+        holes: vec![],
+    };
+    let _ = eng.paint(vp.clone()).unwrap();
+
+    // Pause chip is the first button (~left edge of #tstrip-chips).
+    let hover = eng.input(InputEvent::PointerMove {
+        x: 40.0,
+        y: 26.0,
+        mods: Modifiers::default(),
+    });
+    assert!(
+        matches!(hover, InputOutcome::Hover { id: Some(ref id) } if id == "tstrip-pause"),
+        "expected hover on tstrip-pause, got {hover:?}"
+    );
+    let hovered = eng.paint(vp.clone()).unwrap();
+    let hovered_dark = dark_px(&hovered.rgba.as_ref().unwrap().pixels);
+    assert!(
+        hovered_dark > 100,
+        "tooltip must paint before swap (dark_px={hovered_dark})"
+    );
+
+    // Swap the chips fragment again with the pointer still over pause.
+    slices.bump("time");
+    frags.set("time-strip", CHIPS_FRAGMENT);
+    eng.sync(&slices, &mut frags).unwrap();
+    let after_swap = eng.paint(vp).unwrap();
+    assert!(!after_swap.skipped, "swap under hover must dirty paint");
+    let after_dark = dark_px(&after_swap.rgba.as_ref().unwrap().pixels);
+    assert!(
+        after_dark > 100,
+        "tooltip must survive chip swap (dark_px={after_dark})"
+    );
+    assert_eq!(
+        eng.attr("tstrip-pause", "data-hx-reason").as_deref(),
+        Some("Already paused")
+    );
+}
+
+#[test]
+fn hover_move_within_same_element_skips_paint() {
+    let mut eng = boot_tooltip(REASON_TOOLTIP_CSS, "");
+    disable_x(&mut eng, "Already paused");
+    let _ = paint_small(&mut eng);
+
+    eng.input(InputEvent::PointerMove {
+        x: 10.0,
+        y: 10.0,
+        mods: Modifiers::default(),
+    });
+    let enter = paint_small(&mut eng);
+    assert!(!enter.skipped);
+
+    // Move within the same 40×20 button — Blitz hover node unchanged.
+    let none = eng.input(InputEvent::PointerMove {
+        x: 18.0,
+        y: 12.0,
+        mods: Modifiers::default(),
+    });
+    assert!(
+        matches!(none, InputOutcome::None),
+        "same-element move must not re-emit Hover, got {none:?}"
+    );
+    let skipped = paint_small(&mut eng);
+    assert!(
+        skipped.skipped,
+        "same-element pointer move must keep clean-frame skip"
+    );
+    assert!(
+        eng.last_timings().paint_ns < 1_000_000,
+        "skipped paint must stay cheap, got {} ns",
+        eng.last_timings().paint_ns
+    );
+}
+
+#[test]
+fn hover_title_tooltip_on_enabled_element() {
+    let mut eng = boot_tooltip(TITLE_TOOLTIP_CSS, r#"title="1 min/s""#);
+    // Enabled: no actions-slice disable, so no data-hx-reason.
+    let slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    eng.sync(&slices, &mut frags).unwrap();
+
+    let before = paint_small(&mut eng);
+    assert_eq!(dark_px(&before.rgba.as_ref().unwrap().pixels), 0);
+
+    eng.input(InputEvent::PointerMove {
+        x: 10.0,
+        y: 10.0,
+        mods: Modifiers::default(),
+    });
+    let hovered = paint_small(&mut eng);
+    assert!(!hovered.skipped);
+    let dark = dark_px(&hovered.rgba.as_ref().unwrap().pixels);
+    assert!(
+        dark > 50,
+        "enabled title tooltip must paint via attr(title) (dark_px={dark})"
+    );
+    assert!(eng.attr("b", "data-hx-reason").is_none());
+    assert_eq!(eng.attr("b", "title").as_deref(), Some("1 min/s"));
+}
