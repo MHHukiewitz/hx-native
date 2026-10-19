@@ -6,6 +6,15 @@
 //! [`Engine`] and every surface. The host keeps a [`PaintWorker`] handle that
 //! is `Send` and never blocks waiting for paint after spawn.
 //!
+//! **All command methods are fire-and-forget**, including setup
+//! ([`PaintWorker::declare_actions`], [`PaintWorker::open_surface`],
+//! [`PaintWorker::load_html`], and the per-frame sync / input / control
+//! calls). A successful `Ok(())` means the command was enqueued, not that the
+//! worker has applied it. After setup (or any batch of commands whose result
+//! you need before continuing), either call [`PaintWorker::flush`] once or
+//! check [`PaintWorker::poll_error`]. Engine failures surface there with a
+//! [`SurfaceId`] when known.
+//!
 //! Typical Mainnet frame:
 //!
 //! 1. After the sim tick, build a [`SyncPacket`] from already-rendered slice
@@ -838,6 +847,11 @@ impl SharedState {
 }
 
 /// Host-side handle for a background paint thread (`Send` + `Sync`).
+///
+/// Command methods (including setup: [`Self::declare_actions`],
+/// [`Self::open_surface`], [`Self::load_html`]) are fire-and-forget: `Ok(())`
+/// means enqueued. After setup, check [`Self::poll_error`] or call
+/// [`Self::flush`] once before relying on the result.
 pub struct PaintWorker {
     mailbox: Arc<Mailbox>,
     shared: Arc<SharedState>,
@@ -859,6 +873,11 @@ const _: () = {
 
 impl PaintWorker {
     /// Spawn a worker thread that creates and owns the [`Engine`].
+    ///
+    /// Returns as soon as the thread is started; the [`Engine`] is created on
+    /// the worker. Setup that follows ([`Self::declare_actions`],
+    /// [`Self::open_surface`], [`Self::load_html`], …) is fire-and-forget —
+    /// check [`Self::poll_error`] after setup or call [`Self::flush`] once.
     pub fn spawn(config: EngineConfig) -> Self {
         let mailbox = Arc::new(Mailbox::new());
         let shared = Arc::new(SharedState::new());
@@ -898,18 +917,25 @@ impl PaintWorker {
         Ok(())
     }
 
-    /// Fire-and-forget. Engine failures appear in [`Self::poll_error`] with a
-    /// [`SurfaceId`] when known.
+    /// Fire-and-forget setup: enqueues action names; does not wait for apply.
+    ///
+    /// Check [`Self::poll_error`] after setup or call [`Self::flush`] once.
+    /// Engine failures appear in [`Self::poll_error`] with a [`SurfaceId`] when
+    /// known.
     pub fn declare_actions(&self, names: &[&str]) -> Result<(), WorkerError> {
         self.check_stall_after_enqueue(self.mailbox.push_discrete(Command::DeclareActions {
             names: names.iter().map(|s| (*s).to_string()).collect(),
         }))
     }
 
+    /// Fire-and-forget. Engine failures appear in [`Self::poll_error`].
     pub fn mark_theme_or_stylesheet_changed(&self) -> Result<(), WorkerError> {
         self.check_stall_after_enqueue(self.mailbox.push_mark_theme())
     }
 
+    /// Fire-and-forget setup: enqueues an open; does not wait for the surface.
+    ///
+    /// Check [`Self::poll_error`] after setup or call [`Self::flush`] once.
     pub fn open_surface(
         &self,
         id: SurfaceId,
@@ -925,36 +951,52 @@ impl PaintWorker {
         }))
     }
 
+    /// Fire-and-forget. Engine failures appear in [`Self::poll_error`] with the
+    /// [`SurfaceId`].
     pub fn close_surface(&self, id: SurfaceId) -> Result<(), WorkerError> {
         self.check_stall_after_enqueue(self.mailbox.push_close(id))
     }
 
+    /// Fire-and-forget. Engine failures appear in [`Self::poll_error`] with the
+    /// [`SurfaceId`].
     pub fn set_visible(&self, id: SurfaceId, visible: bool) -> Result<(), WorkerError> {
         self.check_stall_after_enqueue(self.mailbox.push_set_visible(id, visible))
     }
 
+    /// Fire-and-forget. Engine failures appear in [`Self::poll_error`] with the
+    /// [`SurfaceId`].
     pub fn resize_surface(&self, id: SurfaceId, viewport: Viewport) -> Result<(), WorkerError> {
         self.check_stall_after_enqueue(self.mailbox.push_resize(id, viewport))
     }
 
+    /// Fire-and-forget setup: enqueues HTML for the default surface; does not
+    /// wait for load.
+    ///
+    /// Check [`Self::poll_error`] after setup or call [`Self::flush`] once.
     pub fn load_html(&self, html: &str) -> Result<(), WorkerError> {
         self.check_stall_after_enqueue(self.mailbox.push_discrete(Command::LoadHtml {
             html: html.to_string(),
         }))
     }
 
+    /// Fire-and-forget. Engine failures appear in [`Self::poll_error`].
     pub fn sync(&self, packet: SyncPacket) -> Result<(), WorkerError> {
         self.check_stall_after_enqueue(self.mailbox.push_sync(SyncTarget::All, packet))
     }
 
+    /// Fire-and-forget. Engine failures appear in [`Self::poll_error`] with the
+    /// [`SurfaceId`].
     pub fn sync_surface(&self, id: SurfaceId, packet: SyncPacket) -> Result<(), WorkerError> {
         self.check_stall_after_enqueue(self.mailbox.push_sync(SyncTarget::Surface(id), packet))
     }
 
+    /// Fire-and-forget. Engine failures appear in [`Self::poll_error`].
     pub fn input(&self, event: InputEvent) -> Result<(), WorkerError> {
         self.input_surface(SurfaceId::DEFAULT, event)
     }
 
+    /// Fire-and-forget. Engine failures appear in [`Self::poll_error`] with the
+    /// [`SurfaceId`].
     pub fn input_surface(&self, id: SurfaceId, event: InputEvent) -> Result<(), WorkerError> {
         self.shared.input_seq.fetch_add(1, Ordering::SeqCst);
         let r = if matches!(event, InputEvent::PointerMove { .. }) {
@@ -966,6 +1008,7 @@ impl PaintWorker {
         self.check_stall_after_enqueue(r)
     }
 
+    /// Fire-and-forget. Engine failures appear in [`Self::poll_error`].
     pub fn complete(
         &self,
         request: RequestId,
@@ -979,6 +1022,9 @@ impl PaintWorker {
 
     /// Wait until commands queued before this call are applied and dirty
     /// surfaces painted. Bound by [`WORKER_STALL_TIMEOUT_NS`].
+    ///
+    /// Use once after setup (or any batch whose result you need) when you do
+    /// not want to poll [`Self::poll_error`] yourself.
     pub fn flush(&self) -> Result<(), WorkerError> {
         if let Some(err) = self.poll_error() {
             return Err(err);
@@ -1045,6 +1091,8 @@ impl PaintWorker {
             .clone()
     }
 
+    /// Latest worker / engine error, if any (includes fire-and-forget setup
+    /// failures, tagged with [`SurfaceId`] when known).
     pub fn poll_error(&self) -> Option<WorkerError> {
         self.shared
             .error
