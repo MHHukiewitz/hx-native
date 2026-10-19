@@ -1,0 +1,16 @@
+# Rust
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+# Cargo.lock is committed for binaries/examples; libraries may ignore it later.
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Test output
+/tests/output/
+*.png.actual
