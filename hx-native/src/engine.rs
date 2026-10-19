@@ -10,6 +10,10 @@ use blitz_dom::{
 use blitz_html::{HtmlDocument, HtmlProvider};
 use blitz_traits::shell::{ColorScheme, Viewport as BlitzViewport};
 
+use crate::damage::{
+    collect_style_damaged, compute_raw_damage, merge_damage_rects, snapshot_bounds, BoundsSnapshot,
+    DamagePlan, IntRect,
+};
 use crate::dialect::{validate_loaded_attrs, ElementBinding, SwapMode, SyncMode};
 use crate::error::EngineError;
 use crate::focus::{focusable_ids, ids_in_document_order, step_focus};
@@ -18,7 +22,7 @@ use crate::form_args::{
     collect_action_args, is_numeric_input, is_range_input, set_range_value_from_x,
     step_numeric_value,
 };
-use crate::paint::paint_rgba;
+use crate::paint::{paint_damage_into, paint_rgba};
 use crate::pending::{PendingEntry, PendingState, QueuedRelease};
 use crate::trigger::{
     filter_ctx_from_key, keydown_repeat_allowed, FilterCtx, FromTarget, TriggerEvent,
@@ -53,12 +57,21 @@ pub struct Engine {
     press: Option<PressState>,
     focus: FocusState,
     timings: Timings,
-    /// Viewport used for layout / hit-testing (updated on paint).
+    paint_stats: PaintStats,
+    /// Physical viewport size used for layout / hit-testing (updated on paint).
     layout_viewport: (u32, u32),
+    /// Last paint scale factor (hidpi). Full repaint when this changes.
+    layout_scale: f64,
     needs_resolve: bool,
     /// Spec: skip clean frames — only raster when something is damaged.
     paint_dirty: bool,
+    /// Force a full-surface repaint (first frame, theme/stylesheet, etc.).
+    force_full_repaint: bool,
     cached_rgba: Option<RgbaImage>,
+    /// Per-node own/ink bounds from the last painted frame (device pixels).
+    last_bounds: BoundsSnapshot,
+    /// Counts style+layout resolve passes that run inside `paint` (batching test).
+    style_layout_passes: u64,
     /// Test harness: assert pending timeouts were observed.
     pub(crate) frame_count: u32,
     loaded_html: Option<String>,
@@ -91,10 +104,15 @@ impl Engine {
             press: None,
             focus: FocusState::default(),
             timings: Timings::default(),
+            paint_stats: PaintStats::default(),
             layout_viewport: (800, 120),
+            layout_scale: 1.0,
             needs_resolve: false,
             paint_dirty: true,
+            force_full_repaint: true,
             cached_rgba: None,
+            last_bounds: BoundsSnapshot::new(),
+            style_layout_passes: 0,
             frame_count: 0,
             loaded_html: None,
             range_drag_id: None,
@@ -103,6 +121,12 @@ impl Engine {
 
     fn mark_paint_dirty(&mut self) {
         self.paint_dirty = true;
+    }
+
+    /// Host calls this after a theme or stylesheet change. Next paint is a full repaint.
+    pub fn mark_theme_or_stylesheet_changed(&mut self) {
+        self.force_full_repaint = true;
+        self.mark_paint_dirty();
     }
 
     pub fn declare_actions(&mut self, names: &[&str]) {
@@ -141,6 +165,8 @@ impl Engine {
         self.loaded_html = Some(html.to_string());
         self.needs_resolve = false;
         self.cached_rgba = None;
+        self.last_bounds.clear();
+        self.force_full_repaint = true;
         self.mark_paint_dirty();
         Ok(())
     }
@@ -354,17 +380,9 @@ impl Engine {
             !dirty_sections.is_empty() || initial,
         )?;
 
-        // Count damage before resolve (A5 instrumentation).
+        // Count mutation damage before any resolve (A5). Style/layout run once
+        // in `paint()` — sync and swaps only record changes (issue #8 step 1).
         let (damaged_node_count, total_element_count) = self.count_damage();
-
-        self.ensure_resolved();
-
-        // Re-resolve Blitz :hover after swaps / actions-slice rewrites so a
-        // tooltip survives a chip refresh and follows a reason change.
-        // Paint is marked dirty only when the hovered node actually changes.
-        if self.refresh_blitz_hover() {
-            self.mark_paint_dirty();
-        }
 
         // Belt-and-suspenders: a section swap must dirty paint even with no
         // hover (swap_section already marks; keep this so sync stays honest if
@@ -692,15 +710,6 @@ impl Engine {
         self.doc
             .as_mut()
             .map(|doc| doc.clear_hover())
-            .unwrap_or(false)
-    }
-
-    /// Re-resolve Blitz hover after DOM mutations using the last pointer position
-    /// recorded by `set_hover_to`. Returns true when the hovered node changed.
-    fn refresh_blitz_hover(&mut self) -> bool {
-        self.doc
-            .as_mut()
-            .map(|doc| doc.refresh_hover())
             .unwrap_or(false)
     }
 
@@ -1369,62 +1378,173 @@ impl Engine {
 
     /// Paint into a CPU RGBA buffer the host composites.
     ///
-    /// Clean frames (`paint_dirty` false, viewport size unchanged) skip raster
-    /// and return [`PaintOutput`] with `skipped: true` and `rgba: None` — no
-    /// buffer copy. The host must keep its previous texture; see
-    /// [`Self::last_frame`] for a borrowed look at the cache.
+    /// Clean frames (`paint_dirty` false, viewport size/scale unchanged) skip
+    /// raster and return [`PaintOutput`] with `skipped: true`, `rgba: None`, and
+    /// empty `damage` — no buffer copy. The host must keep its previous texture;
+    /// see [`Self::last_frame`] for a borrowed look at the cache.
+    ///
+    /// Style, layout and paint run once here. `sync` / swaps only record changes.
     pub fn paint(&mut self, viewport: Viewport) -> Result<PaintOutput, EngineError> {
         let t0 = Instant::now();
-        let size_changed =
-            self.layout_viewport != (viewport.width, viewport.height) || self.cached_rgba.is_none();
+        let scale = if viewport.scale > 0.0 {
+            viewport.scale
+        } else {
+            1.0
+        };
+        let size_changed = self.layout_viewport != (viewport.width, viewport.height);
+        let scale_changed = (self.layout_scale - scale).abs() > f64::EPSILON;
+        let first_frame = self.cached_rgba.is_none();
+        let force_full = self.force_full_repaint || first_frame || size_changed || scale_changed;
+
         self.layout_viewport = (viewport.width, viewport.height);
+        self.layout_scale = scale;
 
         // Frame tick for pending timeout backstop (always advances).
         self.frame_count = self.frame_count.saturating_add(1);
         self.pending.tick_frames(self.config.pending_timeout_frames);
 
         // Spec: skip clean frames — no raster when nothing is damaged and size is unchanged.
-        if !self.paint_dirty && !size_changed {
+        if !self.paint_dirty && !force_full {
             self.timings.paint_ns = t0.elapsed().as_nanos() as u64;
             self.timings.paint_skipped = true;
+            self.paint_stats = PaintStats::default();
             let _ = viewport.holes;
             return Ok(PaintOutput {
                 rgba: None,
                 texture: None,
                 focus: self.focus.clone(),
                 skipped: true,
+                damage: Vec::new(),
             });
         }
 
-        let doc = self.doc.as_mut().ok_or(EngineError::NotLoaded)?;
-        doc.set_viewport(BlitzViewport::new(
-            viewport.width,
-            viewport.height,
-            1.0,
-            ColorScheme::Light,
-        ));
-        doc.resolve(0.0);
-        self.needs_resolve = false;
+        let plan =
+            self.resolve_and_plan_damage(viewport.width, viewport.height, scale, force_full)?;
 
-        let rgba = paint_rgba(doc, viewport.width, viewport.height, 1.0)?;
+        let rgba = self.rasterize_plan(&plan, viewport.width, viewport.height, scale)?;
+
         self.timings.paint_ns = t0.elapsed().as_nanos() as u64;
         self.timings.paint_skipped = false;
         self.paint_dirty = false;
+        self.force_full_repaint = false;
+        self.paint_stats = PaintStats {
+            damage_rect_count: plan.rects.len(),
+            merged_to_bbox: plan.merged_to_bbox,
+            full_repaint_area_fallback: plan.full_repaint_area_fallback,
+            full_repaint: plan.full_repaint,
+        };
         self.cached_rgba = Some(rgba.clone());
 
         // Holes: Layer 1 crate unit does not composite host textures (UI owns that).
         let _ = viewport.holes;
 
+        let damage: Vec<Rect> = plan.rects.iter().map(|r| r.to_rect()).collect();
         Ok(PaintOutput {
             rgba: Some(rgba),
             texture: None,
             focus: self.focus.clone(),
             skipped: false,
+            damage,
         })
+    }
+
+    /// Run style + layout once, then compute a damage plan.
+    fn resolve_and_plan_damage(
+        &mut self,
+        width: u32,
+        height: u32,
+        scale: f64,
+        force_full: bool,
+    ) -> Result<DamagePlan, EngineError> {
+        let had_previous = !self.last_bounds.is_empty() && self.cached_rgba.is_some();
+        let previous = std::mem::take(&mut self.last_bounds);
+
+        let doc = self.doc.as_mut().ok_or(EngineError::NotLoaded)?;
+        doc.set_viewport(BlitzViewport::new(
+            width,
+            height,
+            scale as f32,
+            ColorScheme::Light,
+        ));
+
+        // Probe: public resolve_stylist first so Node::damage() is readable,
+        // then full resolve (stylist is a no-op; layout + paint-tree run).
+        let style_damaged = if force_full || !had_previous {
+            Vec::new()
+        } else {
+            doc.resolve_stylist(0.0);
+            collect_style_damaged(doc)
+        };
+
+        doc.resolve(0.0);
+        self.style_layout_passes = self.style_layout_passes.saturating_add(1);
+
+        // resolve() ends with refresh_hover(); if hover changed, restyle for this frame.
+        if doc.refresh_hover() {
+            doc.resolve(0.0);
+            self.style_layout_passes = self.style_layout_passes.saturating_add(1);
+        }
+        self.needs_resolve = false;
+
+        let plan = if force_full || !had_previous {
+            DamagePlan::full(width, height)
+        } else {
+            let raw = compute_raw_damage(doc, scale, width, height, &previous, &style_damaged);
+            let merged = merge_damage_rects(raw, width, height);
+            // Dirty paint with no detected rects: fall back to full (safer than a no-op).
+            if merged.rects.is_empty() {
+                DamagePlan::full(width, height)
+            } else {
+                merged
+            }
+        };
+
+        self.last_bounds = snapshot_bounds(doc, scale);
+        Ok(plan)
+    }
+
+    fn rasterize_plan(
+        &mut self,
+        plan: &DamagePlan,
+        width: u32,
+        height: u32,
+        scale: f64,
+    ) -> Result<RgbaImage, EngineError> {
+        let doc = self.doc.as_mut().ok_or(EngineError::NotLoaded)?;
+        if plan.full_repaint
+            || plan.rects.len() == 1 && plan.rects[0] == IntRect::full_surface(width, height)
+        {
+            return paint_rgba(doc, width, height, scale);
+        }
+
+        let mut frame = self.cached_rgba.take().unwrap_or_else(|| RgbaImage {
+            width,
+            height,
+            pixels: vec![0u8; (width as usize) * (height as usize) * 4],
+        });
+        if frame.width != width || frame.height != height {
+            frame = RgbaImage {
+                width,
+                height,
+                pixels: vec![0u8; (width as usize) * (height as usize) * 4],
+            };
+        }
+        paint_damage_into(doc, &mut frame, scale, &plan.rects, self.config.paint_mode)?;
+        Ok(frame)
     }
 
     pub fn last_timings(&self) -> Timings {
         self.timings.clone()
+    }
+
+    /// Diagnostics for the last non-skipped paint (merge / full-repaint fallbacks).
+    pub fn last_paint_stats(&self) -> PaintStats {
+        self.paint_stats.clone()
+    }
+
+    /// Number of style+layout resolve passes executed inside `paint` since engine creation.
+    pub fn style_layout_pass_count(&self) -> u64 {
+        self.style_layout_passes
     }
 
     pub fn config(&self) -> &EngineConfig {
@@ -1508,12 +1628,16 @@ impl Engine {
 }
 
 fn parse_html_document(html: &str, layout_viewport: (u32, u32)) -> HtmlDocument {
+    parse_html_document_scaled(html, layout_viewport, 1.0)
+}
+
+fn parse_html_document_scaled(html: &str, layout_viewport: (u32, u32), scale: f64) -> HtmlDocument {
     let font_ctx = bundled_font_context();
     let (w, h) = layout_viewport;
     HtmlDocument::from_html(
         html,
         DocumentConfig {
-            viewport: Some(BlitzViewport::new(w, h, 1.0, ColorScheme::Light)),
+            viewport: Some(BlitzViewport::new(w, h, scale as f32, ColorScheme::Light)),
             html_parser_provider: Some(Arc::new(HtmlProvider)),
             font_ctx: Some(font_ctx),
             style_threading: StyleThreading::Sequential,

@@ -10,6 +10,8 @@ pub struct EngineConfig {
     /// Backstop for a missing `complete()`: after this many frames a pending
     /// request is dropped. Debug builds warn; test harnesses fail loudly.
     pub pending_timeout_frames: u32,
+    /// Partial-raster strategy. Default is [`PaintMode::Exact`] (byte-identical).
+    pub paint_mode: PaintMode,
 }
 
 impl Default for EngineConfig {
@@ -17,8 +19,24 @@ impl Default for EngineConfig {
         Self {
             max_paint_ns: 8_000_000, // ~8ms default headroom inside a 16.6ms frame
             pending_timeout_frames: 120,
+            paint_mode: PaintMode::Exact,
         }
     }
+}
+
+/// How partial damage rects are rasterized.
+///
+/// [`PaintMode::Exact`] (default) is byte-identical to a full repaint. Mainnet
+/// stays on Exact unless Graph signs off on Shifted.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum PaintMode {
+    /// Cull commands outside the rect, push a full-size clip layer, render at
+    /// full surface size, then copy the rect. Byte-identical to a full paint.
+    #[default]
+    Exact,
+    /// Opt-in faster path: shift and render into a rect-sized target. Can differ
+    /// by up to 1/255 per channel inside the rect.
+    Shifted,
 }
 
 /// Deterministic: starts at 1 per engine, +1 per emitted Action (incl. queued
@@ -160,6 +178,26 @@ pub struct Timings {
     pub paint_skipped: bool,
 }
 
+/// Cap on damage rects after merge. Above this, rects collapse to their bounding box.
+pub const MAX_DAMAGE_RECTS: usize = 8;
+
+/// When total damage area exceeds this fraction of the surface, fall back to a full repaint.
+pub const FULL_REPAINT_AREA_FRACTION: f64 = 0.5;
+
+/// Per-frame paint diagnostics (damage merge / full-repaint fallbacks).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PaintStats {
+    /// Number of damage rects after merge (0 when skipped; 1 for a full surface).
+    pub damage_rect_count: usize,
+    /// True when more than [`MAX_DAMAGE_RECTS`] rects collapsed to a bbox.
+    pub merged_to_bbox: bool,
+    /// True when damage area exceeded [`FULL_REPAINT_AREA_FRACTION`].
+    pub full_repaint_area_fallback: bool,
+    /// True when this frame was a forced full repaint (first frame, resize, scale,
+    /// theme/stylesheet, or area fallback).
+    pub full_repaint: bool,
+}
+
 /// RGBA8 image buffer (software / G1 path).
 #[derive(Clone, Debug)]
 pub struct RgbaImage {
@@ -188,15 +226,46 @@ pub struct PaintOutput {
     pub rgba: Option<RgbaImage>,
     pub texture: Option<HostTextureRef>,
     pub focus: FocusState,
-    /// True when raster was skipped (clean frame). Then `rgba` is `None`.
+    /// True when raster was skipped (clean frame). Then `rgba` is `None` and
+    /// `damage` is empty.
     pub skipped: bool,
+    /// Changed regions in integer device pixels (rounded outward, clamped to
+    /// the surface). Empty when skipped. One full-surface rect on a full repaint.
+    /// The host uploads only these rects with `write_texture`.
+    pub damage: Vec<Rect>,
 }
 
 #[derive(Clone, Debug)]
 pub struct Viewport {
+    /// Physical (device-pixel) width of the paint surface.
     pub width: u32,
+    /// Physical (device-pixel) height of the paint surface.
     pub height: u32,
+    /// Device-pixel ratio / hidpi scale (1.0 = 1 CSS px per device px).
+    pub scale: f64,
     pub holes: Vec<Hole>,
+}
+
+impl Viewport {
+    /// Build a viewport at scale 1.0 with no holes.
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            scale: 1.0,
+            holes: Vec::new(),
+        }
+    }
+
+    /// Build a viewport at the given scale with no holes.
+    pub fn with_scale(width: u32, height: u32, scale: f64) -> Self {
+        Self {
+            width,
+            height,
+            scale,
+            holes: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
