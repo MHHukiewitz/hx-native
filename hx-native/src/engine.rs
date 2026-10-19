@@ -338,8 +338,13 @@ impl Engine {
 
         self.slice_versions = current;
 
-        // Apply actions slice greying.
-        self.apply_action_states(slices.action_states())?;
+        // Apply actions-slice greying only when the desired state differs from
+        // what is already on the DOM (or after a swap that replaced elements).
+        // An unchanged actions slice must not write attributes or mark paint dirty.
+        self.apply_action_states(
+            slices.action_states(),
+            !dirty_sections.is_empty() || initial,
+        )?;
 
         // Count damage before resolve (A5 instrumentation).
         let (damaged_node_count, total_element_count) = self.count_damage();
@@ -348,11 +353,18 @@ impl Engine {
 
         // Re-resolve Blitz :hover after swaps / actions-slice rewrites so a
         // tooltip survives a chip refresh and follows a reason change.
+        // Paint is marked dirty only when the hovered node actually changes.
         if self.refresh_blitz_hover() {
             self.mark_paint_dirty();
         }
 
-        if !dirty_sections.is_empty() || damaged_node_count > 0 {
+        // Belt-and-suspenders: a section swap must dirty paint even with no
+        // hover (swap_section already marks; keep this so sync stays honest if
+        // that path changes). Do NOT mark from `damaged_node_count` — Blitz can
+        // leave stale damage flags after resolve, which made every clean sync
+        // look dirty. Action-state writes mark dirty inside apply_action_states
+        // when `node_updates` is non-empty.
+        if !dirty_sections.is_empty() {
             self.mark_paint_dirty();
         }
 
@@ -439,41 +451,68 @@ impl Engine {
             .ok_or_else(|| EngineError::Internal(format!("hx-target `{sel}` matched nothing")))
     }
 
+    /// Apply greying from the reserved `actions` slice.
+    ///
+    /// `force_dom_pass` is set when section swaps (or the initial full render)
+    /// may have replaced elements that still need the current greying written.
+    /// When the desired disabled/reason map matches `disabled_actions` and no
+    /// DOM pass is forced, this is a no-op: no attribute writes and no paint dirty.
     fn apply_action_states(
         &mut self,
         states: Vec<(String, ActionState)>,
+        force_dom_pass: bool,
     ) -> Result<(), EngineError> {
-        self.disabled_actions.clear();
+        let mut new_disabled: HashMap<String, String> = HashMap::new();
         for (name, state) in &states {
             if let ActionState::Disabled { reason } = state {
-                self.disabled_actions.insert(name.clone(), reason.clone());
+                new_disabled.insert(name.clone(), reason.clone());
             }
         }
 
-        // Collect element ids to update (avoid borrow issues).
-        let updates: Vec<(String, Option<String>)> = self
-            .bindings
-            .values()
-            .filter_map(|b| {
-                let action = b.hx_post.as_ref()?;
-                let reason = self.disabled_actions.get(action).cloned();
-                Some((b.id.clone(), reason))
-            })
-            .collect();
+        let map_changed = new_disabled != self.disabled_actions;
+        if !map_changed && !force_dom_pass {
+            return Ok(());
+        }
 
-        let _ = updates; // rebuilt below with NodeIds
-        let node_updates: Vec<(NodeId, Option<String>)> = {
+        // Desired reason per element with hx-post (None = enabled / clear greying).
+        let desired: Vec<(String, NodeId, Option<String>)> = {
             let doc = self.doc.as_ref().unwrap();
             self.bindings
                 .values()
                 .filter_map(|b| {
                     let action = b.hx_post.as_ref()?;
                     let nid = doc.get_element_by_id(&b.id)?;
-                    let reason = self.disabled_actions.get(action).cloned();
-                    Some((nid, reason))
+                    let reason = new_disabled.get(action).cloned();
+                    Some((b.id.clone(), nid, reason))
                 })
                 .collect()
         };
+
+        // Compare against attributes already on the element; only write diffs.
+        let mut node_updates: Vec<(NodeId, Option<String>)> = Vec::new();
+        for (elem_id, nid, reason) in desired {
+            let current_reason = self.attr(&elem_id, "data-hx-reason");
+            let currently_disabled = self.attr(&elem_id, "disabled").is_some();
+            let currently_aria = self.attr(&elem_id, "aria-disabled").as_deref() == Some("true");
+            let already_matches = match &reason {
+                Some(r) => {
+                    currently_disabled
+                        && currently_aria
+                        && current_reason.as_deref() == Some(r.as_str())
+                }
+                None => !currently_disabled && !currently_aria && current_reason.is_none(),
+            };
+            if !already_matches {
+                node_updates.push((nid, reason));
+            }
+        }
+
+        self.disabled_actions = new_disabled;
+
+        if node_updates.is_empty() {
+            return Ok(());
+        }
+
         {
             let doc = self.doc.as_mut().unwrap();
             let mut mutr = doc.mutate();
@@ -1222,6 +1261,21 @@ impl Engine {
         std::mem::take(&mut self.released_outcomes)
     }
 
+    /// Borrowed view of the last rasterized frame, if any.
+    ///
+    /// Prefer this (or the host's own last texture) over expecting
+    /// [`PaintOutput::rgba`] on a skipped paint — skipped paints return
+    /// `rgba: None` so the engine never copies the buffer.
+    pub fn last_frame(&self) -> Option<&RgbaImage> {
+        self.cached_rgba.as_ref()
+    }
+
+    /// Paint into a CPU RGBA buffer the host composites.
+    ///
+    /// Clean frames (`paint_dirty` false, viewport size unchanged) skip raster
+    /// and return [`PaintOutput`] with `skipped: true` and `rgba: None` — no
+    /// buffer copy. The host must keep its previous texture; see
+    /// [`Self::last_frame`] for a borrowed look at the cache.
     pub fn paint(&mut self, viewport: Viewport) -> Result<PaintOutput, EngineError> {
         let t0 = Instant::now();
         let size_changed =
@@ -1238,7 +1292,7 @@ impl Engine {
             self.timings.paint_skipped = true;
             let _ = viewport.holes;
             return Ok(PaintOutput {
-                rgba: self.cached_rgba.clone(),
+                rgba: None,
                 texture: None,
                 focus: self.focus.clone(),
                 skipped: true,

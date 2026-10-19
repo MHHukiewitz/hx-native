@@ -178,11 +178,17 @@ pub struct HostTextureRef {
 
 #[derive(Clone, Debug)]
 pub struct PaintOutput {
-    /// Fresh or cached RGBA buffer. Present even on skipped paints (last good frame).
+    /// Fresh RGBA buffer when this paint rasterized (`skipped == false`).
+    ///
+    /// When `skipped` is `true`, this is always `None` — the engine does not
+    /// copy the cached frame. The host should keep its last uploaded texture
+    /// (Mainnet `src/ui/hx_time`) and ignore `rgba` on skipped frames. Use
+    /// [`Engine::last_frame`](crate::Engine::last_frame) if a borrowed view of
+    /// the cached buffer is needed without a copy.
     pub rgba: Option<RgbaImage>,
     pub texture: Option<HostTextureRef>,
     pub focus: FocusState,
-    /// True when raster was skipped (clean frame).
+    /// True when raster was skipped (clean frame). Then `rgba` is `None`.
     pub skipped: bool,
 }
 
