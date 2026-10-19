@@ -14,6 +14,10 @@ use crate::dialect::{validate_loaded_attrs, ElementBinding, SwapMode, SyncMode};
 use crate::error::EngineError;
 use crate::focus::{focusable_ids, ids_in_document_order, step_focus};
 use crate::fonts::bundled_font_context;
+use crate::form_args::{
+    collect_action_args, is_numeric_input, is_range_input, set_range_value_from_x,
+    step_numeric_value,
+};
 use crate::paint::paint_rgba;
 use crate::pending::{PendingEntry, PendingState, QueuedRelease};
 use crate::trigger::{
@@ -58,6 +62,8 @@ pub struct Engine {
     /// Test harness: assert pending timeouts were observed.
     pub(crate) frame_count: u32,
     loaded_html: Option<String>,
+    /// Primary-button drag on an `<input type="range">`.
+    range_drag_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -91,6 +97,7 @@ impl Engine {
             cached_rgba: None,
             frame_count: 0,
             loaded_html: None,
+            range_drag_id: None,
         }
     }
 
@@ -115,6 +122,7 @@ impl Engine {
         self.released_outcomes.clear();
         self.hover_id = None;
         self.press = None;
+        self.range_drag_id = None;
         self.focus = FocusState::default();
         self.slice_versions.clear();
         self.disabled_actions.clear();
@@ -632,6 +640,7 @@ impl Engine {
     /// Forward pointer leave to Blitz so `:hover` styles and CSS tooltips clear.
     fn on_pointer_leave(&mut self) -> InputOutcome {
         self.press = None;
+        self.range_drag_id = None;
         if self.clear_blitz_hover() {
             self.mark_paint_dirty();
         }
@@ -644,6 +653,9 @@ impl Engine {
     /// clean-frame skip.
     fn on_pointer_move(&mut self, x: f32, y: f32) -> InputOutcome {
         self.ensure_resolved();
+        if let Some(ref rid) = self.range_drag_id.clone() {
+            let _ = self.apply_range_from_x(rid, x);
+        }
         let (vw, vh) = self.layout_viewport;
         let out_of_bounds = x < 0.0 || y < 0.0 || x >= vw as f32 || y >= vh as f32;
 
@@ -708,6 +720,12 @@ impl Engine {
                     self.focus.focused_id = Some(eid.clone());
                 }
             }
+            // Primary press on a range: set value from x and begin drag.
+            self.range_drag_id = None;
+            if button == PointerButton::Primary && self.element_is_range(eid) {
+                self.apply_range_from_x(eid, x);
+                self.range_drag_id = Some(eid.clone());
+            }
             self.press = Some(PressState {
                 id: eid.clone(),
                 button,
@@ -716,6 +734,7 @@ impl Engine {
             InputOutcome::Press { id }
         } else {
             self.press = None;
+            self.range_drag_id = None;
             InputOutcome::Press { id: None }
         }
     }
@@ -727,6 +746,12 @@ impl Engine {
         button: PointerButton,
         mods: Modifiers,
     ) -> InputOutcome {
+        if let Some(ref rid) = self.range_drag_id.clone() {
+            if button == PointerButton::Primary {
+                self.apply_range_from_x(rid, x);
+            }
+        }
+        self.range_drag_id = None;
         let up_id = self.hit_id(x, y);
         let press = self.press.take();
         let Some(press) = press else {
@@ -868,6 +893,8 @@ impl Engine {
             };
         }
 
+        let args = self.action_args_for(source_id);
+
         // Pending / hx-sync.
         if self.pending.is_pending(source_id) {
             match binding.hx_sync {
@@ -880,7 +907,7 @@ impl Engine {
                         QueuedRelease {
                             source_id: source_id.to_string(),
                             action_name,
-                            args: Vec::new(),
+                            args,
                             trigger: trigger_info,
                             indicator_id: binding.hx_indicator.clone(),
                         },
@@ -893,10 +920,68 @@ impl Engine {
         self.emit_action(
             source_id,
             &action_name,
-            Vec::new(),
+            args,
             trigger_info,
             binding.hx_indicator.clone(),
         )
+    }
+
+    fn action_args_for(&self, source_id: &str) -> Vec<(String, String)> {
+        match self.doc.as_ref() {
+            Some(doc) => collect_action_args(doc, source_id),
+            None => Vec::new(),
+        }
+    }
+
+    fn element_is_range(&self, id: &str) -> bool {
+        self.doc
+            .as_ref()
+            .and_then(|doc| doc.get_element_by_id(id).and_then(|nid| doc.get_node(nid)))
+            .is_some_and(is_range_input)
+    }
+
+    fn apply_range_from_x(&mut self, id: &str, x: f32) -> bool {
+        self.ensure_resolved();
+        let changed = match self.doc.as_mut() {
+            Some(doc) => set_range_value_from_x(doc, id, x),
+            None => false,
+        };
+        if changed {
+            self.needs_resolve = true;
+            self.mark_paint_dirty();
+        }
+        changed
+    }
+
+    fn try_step_focused_numeric(&mut self, key: &str) -> bool {
+        let Some(fid) = self.focus.focused_id.clone() else {
+            return false;
+        };
+        let is_numeric = self
+            .doc
+            .as_ref()
+            .and_then(|doc| {
+                doc.get_element_by_id(&fid)
+                    .and_then(|nid| doc.get_node(nid))
+            })
+            .is_some_and(is_numeric_input);
+        if !is_numeric {
+            return false;
+        }
+        let dir = match key {
+            "ArrowUp" | "ArrowRight" => 1,
+            "ArrowDown" | "ArrowLeft" => -1,
+            _ => return false,
+        };
+        let changed = match self.doc.as_mut() {
+            Some(doc) => step_numeric_value(doc, &fid, dir),
+            None => false,
+        };
+        if changed {
+            self.needs_resolve = true;
+            self.mark_paint_dirty();
+        }
+        true
     }
 
     fn parent_element_id(&self, id: &str) -> Option<String> {
@@ -1015,6 +1100,17 @@ impl Engine {
         } else {
             TriggerEvent::KeyUp
         };
+
+        // Number/range arrow editing (before action triggers).
+        if key.pressed
+            && matches!(
+                key.key.as_str(),
+                "ArrowUp" | "ArrowRight" | "ArrowDown" | "ArrowLeft"
+            )
+            && self.try_step_focused_numeric(&key.key)
+        {
+            return InputOutcome::None;
+        }
 
         // (a) Focused element first.
         if let Some(ref fid) = self.focus.focused_id.clone() {
@@ -1186,6 +1282,7 @@ impl Engine {
                 trigger: trigger_info,
             };
         }
+        let args = self.action_args_for(source_id);
         if self.pending.is_pending(source_id) {
             match binding.hx_sync {
                 SyncMode::Drop => return InputOutcome::None,
@@ -1195,7 +1292,7 @@ impl Engine {
                         QueuedRelease {
                             source_id: source_id.to_string(),
                             action_name,
-                            args: Vec::new(),
+                            args,
                             trigger: trigger_info,
                             indicator_id: binding.hx_indicator.clone(),
                         },
@@ -1207,7 +1304,7 @@ impl Engine {
         self.emit_action(
             source_id,
             &action_name,
-            Vec::new(),
+            args,
             trigger_info,
             binding.hx_indicator.clone(),
         )

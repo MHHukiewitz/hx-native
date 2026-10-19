@@ -1906,3 +1906,362 @@ fn skipped_paint_does_no_buffer_copy() {
         eng.last_timings().paint_ns
     );
 }
+
+// ---------------------------------------------------------------------------
+// K1 / issue #6 — Action.args carry form values
+// ---------------------------------------------------------------------------
+
+fn boot_form(html: &str, actions: &[&str]) -> Engine {
+    let mut eng = Engine::new(EngineConfig {
+        max_paint_ns: 50_000_000,
+        pending_timeout_frames: 5,
+    });
+    eng.declare_actions(actions);
+    let wrapped = format!("<!DOCTYPE html><html><body>{html}</body></html>");
+    eng.load_html(&wrapped).expect("load_html form fixture");
+    let _ = eng.paint(Viewport {
+        width: 400,
+        height: 200,
+        holes: vec![],
+    });
+    eng
+}
+
+fn activate(eng: &mut Engine, id: &str) -> InputOutcome {
+    eng.test_set_focus(id);
+    eng.input(InputEvent::Key(KeyEvent {
+        key: "Enter".into(),
+        code: "Enter".into(),
+        mods: Modifiers::default(),
+        repeat: false,
+        pressed: true,
+    }))
+}
+
+fn action_args(out: &InputOutcome) -> Option<&[(String, String)]> {
+    match out {
+        InputOutcome::Action { args, .. } => Some(args.as_slice()),
+        _ => None,
+    }
+}
+
+#[test]
+fn k1_args_order_and_contents() {
+    let html = r#"
+<form id="f">
+  <input type="hidden" name="slot" value="3" />
+  <input type="number" name="qty" value="2" min="0" max="9" step="1" />
+  <button id="go" name="op" value="write" hx-post="save.write">Go</button>
+</form>
+"#;
+    let mut eng = boot_form(html, &["save.write"]);
+    let out = activate(&mut eng, "go");
+    let args = action_args(&out).expect("Action");
+    assert_eq!(
+        args,
+        &[
+            ("op".into(), "write".into()),
+            ("slot".into(), "3".into()),
+            ("qty".into(), "2".into()),
+        ]
+    );
+}
+
+#[test]
+fn k1_disabled_and_unchecked_excluded() {
+    let html = r#"
+<form id="f">
+  <input type="hidden" name="a" value="1" />
+  <input type="hidden" name="b" value="2" disabled="" />
+  <input type="checkbox" name="c" value="yes" />
+  <input type="checkbox" name="d" value="on" checked="" />
+  <input type="radio" name="r" value="x" />
+  <input type="radio" name="r" value="y" checked="" />
+  <button id="go" name="act" value="1" hx-post="save.write">Go</button>
+  <button id="other" name="other" value="nope">Other</button>
+</form>
+"#;
+    let mut eng = boot_form(html, &["save.write"]);
+    let out = activate(&mut eng, "go");
+    let args = action_args(&out).expect("Action");
+    assert_eq!(
+        args,
+        &[
+            ("act".into(), "1".into()),
+            ("a".into(), "1".into()),
+            ("d".into(), "on".into()),
+            ("r".into(), "y".into()),
+        ]
+    );
+}
+
+#[test]
+fn k1_trigger_outside_form_sends_own_pair_only() {
+    let html = r#"
+<form id="f">
+  <input type="hidden" name="inside" value="1" />
+</form>
+<button id="go" name="solo" value="x" hx-post="save.write">Go</button>
+"#;
+    let mut eng = boot_form(html, &["save.write"]);
+    let out = activate(&mut eng, "go");
+    let args = action_args(&out).expect("Action");
+    assert_eq!(args, &[("solo".into(), "x".into())]);
+}
+
+#[test]
+fn k1_select_sends_selected_or_first_option() {
+    let html = r#"
+<form id="f">
+  <select name="branch">
+    <option value="alpha">A</option>
+    <option value="beta" selected="">B</option>
+  </select>
+  <select name="slot">
+    <option value="1">one</option>
+    <option value="2">two</option>
+  </select>
+  <button id="go" name="op" value="pick" hx-post="save.write">Go</button>
+</form>
+"#;
+    let mut eng = boot_form(html, &["save.write"]);
+    let out = activate(&mut eng, "go");
+    let args = action_args(&out).expect("Action");
+    assert_eq!(
+        args,
+        &[
+            ("op".into(), "pick".into()),
+            ("branch".into(), "beta".into()),
+            ("slot".into(), "1".into()),
+        ]
+    );
+}
+
+#[test]
+fn k1_range_arrow_clamps_and_snaps() {
+    let html = r#"
+<form id="f">
+  <input id="spd" type="range" name="speed" value="0" min="0" max="5" step="2" />
+  <button id="go" name="op" value="set" hx-post="time.set_speed">Go</button>
+</form>
+"#;
+    let mut eng = boot_form(html, &["time.set_speed"]);
+    eng.test_set_focus("spd");
+    // 0 → Up 2 → Right 4 → Up clamp to max 5 → Down 4 → Left 2
+    for (key, code, expect) in [
+        ("ArrowUp", "ArrowUp", "2"),
+        ("ArrowRight", "ArrowRight", "4"),
+        ("ArrowUp", "ArrowUp", "5"),
+        ("ArrowDown", "ArrowDown", "4"),
+        ("ArrowLeft", "ArrowLeft", "2"),
+    ] {
+        let _ = eng.input(InputEvent::Key(KeyEvent {
+            key: key.into(),
+            code: code.into(),
+            mods: Modifiers::default(),
+            repeat: false,
+            pressed: true,
+        }));
+        assert_eq!(
+            eng.attr("spd", "value").as_deref(),
+            Some(expect),
+            "after {key}"
+        );
+    }
+    let out = activate(&mut eng, "go");
+    let args = action_args(&out).expect("Action");
+    assert_eq!(
+        args,
+        &[("op".into(), "set".into()), ("speed".into(), "2".into()),]
+    );
+}
+
+#[test]
+fn k1_blocked_still_reports_with_form_present() {
+    let html = r#"
+<form id="f">
+  <input type="hidden" name="slot" value="1" />
+  <button id="go" name="op" value="write" hx-post="save.write">Go</button>
+</form>
+"#;
+    let mut eng = boot_form(html, &["save.write"]);
+    let mut slices = MemSlices::new();
+    slices.actions.push((
+        "save.write".into(),
+        ActionState::Disabled {
+            reason: "slot locked".into(),
+        },
+    ));
+    let mut frags = SpyFrags::new();
+    eng.sync(&slices, &mut frags).unwrap();
+    let out = activate(&mut eng, "go");
+    match out {
+        InputOutcome::Blocked {
+            name,
+            reason,
+            source_id,
+            ..
+        } => {
+            assert_eq!(name, "save.write");
+            assert_eq!(reason, "slot locked");
+            assert_eq!(source_id, "go");
+        }
+        other => panic!("expected Blocked, got {other:?}"),
+    }
+}
+
+#[test]
+fn k1_args_determinism() {
+    let html = r#"
+<form id="f">
+  <input type="hidden" name="a" value="1" />
+  <input type="number" name="n" value="4" min="0" max="9" />
+  <input type="checkbox" name="c" value="on" checked="" />
+  <select name="s"><option value="x" selected="">X</option><option value="y">Y</option></select>
+  <button id="go" name="op" value="run" hx-post="save.write">Go</button>
+</form>
+"#;
+    let run = || {
+        let mut eng = boot_form(html, &["save.write"]);
+        let out = activate(&mut eng, "go");
+        match out {
+            InputOutcome::Action {
+                args,
+                name,
+                source_id,
+                ..
+            } => (name, source_id, args),
+            other => panic!("expected Action, got {other:?}"),
+        }
+    };
+    let a = run();
+    let b = run();
+    assert_eq!(a, b);
+}
+
+/// Guarantee (1): trigger pair first; form controls in document order; trigger not repeated.
+#[test]
+fn k1_g1_trigger_first_no_repeat() {
+    let html = r#"
+<form id="f">
+  <input type="hidden" name="before" value="1" />
+  <button id="go" name="op" value="go" hx-post="save.write">Go</button>
+  <input type="hidden" name="after" value="2" />
+</form>
+"#;
+    let mut eng = boot_form(html, &["save.write"]);
+    let out = activate(&mut eng, "go");
+    let args = action_args(&out).expect("Action");
+    assert_eq!(
+        args,
+        &[
+            ("op".into(), "go".into()),
+            ("before".into(), "1".into()),
+            ("after".into(), "2".into()),
+        ]
+    );
+    assert_eq!(
+        args.iter().filter(|(n, _)| n == "op").count(),
+        1,
+        "trigger must not be repeated among form controls"
+    );
+}
+
+/// Guarantee (2): empty value → ""; checked checkbox with no value → "on".
+#[test]
+fn k1_g2_empty_value_and_checkbox_on() {
+    let html = r#"
+<form id="f">
+  <input type="hidden" name="empty" />
+  <input type="hidden" name="blank" value="" />
+  <input type="checkbox" name="flag" checked="" />
+  <button id="go" name="op" hx-post="save.write">Go</button>
+</form>
+"#;
+    let mut eng = boot_form(html, &["save.write"]);
+    let out = activate(&mut eng, "go");
+    let args = action_args(&out).expect("Action");
+    assert_eq!(
+        args,
+        &[
+            ("op".into(), "".into()),
+            ("empty".into(), "".into()),
+            ("blank".into(), "".into()),
+            ("flag".into(), "on".into()),
+        ]
+    );
+}
+
+/// Guarantee (3): repeated names stay as repeated pairs, in order.
+#[test]
+fn k1_g3_repeated_names_kept_in_order() {
+    let html = r#"
+<form id="f">
+  <input type="hidden" name="tag" value="a" />
+  <input type="hidden" name="tag" value="b" />
+  <input type="checkbox" name="tag" value="c" checked="" />
+  <button id="go" name="op" value="1" hx-post="save.write">Go</button>
+</form>
+"#;
+    let mut eng = boot_form(html, &["save.write"]);
+    let out = activate(&mut eng, "go");
+    let args = action_args(&out).expect("Action");
+    assert_eq!(
+        args,
+        &[
+            ("op".into(), "1".into()),
+            ("tag".into(), "a".into()),
+            ("tag".into(), "b".into()),
+            ("tag".into(), "c".into()),
+        ]
+    );
+}
+
+/// Guarantee (4): template out-of-range value sent as written; clamp only on engine edits.
+#[test]
+fn k1_g4_raw_template_value_clamp_only_on_edit() {
+    let html = r#"
+<form id="f">
+  <input id="qty" type="number" name="qty" value="99" min="0" max="5" step="1" />
+  <button id="go" name="op" value="set" hx-post="save.write">Go</button>
+</form>
+"#;
+    let mut eng = boot_form(html, &["save.write"]);
+    // Template wrote 99 (out of range) — sent as written.
+    let out = activate(&mut eng, "go");
+    let args = action_args(&out).expect("Action");
+    assert_eq!(
+        args,
+        &[("op".into(), "set".into()), ("qty".into(), "99".into()),]
+    );
+    if let InputOutcome::Action { request, .. } = out {
+        eng.complete(request, Ok(()));
+    }
+
+    // Engine edit clamps.
+    eng.test_set_focus("qty");
+    let _ = eng.input(InputEvent::Key(KeyEvent {
+        key: "ArrowDown".into(),
+        code: "ArrowDown".into(),
+        mods: Modifiers::default(),
+        repeat: false,
+        pressed: true,
+    }));
+    assert_eq!(eng.attr("qty", "value").as_deref(), Some("5"));
+    let out2 = activate(&mut eng, "go");
+    let args2 = action_args(&out2).expect("Action");
+    assert_eq!(
+        args2,
+        &[("op".into(), "set".into()), ("qty".into(), "5".into()),]
+    );
+}
+
+#[test]
+fn k1_text_input_stays_unhandled() {
+    let mut eng = boot_form(
+        r#"<button id="go" name="op" value="1" hx-post="save.write">Go</button>"#,
+        &["save.write"],
+    );
+    let out = eng.input(InputEvent::Text("hello".into()));
+    assert!(matches!(out, InputOutcome::Unhandled(_)));
+}
