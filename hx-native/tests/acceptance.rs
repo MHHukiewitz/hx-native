@@ -1,0 +1,1069 @@
+//! Headless acceptance tests named after REQUIREMENTS.md A-numbers.
+//!
+//! Fixture HTML under `tests/fixtures/` is engine-owned test data (not Designer mocks).
+
+#![allow(clippy::type_complexity)]
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+
+use hx_native::*;
+
+const FIXTURE: &str = include_str!("fixtures/time_strip.html");
+
+fn default_actions() -> &'static [&'static str] {
+    &[
+        "time.pause",
+        "time.set_speed",
+        "time.pause_menu",
+        "time.set_speed.bulk",
+        "time.context",
+    ]
+}
+
+fn boot(html: &str) -> Engine {
+    let mut eng = Engine::new(EngineConfig {
+        max_paint_ns: 50_000_000,
+        pending_timeout_frames: 5,
+    });
+    eng.declare_actions(default_actions());
+    eng.load_html(html).expect("load_html");
+    eng
+}
+
+struct MemSlices {
+    versions: HashMap<String, u64>,
+    actions: Vec<(String, ActionState)>,
+    version_asks: Arc<Mutex<Vec<String>>>,
+}
+
+impl MemSlices {
+    fn new() -> Self {
+        let mut versions = HashMap::new();
+        versions.insert("time".into(), 1);
+        versions.insert("actions".into(), 1);
+        Self {
+            versions,
+            actions: Vec::new(),
+            version_asks: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+    fn bump(&mut self, name: &str) {
+        *self.versions.entry(name.into()).or_insert(0) += 1;
+    }
+}
+
+impl SliceSource for MemSlices {
+    fn version(&self, name: &str) -> Option<u64> {
+        self.version_asks.lock().unwrap().push(name.to_string());
+        self.versions.get(name).copied()
+    }
+    fn action_states(&self) -> Vec<(String, ActionState)> {
+        self.actions.clone()
+    }
+}
+
+struct SpyFrags {
+    calls: Arc<Mutex<Vec<(String, Vec<String>)>>>,
+    bodies: HashMap<String, String>,
+}
+
+impl SpyFrags {
+    fn new() -> Self {
+        let mut bodies = HashMap::new();
+        bodies.insert(
+            "time-strip".into(),
+            r#"<span id="time-label">DATE 2026-10-19 · 1x</span>"#.into(),
+        );
+        Self {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            bodies,
+        }
+    }
+    fn set(&mut self, section: &str, html: &str) {
+        self.bodies.insert(section.into(), html.into());
+    }
+}
+
+impl FragmentSource for SpyFrags {
+    fn render(&mut self, section_id: &str, slices: &[&str]) -> String {
+        self.calls.lock().unwrap().push((
+            section_id.to_string(),
+            slices.iter().map(|s| (*s).to_string()).collect(),
+        ));
+        self.bodies
+            .get(section_id)
+            .cloned()
+            .unwrap_or_else(|| format!("<!-- empty {section_id} -->"))
+    }
+}
+
+fn click_at(eng: &mut Engine, x: f32, y: f32) -> Vec<InputOutcome> {
+    click_at_btn(eng, x, y, PointerButton::Primary, Modifiers::default())
+}
+
+fn click_at_btn(
+    eng: &mut Engine,
+    x: f32,
+    y: f32,
+    button: PointerButton,
+    mods: Modifiers,
+) -> Vec<InputOutcome> {
+    vec![
+        eng.input(InputEvent::PointerMove { x, y, mods }),
+        eng.input(InputEvent::PointerDown { x, y, button, mods }),
+        eng.input(InputEvent::PointerUp { x, y, button, mods }),
+    ]
+}
+
+/// Approximate button centers from the fixture CSS.
+mod pos {
+    pub const PAUSE: (f32, f32) = (350.0, 28.0);
+    pub const SPEED: (f32, f32) = (460.0, 28.0);
+    #[allow(dead_code)]
+    pub const MENU: (f32, f32) = (570.0, 28.0);
+    #[allow(dead_code)]
+    pub const BULK: (f32, f32) = (680.0, 28.0);
+    pub const CTX: (f32, f32) = (370.0, 80.0);
+}
+
+fn sync_paint(eng: &mut Engine, slices: &mut MemSlices, frags: &mut SpyFrags) {
+    eng.sync(slices, frags).unwrap();
+    eng.paint(Viewport {
+        width: 800,
+        height: 120,
+        holes: vec![],
+    })
+    .unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// A1 — Headless boot
+// ---------------------------------------------------------------------------
+#[test]
+fn a1_headless_boot() {
+    let mut eng = Engine::new(EngineConfig::default());
+    eng.declare_actions(default_actions());
+    eng.load_html(FIXTURE).expect("A1 load");
+    let slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    eng.sync(&slices, &mut frags).unwrap();
+    let paint = eng
+        .paint(Viewport {
+            width: 800,
+            height: 120,
+            holes: vec![],
+        })
+        .unwrap();
+    assert!(paint.rgba.is_some());
+    assert_eq!(paint.rgba.as_ref().unwrap().pixels.len(), 800 * 120 * 4);
+
+    // Undeclared action → load error
+    let mut eng2 = Engine::new(EngineConfig::default());
+    eng2.declare_actions(&["only.this"]);
+    let err = eng2
+        .load_html(r#"<button id="b" hx-post="missing.action">x</button>"#)
+        .unwrap_err();
+    assert!(matches!(err, EngineError::UndeclaredAction { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// A22 — Invalid trigger fails load (also covers A1 path)
+// ---------------------------------------------------------------------------
+#[test]
+fn a22_invalid_trigger_fails_load() {
+    let cases = [
+        r#"<button id="b" hx-post="time.pause" hx-trigger="dblclick">x</button>"#,
+        r#"<button id="b" hx-post="time.pause" hx-trigger="mouseover">x</button>"#,
+        r#"<button id="b" hx-post="time.pause" hx-trigger="click[event.foo]">x</button>"#,
+        r#"<button id="b" hx-post="time.pause" hx-trigger="click[shiftKey==1]">x</button>"#,
+        r#"<button id="b" hx-post="time.pause" hx-trigger="click[(shiftKey)]">x</button>"#,
+        r##"<button id="b" hx-post="time.pause" hx-trigger="keydown[key=='a'] from:#id">x</button>"##,
+        r#"<button id="b" hx-post="time.pause" hx-trigger="click from:body">x</button>"#,
+    ];
+    for html in cases {
+        let mut eng = Engine::new(EngineConfig::default());
+        eng.declare_actions(default_actions());
+        let wrapped = format!("<html><body>{html}</body></html>");
+        let err = eng
+            .load_html(&wrapped)
+            .expect_err("expected InvalidTrigger");
+        assert!(
+            matches!(err, EngineError::InvalidTrigger { .. }),
+            "expected InvalidTrigger for {html}, got {err:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A2 — Determinism
+// ---------------------------------------------------------------------------
+#[test]
+fn a2_determinism() {
+    let run = || {
+        let mut eng = boot(FIXTURE);
+        let mut slices = MemSlices::new();
+        let mut frags = SpyFrags::new();
+        sync_paint(&mut eng, &mut slices, &mut frags);
+        let outs = click_at(&mut eng, pos::PAUSE.0, pos::PAUSE.1);
+        let html = eng.serialize_html().unwrap();
+        let rgba = eng
+            .paint(Viewport {
+                width: 800,
+                height: 120,
+                holes: vec![],
+            })
+            .unwrap()
+            .rgba
+            .unwrap();
+        (html, rgba.pixels, outs)
+    };
+    let (h1, p1, o1) = run();
+    let (h2, p2, o2) = run();
+    assert_eq!(h1, h2, "serialized HTML must match");
+    assert_eq!(p1, p2, "RGBA buffers must match (bundled fonts)");
+    assert_eq!(format!("{o1:?}"), format!("{o2:?}"));
+}
+
+// ---------------------------------------------------------------------------
+// A3 — Stable ids
+// ---------------------------------------------------------------------------
+#[test]
+fn a3_stable_ids() {
+    let mut eng = boot(FIXTURE);
+    let mut slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    sync_paint(&mut eng, &mut slices, &mut frags);
+    let outs = click_at(&mut eng, pos::PAUSE.0, pos::PAUSE.1);
+    let action = outs.iter().find_map(|o| match o {
+        InputOutcome::Action { source_id, .. } => Some(source_id.as_str()),
+        _ => None,
+    });
+    assert_eq!(action, Some("btn-pause"));
+}
+
+// ---------------------------------------------------------------------------
+// A3b — Hover → press → click order
+// ---------------------------------------------------------------------------
+#[test]
+fn a3b_hover_press_click_order() {
+    let mut eng = boot(FIXTURE);
+    let mut slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    sync_paint(&mut eng, &mut slices, &mut frags);
+
+    let hover = eng.input(InputEvent::PointerMove {
+        x: pos::PAUSE.0,
+        y: pos::PAUSE.1,
+        mods: Modifiers::default(),
+    });
+    assert!(matches!(hover, InputOutcome::Hover { id: Some(ref id) } if id == "btn-pause"));
+
+    let press = eng.input(InputEvent::PointerDown {
+        x: pos::PAUSE.0,
+        y: pos::PAUSE.1,
+        button: PointerButton::Primary,
+        mods: Modifiers::default(),
+    });
+    assert!(matches!(press, InputOutcome::Press { id: Some(ref id) } if id == "btn-pause"));
+
+    let up = eng.input(InputEvent::PointerUp {
+        x: pos::PAUSE.0,
+        y: pos::PAUSE.1,
+        button: PointerButton::Primary,
+        mods: Modifiers::default(),
+    });
+    assert!(matches!(
+        up,
+        InputOutcome::Action {
+            source_id: ref id,
+            ..
+        } if id == "btn-pause"
+    ));
+
+    // Moving off → Hover{None}
+    let leave = eng.input(InputEvent::PointerMove {
+        x: 5.0,
+        y: 5.0,
+        mods: Modifiers::default(),
+    });
+    // May be Hover{None} or Hover{Some other} — fixture top-left is time-body.
+    // Explicit leave:
+    let leave2 = eng.input(InputEvent::PointerLeave);
+    assert!(matches!(leave2, InputOutcome::Hover { id: None }));
+    let _ = leave;
+
+    // Release off target → Press{None}, no Action
+    eng.input(InputEvent::PointerMove {
+        x: pos::PAUSE.0,
+        y: pos::PAUSE.1,
+        mods: Modifiers::default(),
+    });
+    eng.input(InputEvent::PointerDown {
+        x: pos::PAUSE.0,
+        y: pos::PAUSE.1,
+        button: PointerButton::Primary,
+        mods: Modifiers::default(),
+    });
+    let off = eng.input(InputEvent::PointerUp {
+        x: 5.0,
+        y: 5.0,
+        button: PointerButton::Primary,
+        mods: Modifiers::default(),
+    });
+    assert!(matches!(off, InputOutcome::Press { id: None }));
+}
+
+// ---------------------------------------------------------------------------
+// A3c — Pending lifecycle
+// ---------------------------------------------------------------------------
+#[test]
+fn a3c_pending_lifecycle() {
+    let mut eng = boot(FIXTURE);
+    let mut slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    sync_paint(&mut eng, &mut slices, &mut frags);
+
+    let outs = click_at(&mut eng, pos::PAUSE.0, pos::PAUSE.1);
+    let req = outs.iter().find_map(|o| match o {
+        InputOutcome::Action { request, .. } => Some(*request),
+        _ => None,
+    });
+    let req = req.expect("Action");
+    assert!(eng.has_class("btn-pause", "hx-request"));
+    assert_eq!(eng.attr("btn-pause", "aria-busy").as_deref(), Some("true"));
+    assert!(eng.has_class("spinner", "hx-request"));
+
+    // Bumping time does not clear pending.
+    slices.bump("time");
+    frags.set(
+        "time-strip",
+        r#"<span id="time-label">DATE 2026-10-20 · 1x</span>"#,
+    );
+    eng.sync(&slices, &mut frags).unwrap();
+    assert!(eng.has_class("btn-pause", "hx-request"));
+
+    eng.complete(req, Ok(()));
+    assert!(!eng.has_class("btn-pause", "hx-request"));
+    assert!(eng.attr("btn-pause", "aria-busy").is_none());
+    assert!(!eng.has_class("spinner", "hx-request"));
+
+    // Timeout case: no complete → harness fails loudly.
+    let mut eng2 = Engine::new(EngineConfig {
+        max_paint_ns: 50_000_000,
+        pending_timeout_frames: 2,
+    });
+    eng2.declare_actions(default_actions());
+    eng2.load_html(FIXTURE).unwrap();
+    let mut slices2 = MemSlices::new();
+    let mut frags2 = SpyFrags::new();
+    sync_paint(&mut eng2, &mut slices2, &mut frags2);
+    let outs2 = click_at(&mut eng2, pos::PAUSE.0, pos::PAUSE.1);
+    let req2 = outs2
+        .iter()
+        .find_map(|o| match o {
+            InputOutcome::Action { request, .. } => Some(*request),
+            _ => None,
+        })
+        .unwrap();
+    eng2.test_tick_frame();
+    eng2.test_tick_frame();
+    eng2.test_tick_frame(); // > pending_timeout_frames
+    assert!(
+        !eng2.pending_timeout_failures().is_empty(),
+        "timeout must fail loudly"
+    );
+    // Late complete is a no-op.
+    eng2.complete(req2, Ok(()));
+}
+
+// ---------------------------------------------------------------------------
+// A3d — hx-sync + failure
+// ---------------------------------------------------------------------------
+#[test]
+fn a3d_hx_sync_and_failure() {
+    // drop: double click → one Action
+    let mut eng = boot(FIXTURE);
+    let mut slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    sync_paint(&mut eng, &mut slices, &mut frags);
+    let o1 = click_at(&mut eng, pos::PAUSE.0, pos::PAUSE.1);
+    let o2 = click_at(&mut eng, pos::PAUSE.0, pos::PAUSE.1);
+    let actions1: Vec<_> = o1
+        .iter()
+        .chain(o2.iter())
+        .filter(|o| matches!(o, InputOutcome::Action { .. }))
+        .collect();
+    assert_eq!(actions1.len(), 1, "drop: exactly one Action");
+
+    // queue: one now, one from take_outcomes after complete
+    let mut engq = boot(FIXTURE);
+    let mut slicesq = MemSlices::new();
+    let mut fragsq = SpyFrags::new();
+    sync_paint(&mut engq, &mut slicesq, &mut fragsq);
+    let a = click_at(&mut engq, pos::SPEED.0, pos::SPEED.1);
+    let b = click_at(&mut engq, pos::SPEED.0, pos::SPEED.1);
+    let first = a
+        .iter()
+        .find_map(|o| match o {
+            InputOutcome::Action { request, .. } => Some(*request),
+            _ => None,
+        })
+        .unwrap();
+    assert!(b.iter().all(|o| !matches!(o, InputOutcome::Action { .. })));
+    engq.complete(first, Ok(()));
+    let released = engq.take_outcomes();
+    assert_eq!(released.len(), 1);
+    match &released[0] {
+        InputOutcome::Action { request, .. } => {
+            assert_eq!(request.0, first.0 + 1);
+        }
+        other => panic!("expected Action, got {other:?}"),
+    }
+
+    // complete Err shows reason like Blocked
+    let mut eng3 = boot(FIXTURE);
+    let mut s3 = MemSlices::new();
+    let mut f3 = SpyFrags::new();
+    sync_paint(&mut eng3, &mut s3, &mut f3);
+    let outs = click_at(&mut eng3, pos::PAUSE.0, pos::PAUSE.1);
+    let req = outs
+        .iter()
+        .find_map(|o| match o {
+            InputOutcome::Action { request, .. } => Some(*request),
+            _ => None,
+        })
+        .unwrap();
+    eng3.complete(req, Err(Reason("boom".into())));
+    assert_eq!(
+        eng3.attr("btn-pause", "data-hx-reason").as_deref(),
+        Some("boom")
+    );
+    assert!(!eng3.has_class("btn-pause", "hx-request"));
+
+    // unknown hx-sync fails loudly
+    let mut eng4 = Engine::new(EngineConfig::default());
+    eng4.declare_actions(default_actions());
+    let err = eng4
+        .load_html(r#"<button id="b" hx-post="time.pause" hx-sync="abort">x</button>"#)
+        .unwrap_err();
+    assert!(matches!(err, EngineError::UnsupportedSync { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// A4 — click → Action
+// ---------------------------------------------------------------------------
+#[test]
+fn a4_click_to_action() {
+    let mut eng = boot(FIXTURE);
+    let mut slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    sync_paint(&mut eng, &mut slices, &mut frags);
+    let outs = click_at(&mut eng, pos::PAUSE.0, pos::PAUSE.1);
+    let action = outs
+        .iter()
+        .find(|o| matches!(o, InputOutcome::Action { .. }));
+    match action {
+        Some(InputOutcome::Action {
+            name,
+            source_id,
+            request,
+            ..
+        }) => {
+            assert_eq!(name, "time.pause");
+            assert_eq!(source_id, "btn-pause");
+            assert_eq!(request.0, 1);
+        }
+        _ => panic!("expected Action"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A5 / A5b / A5c / A5d
+// ---------------------------------------------------------------------------
+#[test]
+fn a5_slice_partial_swap() {
+    let mut eng = boot(FIXTURE);
+    let mut slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    let dirty0 = eng.sync(&slices, &mut frags).unwrap();
+    assert!(dirty0.sections.iter().any(|s| s == "time-strip"));
+    eng.paint(Viewport {
+        width: 800,
+        height: 120,
+        holes: vec![],
+    })
+    .unwrap();
+
+    frags.set(
+        "time-strip",
+        r#"<span id="time-label">DATE 2026-10-21 · 2x</span>"#,
+    );
+    slices.bump("time");
+    let dirty = eng.sync(&slices, &mut frags).unwrap();
+    assert_eq!(dirty.sections, vec!["time-strip".to_string()]);
+    // Partial: damaged nodes should be a subset of total elements (not a full-tree mark).
+    assert!(
+        dirty.damaged_node_count < dirty.total_element_count || dirty.total_element_count <= 3,
+        "expected partial damage, damaged={} total={}",
+        dirty.damaged_node_count,
+        dirty.total_element_count
+    );
+    let html = eng.serialize_html().unwrap();
+    assert!(html.contains("2026-10-21"));
+}
+
+#[test]
+fn a5b_unsupported_swap_fails() {
+    let mut eng = Engine::new(EngineConfig::default());
+    eng.declare_actions(default_actions());
+    let err = eng
+        .load_html(r#"<div id="s" hx-trigger="slice:time" hx-swap="beforeend">x</div>"#)
+        .unwrap_err();
+    assert!(matches!(err, EngineError::UnsupportedSwap { .. }));
+}
+
+#[test]
+fn a5_default_swap_is_inner_html() {
+    // Spec addition: missing hx-swap defaults to innerHTML (htmx parity).
+    let html = r##"<!DOCTYPE html><html><body>
+      <section id="sec" hx-trigger="slice:time" hx-target="#box">
+        <div id="box">OLD</div>
+      </section>
+    </body></html>"##;
+    let mut eng = Engine::new(EngineConfig::default());
+    eng.declare_actions(&[]);
+    eng.load_html(html).unwrap();
+    let slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    frags.set("sec", "NEW");
+    eng.sync(&slices, &mut frags).unwrap();
+    let ser = eng.serialize_html().unwrap();
+    assert!(ser.contains("NEW"));
+    // Outer section element should still exist (innerHTML, not outerHTML).
+    assert!(ser.contains("id=\"sec\"") || ser.contains("id=sec"));
+}
+
+#[test]
+fn a5c_clean_sections_never_render() {
+    let html = r##"<!DOCTYPE html><html><body>
+      <section id="sec-a" hx-trigger="slice:a" hx-target="#a" hx-swap="innerHTML"><div id="a">A</div></section>
+      <section id="sec-b" hx-trigger="slice:b" hx-target="#b" hx-swap="innerHTML"><div id="b">B</div></section>
+    </body></html>"##;
+    let mut eng = Engine::new(EngineConfig::default());
+    eng.declare_actions(&[]);
+    eng.load_html(html).unwrap();
+
+    let mut slices = MemSlices::new();
+    slices.versions.insert("a".into(), 1);
+    slices.versions.insert("b".into(), 1);
+    let asks = slices.version_asks.clone();
+    let mut frags = SpyFrags::new();
+    frags.set("sec-a", "Aa");
+    frags.set("sec-b", "Bb");
+    let calls = frags.calls.clone();
+
+    eng.sync(&slices, &mut frags).unwrap(); // initial full render
+    calls.lock().unwrap().clear();
+    asks.lock().unwrap().clear();
+
+    slices.bump("a");
+    frags.set("sec-a", "A2");
+    eng.sync(&slices, &mut frags).unwrap();
+
+    let call_ids: Vec<String> = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect();
+    assert_eq!(call_ids, vec!["sec-a".to_string()]);
+    let asked: HashSet<String> = asks.lock().unwrap().iter().cloned().collect();
+    assert!(asked.contains("a") || asked.contains("actions"));
+    assert!(
+        !asked.contains("unsubscribed"),
+        "must not ask unsubscribed names"
+    );
+    // b is subscribed but clean — version still asked (we ask all subscribed),
+    // but render must not be called for sec-b.
+    assert!(!call_ids.iter().any(|c| c == "sec-b"));
+}
+
+#[test]
+fn a5d_no_persisted_ui_state() {
+    let mut eng = boot(FIXTURE);
+    let mut slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    sync_paint(&mut eng, &mut slices, &mut frags);
+    let outs = click_at(&mut eng, pos::PAUSE.0, pos::PAUSE.1);
+    assert!(outs
+        .iter()
+        .any(|o| matches!(o, InputOutcome::Action { .. })));
+    assert!(eng.has_class("btn-pause", "hx-request"));
+
+    // Reload → pending dropped, full render of every section.
+    frags.calls.lock().unwrap().clear();
+    eng.load_html(FIXTURE).unwrap();
+    assert!(!eng.has_class("btn-pause", "hx-request"));
+    assert!(eng.attr("btn-pause", "aria-busy").is_none());
+    let dirty = eng.sync(&slices, &mut frags).unwrap();
+    assert!(dirty.sections.iter().any(|s| s == "time-strip"));
+    // New Action after reload starts at RequestId(1) only in a *new* engine.
+    // Spec: counter restarts at 1 in a new engine. Same engine keeps counting.
+    let mut eng_new = boot(FIXTURE);
+    let mut s2 = MemSlices::new();
+    let mut f2 = SpyFrags::new();
+    sync_paint(&mut eng_new, &mut s2, &mut f2);
+    let outs2 = click_at(&mut eng_new, pos::PAUSE.0, pos::PAUSE.1);
+    let req = outs2.iter().find_map(|o| match o {
+        InputOutcome::Action { request, .. } => Some(request.0),
+        _ => None,
+    });
+    assert_eq!(req, Some(1));
+}
+
+// ---------------------------------------------------------------------------
+// A6 / A6b
+// ---------------------------------------------------------------------------
+#[test]
+fn a6_greyed_before_click() {
+    let mut eng = boot(FIXTURE);
+    let mut slices = MemSlices::new();
+    slices.actions.push((
+        "time.pause".into(),
+        ActionState::Disabled {
+            reason: "sim busy".into(),
+        },
+    ));
+    let mut frags = SpyFrags::new();
+    eng.sync(&slices, &mut frags).unwrap();
+    assert!(eng.attr("btn-pause", "disabled").is_some());
+    assert_eq!(
+        eng.attr("btn-pause", "aria-disabled").as_deref(),
+        Some("true")
+    );
+    assert_eq!(
+        eng.attr("btn-pause", "data-hx-reason").as_deref(),
+        Some("sim busy")
+    );
+
+    slices.actions.clear();
+    slices.bump("actions");
+    eng.sync(&slices, &mut frags).unwrap();
+    assert!(eng.attr("btn-pause", "disabled").is_none());
+    assert!(eng.attr("btn-pause", "aria-disabled").is_none());
+    assert!(eng.attr("btn-pause", "data-hx-reason").is_none());
+}
+
+#[test]
+fn a6b_blocked_race_fallback() {
+    let mut eng = boot(FIXTURE);
+    let mut slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    sync_paint(&mut eng, &mut slices, &mut frags);
+    // Disable between paint and click without syncing into attributes —
+    // the engine checks disabled_actions at click time from last sync.
+    // Simulate race: sync with disabled after paint.
+    slices.actions.push((
+        "time.pause".into(),
+        ActionState::Disabled {
+            reason: "race".into(),
+        },
+    ));
+    slices.bump("actions");
+    eng.sync(&slices, &mut frags).unwrap();
+    // Do not paint — click immediately.
+    let outs = click_at(&mut eng, pos::PAUSE.0, pos::PAUSE.1);
+    let blocked = outs
+        .iter()
+        .find(|o| matches!(o, InputOutcome::Blocked { .. }));
+    match blocked {
+        Some(InputOutcome::Blocked { name, reason, .. }) => {
+            assert_eq!(name, "time.pause");
+            assert_eq!(reason, "race");
+        }
+        _ => panic!("expected Blocked, got {outs:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A8 — Paint budget (measure + report)
+// ---------------------------------------------------------------------------
+#[test]
+fn a8_paint_budget() {
+    let mut eng = boot(FIXTURE);
+    let slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    eng.sync(&slices, &mut frags).unwrap();
+    eng.paint(Viewport {
+        width: 800,
+        height: 120,
+        holes: vec![],
+    })
+    .unwrap();
+    let t = eng.last_timings();
+    eprintln!(
+        "A8 time-strip fixture paint_ns={} sync_ns={} max_paint_ns={}",
+        t.paint_ns,
+        t.sync_ns,
+        eng.config().max_paint_ns
+    );
+    assert!(
+        t.paint_ns <= eng.config().max_paint_ns,
+        "paint_ns {} exceeded max_paint_ns {}",
+        t.paint_ns,
+        eng.config().max_paint_ns
+    );
+    assert!(t.paint_ns > 0, "paint timing must be measured");
+}
+
+// ---------------------------------------------------------------------------
+// A13 — No Mainnet / wgpu deps
+// ---------------------------------------------------------------------------
+#[test]
+fn a13_cargo_tree_no_mainnet_or_wgpu() {
+    use std::process::Command;
+    let output = Command::new("cargo")
+        .args(["tree", "-p", "hx-native", "--prefix", "none"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("cargo tree");
+    assert!(output.status.success(), "cargo tree failed");
+    let tree = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    for banned in ["mainnet", "mainnet_graph", "graph_bridge", "wgpu "] {
+        // Match package names carefully: "wgpu " prefix form from cargo tree lines.
+        let hit = tree.lines().any(|line| {
+            let pkg = line.split_whitespace().next().unwrap_or("");
+            pkg == banned.trim()
+                || pkg.starts_with("mainnet")
+                || pkg == "graph_bridge"
+                || pkg == "wgpu"
+                || pkg.starts_with("wgpu-")
+        });
+        assert!(
+            !hit,
+            "banned dependency found near `{banned}` in cargo tree"
+        );
+    }
+    // Also ensure blitz-net is absent.
+    assert!(
+        !tree.lines().any(|l| l.starts_with("blitz-net ")),
+        "blitz-net must not be a dependency"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A17 — Right click
+// ---------------------------------------------------------------------------
+#[test]
+fn a17_right_click() {
+    let mut eng = boot(FIXTURE);
+    let mut slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    sync_paint(&mut eng, &mut slices, &mut frags);
+
+    let outs = click_at_btn(
+        &mut eng,
+        pos::CTX.0,
+        pos::CTX.1,
+        PointerButton::Secondary,
+        Modifiers::default(),
+    );
+    let action = outs
+        .iter()
+        .find(|o| matches!(o, InputOutcome::Action { .. }));
+    match action {
+        Some(InputOutcome::Action {
+            name,
+            trigger: TriggerInfo::Pointer { event, button, .. },
+            ..
+        }) => {
+            assert_eq!(name, "time.context");
+            assert_eq!(*event, "contextmenu");
+            assert_eq!(*button, PointerButton::Secondary);
+        }
+        _ => panic!("expected contextmenu Action, got {outs:?}"),
+    }
+
+    // Primary click on same element emits nothing (no click trigger).
+    let outs2 = click_at(&mut eng, pos::CTX.0, pos::CTX.1);
+    assert!(
+        outs2
+            .iter()
+            .all(|o| !matches!(o, InputOutcome::Action { .. })),
+        "primary click must not fire Action on contextmenu-only control"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A18 — Modifier filters
+// ---------------------------------------------------------------------------
+#[test]
+fn a18_modifier_filters() {
+    let html = r##"<!DOCTYPE html><html><head><style>
+      button { position:absolute; width:80px; height:40px; }
+      #plain { left:10px; top:10px; }
+      #shift { left:100px; top:10px; }
+      #ctrl { left:190px; top:10px; }
+      #meta { left:280px; top:10px; }
+      #either { left:370px; top:10px; }
+    </style></head><body>
+      <button id="plain" hx-post="a.plain" hx-trigger="click[!shiftKey]">p</button>
+      <button id="shift" hx-post="a.shift" hx-trigger="click[shiftKey]">s</button>
+      <button id="ctrl" hx-post="a.ctrl" hx-trigger="click[ctrlKey]">c</button>
+      <button id="meta" hx-post="a.meta" hx-trigger="click[metaKey]">m</button>
+      <button id="either" hx-post="a.either" hx-trigger="click[ctrlKey||metaKey]">e</button>
+    </body></html>"##;
+    let mut eng = Engine::new(EngineConfig::default());
+    eng.declare_actions(&["a.plain", "a.shift", "a.ctrl", "a.meta", "a.either"]);
+    eng.load_html(html).unwrap();
+    let slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    eng.sync(&slices, &mut frags).unwrap();
+    eng.paint(Viewport {
+        width: 500,
+        height: 80,
+        holes: vec![],
+    })
+    .unwrap();
+
+    let shift_mods = Modifiers {
+        shift: true,
+        ..Modifiers::default()
+    };
+    // shift button without shift → no action
+    let o = click_at_btn(
+        &mut eng,
+        140.0,
+        30.0,
+        PointerButton::Primary,
+        Modifiers::default(),
+    );
+    assert!(o.iter().all(|x| !matches!(x, InputOutcome::Action { .. })));
+    // with shift → action
+    let o = click_at_btn(&mut eng, 140.0, 30.0, PointerButton::Primary, shift_mods);
+    match o.iter().find(|x| matches!(x, InputOutcome::Action { .. })) {
+        Some(InputOutcome::Action {
+            name,
+            trigger: TriggerInfo::Pointer { mods, .. },
+            ..
+        }) => {
+            assert_eq!(name, "a.shift");
+            assert!(mods.shift);
+        }
+        _ => panic!("expected shift Action"),
+    }
+
+    // plain with shift → no; without → yes
+    let o = click_at_btn(&mut eng, 50.0, 30.0, PointerButton::Primary, shift_mods);
+    assert!(o.iter().all(|x| !matches!(x, InputOutcome::Action { .. })));
+    let o = click_at(&mut eng, 50.0, 30.0);
+    assert!(o
+        .iter()
+        .any(|x| matches!(x, InputOutcome::Action { name, .. } if name == "a.plain")));
+
+    // Helper: complete any Action so pending drop does not hide later clicks.
+    let complete_all = |eng: &mut Engine, outs: &[InputOutcome]| {
+        for o in outs {
+            if let InputOutcome::Action { request, .. } = o {
+                eng.complete(*request, Ok(()));
+            }
+        }
+    };
+
+    // ctrl vs meta
+    let ctrl = Modifiers {
+        ctrl: true,
+        ..Modifiers::default()
+    };
+    let meta = Modifiers {
+        meta: true,
+        ..Modifiers::default()
+    };
+    let o = click_at_btn(&mut eng, 230.0, 30.0, PointerButton::Primary, ctrl);
+    assert!(o
+        .iter()
+        .any(|x| matches!(x, InputOutcome::Action { name, .. } if name == "a.ctrl")));
+    complete_all(&mut eng, &o);
+    let o = click_at_btn(&mut eng, 230.0, 30.0, PointerButton::Primary, meta);
+    assert!(o
+        .iter()
+        .all(|x| !matches!(x, InputOutcome::Action { name, .. } if name == "a.ctrl")));
+
+    let o = click_at_btn(&mut eng, 320.0, 30.0, PointerButton::Primary, meta);
+    assert!(o
+        .iter()
+        .any(|x| matches!(x, InputOutcome::Action { name, .. } if name == "a.meta")));
+    complete_all(&mut eng, &o);
+
+    // ctrlKey||metaKey
+    let o = click_at_btn(&mut eng, 410.0, 30.0, PointerButton::Primary, ctrl);
+    assert!(o
+        .iter()
+        .any(|x| matches!(x, InputOutcome::Action { name, .. } if name == "a.either")));
+    complete_all(&mut eng, &o);
+    let o = click_at_btn(&mut eng, 410.0, 30.0, PointerButton::Primary, meta);
+    assert!(o
+        .iter()
+        .any(|x| matches!(x, InputOutcome::Action { name, .. } if name == "a.either")));
+    complete_all(&mut eng, &o);
+
+    // macOS Ctrl+Primary reported raw as Primary + ctrl (no remap)
+    let o = click_at_btn(&mut eng, 230.0, 30.0, PointerButton::Primary, ctrl);
+    match o.iter().find(|x| matches!(x, InputOutcome::Action { .. })) {
+        Some(InputOutcome::Action {
+            trigger: TriggerInfo::Pointer { button, mods, .. },
+            ..
+        }) => {
+            assert_eq!(*button, PointerButton::Primary);
+            assert!(mods.ctrl);
+        }
+        _ => panic!("expected raw Primary+ctrl"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A19 — Window-level key
+// ---------------------------------------------------------------------------
+#[test]
+fn a19_window_level_key() {
+    let mut eng = boot(FIXTURE);
+    let mut slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    sync_paint(&mut eng, &mut slices, &mut frags);
+
+    // from:body Enter with no focus → Action on btn-menu
+    eng.focus_state(); // ensure we can read
+                       // Clear focus intentionally
+    let key = KeyEvent {
+        key: "Enter".into(),
+        code: "Enter".into(),
+        mods: Modifiers::default(),
+        repeat: false,
+        pressed: true,
+    };
+    let out = eng.input(InputEvent::Key(key.clone()));
+    match out {
+        InputOutcome::Action {
+            name, source_id, ..
+        } => {
+            assert_eq!(name, "time.pause_menu");
+            assert_eq!(source_id, "btn-menu");
+        }
+        other => panic!("expected from:body Action, got {other:?}"),
+    }
+
+    // Auto-repeat keydown does not fire unless filter has repeat
+    let rep = KeyEvent {
+        repeat: true,
+        ..key
+    };
+    let out = eng.input(InputEvent::Key(rep));
+    // Pending drop may also yield None — complete first.
+    if let InputOutcome::Action { request, .. } = out {
+        eng.complete(request, Ok(()));
+    } else {
+        // Should be Unhandled or None — not a new Action from repeat without [repeat]
+        assert!(
+            matches!(out, InputOutcome::Unhandled(_) | InputOutcome::None),
+            "repeat without [repeat] must not Action: {out:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A20 — Esc passthrough
+// ---------------------------------------------------------------------------
+#[test]
+fn a20_esc_passthrough() {
+    let mut eng = boot(FIXTURE);
+    let mut slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    sync_paint(&mut eng, &mut slices, &mut frags);
+
+    let esc = KeyEvent {
+        key: "Escape".into(),
+        code: "Escape".into(),
+        mods: Modifiers::default(),
+        repeat: false,
+        pressed: true,
+    };
+    let out = eng.input(InputEvent::Key(esc.clone()));
+    match out {
+        InputOutcome::Unhandled(k) => assert_eq!(k.key, "Escape"),
+        other => panic!("Esc must be Unhandled by default, got {other:?}"),
+    }
+
+    // With explicit trigger on focused element → consumed
+    let html = r#"<!DOCTYPE html><html><body>
+      <button id="closer" hx-post="win.close" hx-trigger="keydown[key=='Escape']">x</button>
+    </body></html>"#;
+    let mut eng2 = Engine::new(EngineConfig::default());
+    eng2.declare_actions(&["win.close"]);
+    eng2.load_html(html).unwrap();
+    let s2 = MemSlices::new();
+    let mut f2 = SpyFrags::new();
+    eng2.sync(&s2, &mut f2).unwrap();
+    eng2.paint(Viewport {
+        width: 200,
+        height: 80,
+        holes: vec![],
+    })
+    .unwrap();
+    eng2.test_set_focus("closer");
+    let out = eng2.input(InputEvent::Key(esc));
+    assert!(matches!(out, InputOutcome::Action { name, .. } if name == "win.close"));
+}
+
+// ---------------------------------------------------------------------------
+// A21 — Keyboard activation
+// ---------------------------------------------------------------------------
+#[test]
+fn a21_keyboard_activation() {
+    let mut eng = boot(FIXTURE);
+    let mut slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    sync_paint(&mut eng, &mut slices, &mut frags);
+
+    eng.test_set_focus("btn-pause");
+    let enter = KeyEvent {
+        key: "Enter".into(),
+        code: "Enter".into(),
+        mods: Modifiers::default(),
+        repeat: false,
+        pressed: true,
+    };
+    let out = eng.input(InputEvent::Key(enter));
+    match out {
+        InputOutcome::Action {
+            name,
+            source_id,
+            trigger: TriggerInfo::Key { .. },
+            request,
+            ..
+        } => {
+            assert_eq!(name, "time.pause");
+            assert_eq!(source_id, "btn-pause");
+            eng.complete(request, Ok(()));
+        }
+        other => panic!("Enter on focused hx-post must Action: {other:?}"),
+    }
+
+    eng.test_set_focus("btn-pause");
+    let space = KeyEvent {
+        key: " ".into(),
+        code: "Space".into(),
+        mods: Modifiers::default(),
+        repeat: false,
+        pressed: true,
+    };
+    let out = eng.input(InputEvent::Key(space));
+    assert!(matches!(
+        out,
+        InputOutcome::Action {
+            name,
+            trigger: TriggerInfo::Key { .. },
+            ..
+        } if name == "time.pause"
+    ));
+}

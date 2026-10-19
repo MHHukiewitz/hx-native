@@ -3,7 +3,7 @@
 **/target/
 **/*.rs.bk
 *.pdb
-# Cargo.lock is committed for binaries/examples; libraries may ignore it later.
+# Cargo.lock is committed for reproducible CI.
 
 # Editors / OS
 .idea/
