@@ -4,6 +4,7 @@
 
 #![deny(unsafe_code)]
 
+mod damage;
 mod dialect;
 mod engine;
 mod error;

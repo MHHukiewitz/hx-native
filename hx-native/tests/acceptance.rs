@@ -27,6 +27,7 @@ fn boot(html: &str) -> Engine {
     let mut eng = Engine::new(EngineConfig {
         max_paint_ns: 50_000_000,
         pending_timeout_frames: 5,
+        paint_mode: PaintMode::Exact,
     });
     eng.declare_actions(default_actions());
     eng.load_html(html).expect("load_html");
@@ -134,6 +135,7 @@ fn sync_paint(eng: &mut Engine, slices: &mut MemSlices, frags: &mut SpyFrags) {
     eng.paint(Viewport {
         width: 800,
         height: 120,
+        scale: 1.0,
         holes: vec![],
     })
     .unwrap();
@@ -154,6 +156,7 @@ fn a1_headless_boot() {
         .paint(Viewport {
             width: 800,
             height: 120,
+            scale: 1.0,
             holes: vec![],
         })
         .unwrap();
@@ -213,6 +216,7 @@ fn a2_determinism() {
             .paint(Viewport {
                 width: 800,
                 height: 120,
+                scale: 1.0,
                 holes: vec![],
             })
             .unwrap()
@@ -354,6 +358,7 @@ fn a3c_pending_lifecycle() {
     let mut eng2 = Engine::new(EngineConfig {
         max_paint_ns: 50_000_000,
         pending_timeout_frames: 2,
+        paint_mode: PaintMode::Exact,
     });
     eng2.declare_actions(default_actions());
     eng2.load_html(FIXTURE).unwrap();
@@ -493,6 +498,7 @@ fn a5_slice_partial_swap() {
     eng.paint(Viewport {
         width: 800,
         height: 120,
+        scale: 1.0,
         holes: vec![],
     })
     .unwrap();
@@ -705,6 +711,7 @@ fn a8_paint_budget() {
         .paint(Viewport {
             width: 800,
             height: 120,
+            scale: 1.0,
             holes: vec![],
         })
         .unwrap();
@@ -730,6 +737,7 @@ fn a8_paint_budget() {
         .paint(Viewport {
             width: 800,
             height: 120,
+            scale: 1.0,
             holes: vec![],
         })
         .unwrap();
@@ -856,6 +864,7 @@ fn a18_modifier_filters() {
     eng.paint(Viewport {
         width: 500,
         height: 80,
+        scale: 1.0,
         holes: vec![],
     })
     .unwrap();
@@ -1040,6 +1049,7 @@ fn a20_esc_passthrough() {
     eng2.paint(Viewport {
         width: 200,
         height: 80,
+        scale: 1.0,
         holes: vec![],
     })
     .unwrap();
@@ -1148,6 +1158,7 @@ fn a21_tab_focus_order() {
     eng.paint(Viewport {
         width: 400,
         height: 200,
+        scale: 1.0,
         holes: vec![],
     })
     .unwrap();
@@ -1498,6 +1509,7 @@ fn boot_tooltip(css: &str, button_attrs: &str) -> Engine {
     let mut eng = Engine::new(EngineConfig {
         max_paint_ns: 50_000_000,
         pending_timeout_frames: 5,
+        paint_mode: PaintMode::Exact,
     });
     eng.declare_actions(&["x"]);
     eng.load_html(&tooltip_page(css, button_attrs))
@@ -1509,6 +1521,7 @@ fn paint_small(eng: &mut Engine) -> PaintOutput {
     eng.paint(Viewport {
         width: 300,
         height: 60,
+        scale: 1.0,
         holes: vec![],
     })
     .unwrap()
@@ -1641,6 +1654,7 @@ button { height: 36px; margin-right: 4px; position: relative; }
     let mut eng = Engine::new(EngineConfig {
         max_paint_ns: 50_000_000,
         pending_timeout_frames: 5,
+        paint_mode: PaintMode::Exact,
     });
     eng.declare_actions(&["time.pause", "time.resume", "time.set_speed"]);
     eng.load_html(&shell).expect("load shell");
@@ -1659,6 +1673,7 @@ button { height: 36px; margin-right: 4px; position: relative; }
     let vp = Viewport {
         width: 800,
         height: 120,
+        scale: 1.0,
         holes: vec![],
     };
     let _ = eng.paint(vp.clone()).unwrap();
@@ -1768,6 +1783,7 @@ fn paint_view(eng: &mut Engine) -> PaintOutput {
     eng.paint(Viewport {
         width: 800,
         height: 120,
+        scale: 1.0,
         holes: vec![],
     })
     .unwrap()
@@ -1915,6 +1931,7 @@ fn boot_form(html: &str, actions: &[&str]) -> Engine {
     let mut eng = Engine::new(EngineConfig {
         max_paint_ns: 50_000_000,
         pending_timeout_frames: 5,
+        paint_mode: PaintMode::Exact,
     });
     eng.declare_actions(actions);
     let wrapped = format!("<!DOCTYPE html><html><body>{html}</body></html>");
@@ -1922,6 +1939,7 @@ fn boot_form(html: &str, actions: &[&str]) -> Engine {
     let _ = eng.paint(Viewport {
         width: 400,
         height: 200,
+        scale: 1.0,
         holes: vec![],
     });
     eng

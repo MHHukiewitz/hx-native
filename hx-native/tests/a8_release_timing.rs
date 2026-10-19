@@ -21,6 +21,7 @@ fn view() -> Viewport {
     Viewport {
         width: 800,
         height: 120,
+        scale: 1.0,
         holes: vec![],
     }
 }
@@ -80,6 +81,7 @@ fn boot() -> (Engine, MemSlices, Frags) {
     let mut eng = Engine::new(EngineConfig {
         max_paint_ns: 16_600_000, // honest ideal frame; we report, not hard-fail vs FRAME_BUDGET here
         pending_timeout_frames: 120,
+        paint_mode: PaintMode::Exact,
     });
     eng.declare_actions(&[
         "time.pause",
