@@ -1476,11 +1476,14 @@ impl Engine {
             collect_style_damaged(doc)
         };
 
+        // Style + layout once. A second pass is allowed only when the hovered
+        // node changes (Graph: at most 2 passes total per paint).
+        let hover_before = doc.get_hover_node_id();
         doc.resolve(0.0);
         self.style_layout_passes = self.style_layout_passes.saturating_add(1);
-
-        // resolve() ends with refresh_hover(); if hover changed, restyle for this frame.
-        if doc.refresh_hover() {
+        // resolve() ends with refresh_hover(); compare hover node to decide follow-up.
+        let hover_changed = doc.get_hover_node_id() != hover_before;
+        if hover_changed {
             doc.resolve(0.0);
             self.style_layout_passes = self.style_layout_passes.saturating_add(1);
         }

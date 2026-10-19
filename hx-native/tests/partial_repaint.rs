@@ -204,7 +204,7 @@ fn damage_union(out: &PaintOutput) -> Option<(f32, f32, f32, f32)> {
 }
 
 #[test]
-fn n_swaps_one_tick_one_style_layout_pass() {
+fn n_swaps_no_hover_change_exactly_one_style_layout_pass() {
     let mut eng = boot(&script_page());
     let mut slices = MemSlices::new();
     let mut frags = SpyFrags::new();
@@ -219,7 +219,7 @@ fn n_swaps_one_tick_one_style_layout_pass() {
     let after_first = eng.style_layout_pass_count();
     assert!(after_first > before, "first paint must resolve");
 
-    // One tick: bump several slices → multiple section swaps in one sync, one paint.
+    // One tick: N section swaps, no pointer hover — exactly one style/layout pass.
     slices.bump("time");
     slices.bump("ticker");
     slices.bump("hud");
@@ -238,10 +238,59 @@ fn n_swaps_one_tick_one_style_layout_pass() {
 
     eng.paint(vp_css(800, 400, 1.0)).unwrap();
     let end = eng.style_layout_pass_count();
-    // One paint may do 1 resolve, or 2 if hover refresh needs a second pass.
+    assert_eq!(
+        end,
+        mid + 1,
+        "N swaps with no hover change must use exactly 1 style/layout pass, mid={mid} end={end}"
+    );
+}
+
+#[test]
+fn swap_moving_hovered_node_at_most_two_style_layout_passes() {
+    // Hover a chip, then swap chips under the pointer so the hovered node changes.
+    // Graph: follow-up pass only when hover changes, and at most 2 passes total.
+    let mut eng = boot(&script_page());
+    let mut slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    frags.set("sec-chips", &chips_html("1x"));
+    frags.set("sec-date", &date_html(1));
+    frags.set("sec-ticker", &ticker_html(0));
+    frags.set("sec-win", &win_html(false));
+    eng.sync(&slices, &mut frags).unwrap();
+    let view = vp_css(800, 400, 1.0);
+    let _ = eng.paint(view.clone()).unwrap();
+
+    // Hover the first chip (left side of #chips).
+    let hover = eng.input(InputEvent::PointerMove {
+        x: 40.0,
+        y: 20.0,
+        mods: Modifiers::default(),
+    });
     assert!(
-        end == mid + 1 || end == mid + 2,
-        "one paint should run one (or hover-follow-up) style/layout pass, mid={mid} end={end}"
+        matches!(hover, InputOutcome::Hover { id: Some(ref id) } if id.starts_with("chip-")),
+        "expected chip hover, got {hover:?}"
+    );
+    let after_hover = eng.style_layout_pass_count();
+    eng.paint(view.clone()).unwrap();
+    let mid = eng.style_layout_pass_count();
+    assert!(
+        mid == after_hover + 1 || mid == after_hover + 2,
+        "hover paint at most 2 passes, after_hover={after_hover} mid={mid}"
+    );
+
+    // Swap chips while pointer stays put — hovered node id is replaced.
+    slices.bump("time");
+    frags.set("sec-chips", &chips_html("Week"));
+    frags.set("sec-date", &date_html(3));
+    eng.sync(&slices, &mut frags).unwrap();
+    let before_swap_paint = eng.style_layout_pass_count();
+    assert_eq!(before_swap_paint, mid, "sync must not run style/layout");
+    eng.paint(view).unwrap();
+    let end = eng.style_layout_pass_count();
+    let passes = end - before_swap_paint;
+    assert!(
+        (1..=2).contains(&passes),
+        "swap under hover must use 1 or 2 passes (hover change allows follow-up), got {passes} (before={before_swap_paint} end={end})"
     );
 }
 
