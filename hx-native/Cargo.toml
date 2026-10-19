@@ -52,6 +52,10 @@ path = "tests/partial_repaint.rs"
 name = "multi_surface"
 path = "tests/multi_surface.rs"
 
+[[test]]
+name = "paint_worker"
+path = "tests/paint_worker.rs"
+
 [[example]]
 name = "paint_bench"
 path = "examples/paint_bench.rs"
@@ -59,6 +63,10 @@ path = "examples/paint_bench.rs"
 [[example]]
 name = "surface_probe"
 path = "examples/surface_probe.rs"
+
+[[example]]
+name = "worker_bench"
+path = "examples/worker_bench.rs"
 
 [[bin]]
 name = "check_deps"

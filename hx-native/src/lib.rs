@@ -1,6 +1,9 @@
 //! `hx_native` — in-process HTMX-style fragment engine (offline, no JS, no network).
 //!
 //! See `docs/REQUIREMENTS.md` for the locked contract.
+//!
+//! For a background paint thread (issue #8 step 3), see [`PaintWorker`] and the
+//! rustdoc on the [`worker`] module (Mainnet / wgpu / egui host notes).
 
 #![deny(unsafe_code)]
 
@@ -16,6 +19,7 @@ mod paint;
 mod pending;
 mod trigger;
 mod types;
+pub mod worker;
 
 pub use dialect::{SwapMode, SyncMode};
 pub use engine::{DirtySet, Engine};
@@ -27,6 +31,10 @@ pub use memory::{
 pub use pending::PendingTimeout;
 pub use trigger::{FilterExpr, FromTarget, ParsedTrigger, TriggerEvent};
 pub use types::*;
+pub use worker::{
+    PaintWorker, SyncPacket, WorkerError, WorkerFrame, WorkerStatus, PAINT_WORKER_COMMAND_CAPACITY,
+    PAINT_WORKER_FRAME_SLOTS, PAINT_WORKER_JOIN_WARN_NS,
+};
 
 /// Crate version string.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -40,6 +48,8 @@ const _: () = {
         assert_send::<PaintOutput>();
         assert_send::<PaintStats>();
         assert_send::<Timings>();
+        assert_send::<SyncPacket>();
+        assert_send::<WorkerFrame>();
     }
     let _ = check;
 };
