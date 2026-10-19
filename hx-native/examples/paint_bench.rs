@@ -1,8 +1,10 @@
-//! Week-speed paint bench for issue #8 step 1.
+//! Week-speed paint bench for issue #8 step 2 (multi-surface).
 //!
-//! Runs a scripted sequence (ticker, hover, action greying, slice swaps, window
-//! open during a sim tick) at 720p, 1080p and 1440p. Reports mean / p95 / p99
-//! frame time and how often merge-to-bbox and full-repaint fallbacks fire.
+//! Runs a scripted sequence at 720p, 1080p and 1440p in Exact mode: ticker,
+//! hover, action greying, slice swaps, and opening a window during a slice
+//! update. Reports mean / p95 / p99 overall and **per event type**, so the
+//! slowest 1% can be attributed. The scripted sequence deliberately cold-opens
+//! a non-pinned window every 8th frame; a "steady-play" row excludes those.
 //!
 //! Usage: `cargo run -p hx-native --example paint_bench --release`
 
@@ -12,6 +14,41 @@ use hx_native::*;
 
 const WARMUP: usize = 10;
 const FRAMES: usize = 200;
+
+const CHROME: SurfaceId = SurfaceId(1);
+const WIN: SurfaceId = SurfaceId(2);
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+enum EventKind {
+    /// Ticker / actions / chips slice sync + paint.
+    SliceUpdate,
+    /// Pointer move or leave on chrome.
+    Hover,
+    /// `open_surface(visible:true)` of a non-pinned window during a slice tick.
+    ColdOpen,
+    /// Hide window (`set_visible(false)`); may include eviction under pressure.
+    HideWindow,
+    /// Dedicated path: open hidden then show (pre-drawn).
+    PredrawnShow,
+    /// Dedicated path: rebuild after eviction then paint.
+    EvictedReopen,
+    /// Frame that performed at least one surface eviction (pressure run).
+    Eviction,
+}
+
+impl EventKind {
+    fn label(self) -> &'static str {
+        match self {
+            EventKind::SliceUpdate => "slice update",
+            EventKind::Hover => "hover",
+            EventKind::ColdOpen => "cold open",
+            EventKind::HideWindow => "hide window",
+            EventKind::PredrawnShow => "pre-drawn show",
+            EventKind::EvictedReopen => "evicted reopen",
+            EventKind::Eviction => "eviction",
+        }
+    }
+}
 
 struct MemSlices {
     versions: HashMap<String, u64>,
@@ -68,7 +105,7 @@ impl FragmentSource for Frags {
     }
 }
 
-fn page(css_w: u32, css_h: u32) -> String {
+fn chrome_page(css_w: u32, css_h: u32) -> String {
     format!(
         r##"<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"/>
@@ -81,10 +118,6 @@ body {{ width: {css_w}px; height: {css_h}px; background: #1a1f2a; color: #e8ecf4
 #chips button {{ height: 32px; margin-right: 4px; padding: 0 12px; background: #2d3648;
   color: #e8ecf4; border: 1px solid #556; position: relative; }}
 #chips button.on {{ background: #3d7ea6; }}
-#chips button[data-hx-reason]:hover::after {{
-  content: attr(data-hx-reason); position: absolute; left: 0; top: 36px;
-  white-space: nowrap; color: #000; background: #ffffe1; border: 1px solid #000; z-index: 5;
-}}
 #date {{ position: absolute; left: 8px; top: 48px; font-size: 14px; }}
 #ticker-lane {{
   position: absolute; left: 0; top: {ticker_top}px; width: {css_w}px; height: 32px;
@@ -93,7 +126,6 @@ body {{ width: {css_w}px; height: {css_h}px; background: #1a1f2a; color: #e8ecf4
 #ticker-inner {{ position: absolute; left: 0; top: 4px; white-space: nowrap; font-size: 14px; }}
 #act {{ position: absolute; left: {act_x}px; top: 20px; width: 120px; height: 32px;
   background: #2d3648; color: #e8ecf4; border: 1px solid #556; }}
-#act:disabled {{ opacity: 0.4; }}
 </style></head><body>
 <div id="strip"></div>
 <section id="sec-chips" hx-trigger="slice:time" hx-target="#chips" hx-swap="innerHTML">
@@ -105,15 +137,32 @@ body {{ width: {css_w}px; height: {css_h}px; background: #1a1f2a; color: #e8ecf4
 <section id="sec-ticker" hx-trigger="slice:ticker" hx-target="#ticker-inner" hx-swap="innerHTML">
   <div id="ticker-lane"><div id="ticker-inner">news</div></div>
 </section>
-<section id="sec-win" hx-trigger="slice:hud" hx-target="#win-slot" hx-swap="innerHTML">
-  <div id="win-slot"></div>
-</section>
 <button id="act" hx-post="act.do" hx-trigger="click">Do</button>
 </body></html>"##,
         css_w = css_w,
         css_h = css_h,
         ticker_top = css_h.saturating_sub(40),
         act_x = css_w.saturating_sub(160),
+    )
+}
+
+fn win_page(cell: &str) -> String {
+    format!(
+        r##"<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/>
+<style>
+* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+body {{ width: 560px; height: 360px; background: #2a3140; color: #e8ecf4;
+  font-family: "DejaVu Sans", sans-serif; border: 1px solid #667; }}
+table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
+td {{ padding: 6px 10px; border-bottom: 1px solid #445; }}
+</style></head><body>
+<table>
+<tr><td>{cell}</td><td>42</td></tr>
+<tr><td>Beta</td><td>7</td></tr>
+<tr><td>Gamma</td><td>3</td></tr>
+</table>
+</body></html>"##
     )
 }
 
@@ -138,33 +187,50 @@ fn ticker(offset: i32) -> String {
     )
 }
 
-fn win(open: bool, cell: &str) -> String {
-    if !open {
-        return r#"<div id="win" style="display:none"></div>"#.into();
+fn pct(samples: &[u64], p: f64) -> u64 {
+    if samples.is_empty() {
+        return 0;
     }
-    format!(
-        r#"<div id="win" style="position:absolute;left:80px;top:120px;width:560px;height:360px;background:#2a3140;border:1px solid #667;box-shadow:10px 10px 24px rgba(0,0,0,0.5);display:block">
-<table style="width:100%;border-collapse:collapse;font-size:14px">
-<tr><td style="padding:6px 10px;border-bottom:1px solid #445">{cell}</td><td>42</td></tr>
-<tr><td style="padding:6px 10px;border-bottom:1px solid #445">Beta</td><td>7</td></tr>
-<tr><td style="padding:6px 10px;border-bottom:1px solid #445">Gamma</td><td>3</td></tr>
-</table></div>"#
-    )
+    let mut v = samples.to_vec();
+    v.sort_unstable();
+    let idx = ((v.len() as f64) * p) as usize;
+    v[idx.min(v.len() - 1)]
+}
+
+fn mean(samples: &[u64]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    samples.iter().sum::<u64>() as f64 / samples.len() as f64
+}
+
+fn report_row(label: &str, samples: &[u64]) {
+    if samples.is_empty() {
+        println!("| {label} | 0 | — | — | — |");
+        return;
+    }
+    println!(
+        "| {label} | {} | {:.3} | {:.3} | {:.3} |",
+        samples.len(),
+        mean(samples) / 1e6,
+        pct(samples, 0.95) as f64 / 1e6,
+        pct(samples, 0.99) as f64 / 1e6,
+    );
 }
 
 #[derive(Default)]
 struct Acc {
-    times_ns: Vec<u64>,
+    /// (kind, frame_ns) for every measured frame in the scripted sequence.
+    frames: Vec<(EventKind, u64)>,
     merge_to_bbox: u32,
     full_repaint: u32,
     full_area_fallback: u32,
-    frames: u32,
+    evictions: u64,
 }
 
 impl Acc {
-    fn record(&mut self, eng: &Engine, paint_ns: u64) {
-        self.times_ns.push(paint_ns);
-        self.frames += 1;
+    fn record(&mut self, eng: &Engine, kind: EventKind, frame_ns: u64) {
+        self.frames.push((kind, frame_ns));
         let s = eng.last_paint_stats();
         if s.merged_to_bbox {
             self.merge_to_bbox += 1;
@@ -175,51 +241,128 @@ impl Acc {
         if s.full_repaint_area_fallback {
             self.full_area_fallback += 1;
         }
+        let mem = eng.surface_memory_stats();
+        self.evictions = mem.eviction_count;
     }
 
-    fn report(&mut self, label: &str) {
-        self.times_ns.sort_unstable();
-        let n = self.times_ns.len();
-        let mean = self.times_ns.iter().sum::<u64>() as f64 / n as f64;
-        let p95 = self.times_ns[((n as f64) * 0.95) as usize].min(self.times_ns[n - 1]);
-        let p99 = self.times_ns[((n as f64) * 0.99) as usize].min(self.times_ns[n - 1]);
+    fn times(&self) -> Vec<u64> {
+        self.frames.iter().map(|(_, t)| *t).collect()
+    }
+
+    fn times_excluding(&self, skip: EventKind) -> Vec<u64> {
+        self.frames
+            .iter()
+            .filter(|(k, _)| *k != skip)
+            .map(|(_, t)| *t)
+            .collect()
+    }
+
+    fn by_kind(&self, kind: EventKind) -> Vec<u64> {
+        self.frames
+            .iter()
+            .filter(|(k, _)| *k == kind)
+            .map(|(_, t)| *t)
+            .collect()
+    }
+
+    /// Name what sits in the overall slowest 1% (by event kind).
+    fn p99_drivers(&self) -> String {
+        let all = self.times();
+        if all.is_empty() {
+            return "n/a".into();
+        }
+        let threshold = pct(&all, 0.99);
+        let mut counts: HashMap<&'static str, usize> = HashMap::new();
+        for (k, t) in &self.frames {
+            if *t >= threshold {
+                *counts.entry(k.label()).or_insert(0) += 1;
+            }
+        }
+        let mut parts: Vec<_> = counts.into_iter().collect();
+        parts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        parts
+            .iter()
+            .map(|(name, n)| format!("{name}×{n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn report(&mut self, label: &str, eng: &Engine) {
+        let all = self.times();
+        let steady = self.times_excluding(EventKind::ColdOpen);
+        let mem = eng.surface_memory_stats();
+        println!();
+        println!("### {label}");
         println!(
-            "{label}: mean={:.3} ms  p95={:.3} ms  p99={:.3} ms  frames={}  merge_to_bbox={}  full_repaint={}  area_fallback={}",
-            mean / 1e6,
-            p95 as f64 / 1e6,
-            p99 as f64 / 1e6,
-            self.frames,
+            "Overall: mean={:.3} ms  p95={:.3} ms  p99={:.3} ms  frames={}  merge_to_bbox={}  full_repaint={}  area_fallback={}  evictions={}  pinned={:.2} MiB  live={:.2} MiB",
+            mean(&all) / 1e6,
+            pct(&all, 0.95) as f64 / 1e6,
+            pct(&all, 0.99) as f64 / 1e6,
+            all.len(),
             self.merge_to_bbox,
             self.full_repaint,
             self.full_area_fallback,
+            self.evictions,
+            mem.pinned_bytes as f64 / (1024.0 * 1024.0),
+            mem.live_bytes as f64 / (1024.0 * 1024.0),
         );
+        println!(
+            "Steady-play (excludes deliberate cold opens): mean={:.3} ms  p95={:.3} ms  p99={:.3} ms  frames={}",
+            mean(&steady) / 1e6,
+            pct(&steady, 0.95) as f64 / 1e6,
+            pct(&steady, 0.99) as f64 / 1e6,
+            steady.len(),
+        );
+        println!(
+            "p99 drivers (≥ overall p99 threshold): {}",
+            self.p99_drivers()
+        );
+        println!("| Event | n | mean ms | p95 ms | p99 ms |");
+        println!("|---|---|---|---|---|");
+        for kind in [
+            EventKind::SliceUpdate,
+            EventKind::Hover,
+            EventKind::ColdOpen,
+            EventKind::HideWindow,
+        ] {
+            report_row(kind.label(), &self.by_kind(kind));
+        }
+        report_row("steady-play (no cold open)", &steady);
+        report_row("all frames", &all);
     }
 }
 
-/// One Week-speed frame pattern: rotate through the scripted scenarios.
-/// Returns engine `paint_ns` for the paint call.
+/// Scripted Week-speed frame. Every 8th step cold-opens a non-pinned window
+/// during a slice update (deliberate; Mainnet Pause family is pinned/pre-drawn).
 fn step_sequence(
     i: usize,
     eng: &mut Engine,
     slices: &mut MemSlices,
     frags: &mut Frags,
-    view: &Viewport,
-) -> u64 {
-    match i % 8 {
+    win_view: &Viewport,
+) -> (EventKind, u64) {
+    let t0 = std::time::Instant::now();
+    let kind = match i % 8 {
         0 => {
             slices.bump("ticker");
             frags.set("sec-ticker", &ticker(-((i as i32 % 40) * 3)));
-            eng.sync(slices, frags).unwrap();
+            eng.sync_surface(CHROME, slices, frags).unwrap();
+            EventKind::SliceUpdate
         }
         1 => {
-            let _ = eng.input(InputEvent::PointerMove {
-                x: 48.0,
-                y: 22.0,
-                mods: Modifiers::default(),
-            });
+            let _ = eng.input_surface(
+                CHROME,
+                InputEvent::PointerMove {
+                    x: 48.0,
+                    y: 22.0,
+                    mods: Modifiers::default(),
+                },
+            );
+            EventKind::Hover
         }
         2 => {
-            let _ = eng.input(InputEvent::PointerLeave);
+            let _ = eng.input_surface(CHROME, InputEvent::PointerLeave);
+            EventKind::Hover
         }
         3 => {
             slices.actions = vec![(
@@ -229,69 +372,272 @@ fn step_sequence(
                 },
             )];
             slices.bump("actions");
-            eng.sync(slices, frags).unwrap();
+            eng.sync_surface(CHROME, slices, frags).unwrap();
+            EventKind::SliceUpdate
         }
         4 => {
             slices.actions.clear();
             slices.bump("actions");
-            eng.sync(slices, frags).unwrap();
+            eng.sync_surface(CHROME, slices, frags).unwrap();
+            EventKind::SliceUpdate
         }
         5 => {
             let active = ["1x", "2x", "Week", "Month"][i % 4];
             slices.bump("time");
             frags.set("sec-chips", &chips(active));
             frags.set("sec-date", &date((i % 28) as u32 + 1));
-            eng.sync(slices, frags).unwrap();
+            eng.sync_surface(CHROME, slices, frags).unwrap();
+            EventKind::SliceUpdate
         }
         6 => {
-            // Window opens during a sim tick (time + hud together).
+            // Cold open of a non-pinned window during a sim tick.
             slices.bump("time");
-            slices.bump("hud");
             frags.set("sec-chips", &chips("Week"));
             frags.set("sec-date", &date(15));
-            frags.set("sec-win", &win(true, &format!("Cell {i}")));
-            eng.sync(slices, frags).unwrap();
+            eng.sync_surface(CHROME, slices, frags).unwrap();
+            let _ = eng.close_surface(WIN);
+            eng.open_surface(
+                WIN,
+                &win_page(&format!("Cell {i}")),
+                win_view.clone(),
+                SurfaceOpts {
+                    visible: true,
+                    pinned: false,
+                },
+            )
+            .unwrap();
+            EventKind::ColdOpen
         }
         _ => {
-            slices.bump("hud");
-            frags.set("sec-win", &win(false, ""));
-            eng.sync(slices, frags).unwrap();
+            if eng.surface_info(WIN).is_some() {
+                eng.set_visible(WIN, false).unwrap();
+            }
+            EventKind::HideWindow
         }
+    };
+    for id in eng.dirty_surfaces() {
+        let _ = eng.paint_surface(id).unwrap();
     }
-    let _out = eng.paint(view.clone()).unwrap();
-    eng.last_timings().paint_ns
+    if !eng.dirty_surfaces().contains(&CHROME) {
+        let _ = eng.paint_surface(CHROME).unwrap();
+    }
+    (kind, t0.elapsed().as_nanos() as u64)
 }
 
-fn bench_resolution(label: &str, phys_w: u32, phys_h: u32) {
-    // Author CSS at 1.0 logical = physical for the bench (scale 1.0).
+fn boot_engine(phys_w: u32, phys_h: u32, budget: u64) -> (Engine, MemSlices, Frags, Viewport) {
     let css_w = phys_w;
     let css_h = phys_h;
     let mut eng = Engine::new(EngineConfig {
         max_paint_ns: 50_000_000,
         pending_timeout_frames: 120,
         paint_mode: PaintMode::Exact,
+        hidden_surface_budget_bytes: budget,
     });
     eng.declare_actions(&["time.set_speed", "act.do", "win.open"]);
-    eng.load_html(&page(css_w, css_h)).unwrap();
+    let chrome_view = Viewport::with_scale(phys_w, phys_h, 1.0);
+    eng.open_surface(
+        CHROME,
+        &chrome_page(css_w, css_h),
+        chrome_view,
+        SurfaceOpts {
+            visible: true,
+            pinned: true,
+        },
+    )
+    .unwrap();
 
-    let mut slices = MemSlices::new();
+    let slices = MemSlices::new();
     let mut frags = Frags::new();
     frags.set("sec-chips", &chips("1x"));
     frags.set("sec-date", &date(1));
     frags.set("sec-ticker", &ticker(0));
-    frags.set("sec-win", &win(false, ""));
-    eng.sync(&slices, &mut frags).unwrap();
+    eng.sync_surface(CHROME, &slices, &mut frags).unwrap();
+    let _ = eng.paint_surface(CHROME).unwrap();
 
-    let view = Viewport::with_scale(phys_w, phys_h, 1.0);
+    let win_view = Viewport::with_scale(560, 360, 1.0);
+    (eng, slices, frags, win_view)
+}
+
+fn bench_resolution(label: &str, phys_w: u32, phys_h: u32) {
+    let (mut eng, mut slices, mut frags, win_view) =
+        boot_engine(phys_w, phys_h, DEFAULT_HIDDEN_SURFACE_BUDGET_BYTES);
 
     let mut acc = Acc::default();
     for i in 0..(WARMUP + FRAMES) {
-        let paint_ns = step_sequence(i, &mut eng, &mut slices, &mut frags, &view);
+        let (kind, frame_ns) = step_sequence(i, &mut eng, &mut slices, &mut frags, &win_view);
         if i >= WARMUP {
-            acc.record(&eng, paint_ns);
+            acc.record(&eng, kind, frame_ns);
         }
     }
-    acc.report(label);
+    acc.report(label, &eng);
+}
+
+fn bench_open_paths(phys_w: u32, phys_h: u32) {
+    let win_view = Viewport::with_scale(560, 360, 1.0);
+    let html = win_page("open-path");
+    const N: usize = 40;
+    const W: usize = 5;
+
+    let mut cold = Vec::new();
+    let mut predrawn = Vec::new();
+    let mut reopened = Vec::new();
+
+    for i in 0..(W + N) {
+        let mut eng = Engine::new(EngineConfig {
+            max_paint_ns: 50_000_000,
+            paint_mode: PaintMode::Exact,
+            ..Default::default()
+        });
+        eng.declare_actions(&["act.do"]);
+        let t0 = std::time::Instant::now();
+        eng.open_surface(
+            WIN,
+            &html,
+            win_view.clone(),
+            SurfaceOpts {
+                visible: true,
+                pinned: false,
+            },
+        )
+        .unwrap();
+        let _ = eng.paint_surface(WIN).unwrap();
+        let cold_ns = t0.elapsed().as_nanos() as u64;
+
+        let mut eng2 = Engine::new(EngineConfig {
+            max_paint_ns: 50_000_000,
+            paint_mode: PaintMode::Exact,
+            ..Default::default()
+        });
+        eng2.declare_actions(&["act.do"]);
+        eng2.open_surface(
+            WIN,
+            &html,
+            win_view.clone(),
+            SurfaceOpts {
+                visible: false,
+                pinned: false,
+            },
+        )
+        .unwrap();
+        let t1 = std::time::Instant::now();
+        eng2.set_visible(WIN, true).unwrap();
+        let _ = eng2.paint_surface(WIN).unwrap();
+        let pre_ns = t1.elapsed().as_nanos() as u64;
+
+        let tiny = estimate_surface_engine_bytes(560, 360, &html) / 2;
+        let mut eng3 = Engine::new(EngineConfig {
+            max_paint_ns: 50_000_000,
+            paint_mode: PaintMode::Exact,
+            hidden_surface_budget_bytes: tiny.max(1),
+            ..Default::default()
+        });
+        eng3.declare_actions(&["act.do"]);
+        eng3.open_surface(
+            WIN,
+            &html,
+            win_view.clone(),
+            SurfaceOpts {
+                visible: false,
+                pinned: false,
+            },
+        )
+        .unwrap();
+        eng3.open_surface(
+            SurfaceId(9),
+            &html,
+            win_view.clone(),
+            SurfaceOpts {
+                visible: false,
+                pinned: false,
+            },
+        )
+        .unwrap();
+        assert!(eng3.surface_info(WIN).unwrap().evicted);
+        let t2 = std::time::Instant::now();
+        eng3.set_visible(WIN, true).unwrap();
+        let _ = eng3.paint_surface(WIN).unwrap();
+        let reopen_ns = t2.elapsed().as_nanos() as u64;
+
+        if i >= W {
+            cold.push(cold_ns);
+            predrawn.push(pre_ns);
+            reopened.push(reopen_ns);
+        }
+        let _ = (eng, eng2, eng3, phys_w, phys_h);
+    }
+
+    println!();
+    println!("### Dedicated open paths (560×360 window, {phys_w}×{phys_h} chrome context unused)");
+    println!("| Event | n | mean ms | p95 ms | p99 ms |");
+    println!("|---|---|---|---|---|");
+    report_row(EventKind::ColdOpen.label(), &cold);
+    report_row(EventKind::PredrawnShow.label(), &predrawn);
+    report_row(EventKind::EvictedReopen.label(), &reopened);
+}
+
+fn bench_eviction_pressure(phys_w: u32, phys_h: u32) {
+    let html = win_page("evac");
+    let one = estimate_surface_engine_bytes(560, 360, &html);
+    let (mut eng, mut slices, mut frags, win_view) = boot_engine(phys_w, phys_h, one + 1024);
+
+    let mut eviction_frames = Vec::new();
+    let mut other_frames = Vec::new();
+    let mut prev_evictions = eng.surface_memory_stats().eviction_count;
+
+    for i in 0..(WARMUP + FRAMES) {
+        let before = eng.surface_memory_stats().eviction_count;
+        // Cycle hidden windows to force LRU eviction.
+        if i % 3 == 0 {
+            let sid = SurfaceId(100 + (i % 5) as u64);
+            let _ = eng.close_surface(sid);
+            eng.open_surface(
+                sid,
+                &html,
+                win_view.clone(),
+                SurfaceOpts {
+                    visible: false,
+                    pinned: false,
+                },
+            )
+            .unwrap();
+        }
+        let (kind, frame_ns) = step_sequence(i, &mut eng, &mut slices, &mut frags, &win_view);
+        let after = eng.surface_memory_stats().eviction_count;
+        if i >= WARMUP {
+            if after > before || after > prev_evictions {
+                eviction_frames.push(frame_ns);
+            } else {
+                other_frames.push((kind, frame_ns));
+            }
+            prev_evictions = after;
+        }
+    }
+
+    println!();
+    println!("### Eviction-pressure run (budget ≈ one mid window, {phys_w}×{phys_h})");
+    println!(
+        "evictions total={}  last_eviction={:.3} ms",
+        eng.surface_memory_stats().eviction_count,
+        eng.surface_memory_stats().last_eviction_ns as f64 / 1e6
+    );
+    println!("| Event | n | mean ms | p95 ms | p99 ms |");
+    println!("|---|---|---|---|---|");
+    report_row(EventKind::Eviction.label(), &eviction_frames);
+    let mut by: HashMap<EventKind, Vec<u64>> = HashMap::new();
+    for (k, t) in other_frames {
+        by.entry(k).or_default().push(t);
+    }
+    for kind in [
+        EventKind::SliceUpdate,
+        EventKind::Hover,
+        EventKind::ColdOpen,
+        EventKind::HideWindow,
+    ] {
+        report_row(
+            kind.label(),
+            by.get(&kind).map(|v| v.as_slice()).unwrap_or(&[]),
+        );
+    }
 }
 
 fn main() {
@@ -303,9 +649,16 @@ fn main() {
                 .map(|l| l.split(':').nth(1).unwrap_or("").trim().to_string())
         })
         .unwrap_or_else(|| "unknown CPU".into());
-    println!("paint_bench (Exact mode) — CPU: {cpu}");
+    println!("paint_bench step 2 (Exact mode, multi-surface) — CPU: {cpu}");
     println!("warmup={WARMUP} measured_frames={FRAMES}");
+    println!(
+        "Note: the scripted sequence cold-opens a non-pinned window on every 8th frame \
+         (case 6). Mainnet Pause-family windows are pinned/pre-drawn; steady-play p99 \
+         excludes those cold opens."
+    );
     bench_resolution("720p  (1280x720)", 1280, 720);
     bench_resolution("1080p (1920x1080)", 1920, 1080);
     bench_resolution("1440p (2560x1440)", 2560, 1440);
+    bench_open_paths(1920, 1080);
+    bench_eviction_pressure(1920, 1080);
 }

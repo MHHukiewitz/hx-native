@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use crate::types::SurfaceId;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EngineError {
     /// `hx-post` names an action not passed to `declare_actions`.
@@ -24,6 +26,11 @@ pub enum EngineError {
     Paint(String),
     /// Engine used before `load_html`.
     NotLoaded,
+    /// No surface with this id is open.
+    UnknownSurface(SurfaceId),
+    /// The surface was evicted by the hidden-surface budget; `set_visible(id, true)`
+    /// rebuilds it.
+    SurfaceEvicted(SurfaceId),
     /// Internal invariant broken (tests fail loudly).
     Internal(String),
 }
@@ -48,6 +55,10 @@ impl fmt::Display for EngineError {
             }
             EngineError::Paint(msg) => write!(f, "paint error: {msg}"),
             EngineError::NotLoaded => write!(f, "engine has no loaded HTML"),
+            EngineError::UnknownSurface(id) => write!(f, "{id} is not open"),
+            EngineError::SurfaceEvicted(id) => {
+                write!(f, "{id} was evicted; set_visible(true) rebuilds it")
+            }
             EngineError::Internal(msg) => write!(f, "internal error: {msg}"),
         }
     }

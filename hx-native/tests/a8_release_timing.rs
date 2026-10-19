@@ -82,6 +82,7 @@ fn boot() -> (Engine, MemSlices, Frags) {
         max_paint_ns: 16_600_000, // honest ideal frame; we report, not hard-fail vs FRAME_BUDGET here
         pending_timeout_frames: 120,
         paint_mode: PaintMode::Exact,
+        ..Default::default()
     });
     eng.declare_actions(&[
         "time.pause",

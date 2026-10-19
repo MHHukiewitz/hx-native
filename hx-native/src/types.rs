@@ -12,6 +12,11 @@ pub struct EngineConfig {
     pub pending_timeout_frames: u32,
     /// Partial-raster strategy. Default is [`PaintMode::Exact`] (byte-identical).
     pub paint_mode: PaintMode,
+    /// Upper bound on estimated bytes held by hidden, unpinned, live surfaces.
+    /// Above it, the least recently used of them are evicted (see
+    /// [`Engine::set_visible`](crate::Engine::set_visible)). Defaults to
+    /// [`DEFAULT_HIDDEN_SURFACE_BUDGET_BYTES`].
+    pub hidden_surface_budget_bytes: u64,
 }
 
 impl Default for EngineConfig {
@@ -20,8 +25,99 @@ impl Default for EngineConfig {
             max_paint_ns: 8_000_000, // ~8ms default headroom inside a 16.6ms frame
             pending_timeout_frames: 120,
             paint_mode: PaintMode::Exact,
+            hidden_surface_budget_bytes: DEFAULT_HIDDEN_SURFACE_BUDGET_BYTES,
         }
     }
+}
+
+const MIB: u64 = 1024 * 1024;
+
+/// Default for [`EngineConfig::hidden_surface_budget_bytes`].
+pub const DEFAULT_HIDDEN_SURFACE_BUDGET_BYTES: u64 = 16 * MIB;
+
+/// When the estimated bytes of all live pinned surfaces exceed this, the engine
+/// logs a warning (pinned surfaces are never evicted).
+pub const PINNED_SURFACE_WARN_BYTES: u64 = 32 * MIB;
+
+/// Layout size of a surface created by [`Engine::load_html`](crate::Engine::load_html)
+/// before the host has passed a viewport to `paint`.
+pub const DEFAULT_SURFACE_WIDTH: u32 = 800;
+/// See [`DEFAULT_SURFACE_WIDTH`].
+pub const DEFAULT_SURFACE_HEIGHT: u32 = 120;
+
+/// Host-chosen key for one HTML document + RGBA buffer inside an [`Engine`](crate::Engine).
+///
+/// [`SurfaceId::DEFAULT`] is the surface the single-document API
+/// (`load_html`, `sync`, `input`, `paint(viewport)`, ...) operates on.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Ord, PartialOrd)]
+pub struct SurfaceId(pub u64);
+
+impl SurfaceId {
+    pub const DEFAULT: SurfaceId = SurfaceId(0);
+}
+
+impl fmt::Display for SurfaceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "surface#{}", self.0)
+    }
+}
+
+/// Options for [`Engine::open_surface`](crate::Engine::open_surface).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SurfaceOpts {
+    /// Hidden surfaces still run style, layout and a first raster on open
+    /// (pre-drawn), but are never reported by `dirty_surfaces` unless pinned.
+    pub visible: bool,
+    /// Pinned surfaces are never evicted. Their bytes are reported by
+    /// [`Engine::pinned_bytes`](crate::Engine::pinned_bytes).
+    pub pinned: bool,
+}
+
+impl Default for SurfaceOpts {
+    fn default() -> Self {
+        Self {
+            visible: true,
+            pinned: false,
+        }
+    }
+}
+
+/// Snapshot of one surface's host-visible state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SurfaceInfo {
+    pub visible: bool,
+    pub pinned: bool,
+    /// True when the document and buffer were dropped by the hidden-surface
+    /// budget. `set_visible(true)` rebuilds it from the stored HTML.
+    pub evicted: bool,
+    pub width: u32,
+    pub height: u32,
+    pub scale: f64,
+    /// Estimated engine bytes ([`crate::estimate_surface_engine_bytes`]); 0 when evicted.
+    pub estimated_bytes: u64,
+}
+
+/// Engine-wide surface memory accounting (estimates; see [`crate::estimate_surface_engine_bytes`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SurfaceMemoryStats {
+    pub live_surfaces: usize,
+    pub evicted_surfaces: usize,
+    /// Estimated bytes of every live surface.
+    pub live_bytes: u64,
+    /// Estimated bytes of hidden, unpinned, live surfaces (what the budget limits).
+    pub hidden_unpinned_bytes: u64,
+    /// Estimated bytes of live pinned surfaces (never evicted).
+    pub pinned_bytes: u64,
+    /// [`EngineConfig::hidden_surface_budget_bytes`].
+    pub hidden_budget_bytes: u64,
+    /// Surfaces evicted since engine creation.
+    pub eviction_count: u64,
+    /// Wall time of the most recent eviction (dropping document + buffer), in ns.
+    pub last_eviction_ns: u64,
+    /// Evicted surfaces rebuilt by `set_visible(true)` since engine creation.
+    pub rebuild_count: u64,
+    /// Wall time of the most recent cold rebuild (parse + style + layout), in ns.
+    pub last_rebuild_ns: u64,
 }
 
 /// How partial damage rects are rasterized.
@@ -40,7 +136,8 @@ pub enum PaintMode {
 }
 
 /// Deterministic: starts at 1 per engine, +1 per emitted Action (incl. queued
-/// releases), never reused, never persisted.
+/// releases), never reused, never persisted. One counter per engine, shared by
+/// every surface.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Ord, PartialOrd)]
 pub struct RequestId(pub u64);
 
@@ -196,6 +293,9 @@ pub struct PaintStats {
     /// True when this frame was a forced full repaint (first frame, resize, scale,
     /// theme/stylesheet, or area fallback).
     pub full_repaint: bool,
+    /// True when `damage` was widened to the full surface because the surface
+    /// just became visible (or was rebuilt), so the host must re-upload it all.
+    pub full_host_upload: bool,
 }
 
 /// RGBA8 image buffer (software / G1 path).
