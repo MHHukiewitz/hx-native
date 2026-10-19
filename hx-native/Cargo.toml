@@ -52,6 +52,10 @@ path = "tests/partial_repaint.rs"
 name = "paint_bench"
 path = "examples/paint_bench.rs"
 
+[[example]]
+name = "surface_probe"
+path = "examples/surface_probe.rs"
+
 [[bin]]
 name = "check_deps"
 path = "src/bin/check_deps.rs"
