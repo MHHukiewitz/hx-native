@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>hx-native time-strip fixture (engine test data — not a Designer mock)</title>
+  <style>
+    :root {
+      --strip-bg: #1a1f2a;
+      --strip-fg: #e8ecf4;
+      --chip-bg: #2d3648;
+      --chip-active: #3d7ea6;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "DejaVu Sans", sans-serif;
+      background: var(--strip-bg);
+      color: var(--strip-fg);
+      width: 800px;
+      height: 120px;
+      overflow: hidden;
+    }
+    #time-strip {
+      position: absolute;
+      left: 0; top: 0;
+      width: 800px; height: 120px;
+      display: block;
+    }
+    #time-body {
+      position: absolute;
+      left: 8px; top: 8px;
+      width: 280px; height: 40px;
+      line-height: 40px;
+      font-size: 18px;
+    }
+    button {
+      position: absolute;
+      height: 40px;
+      width: 100px;
+      border: 1px solid #556;
+      background: var(--chip-bg);
+      color: var(--strip-fg);
+      font-size: 14px;
+    }
+    button:disabled { opacity: 0.4; }
+    #btn-pause { left: 300px; top: 8px; }
+    #btn-speed { left: 410px; top: 8px; }
+    #btn-menu { left: 520px; top: 8px; }
+    #btn-bulk { left: 630px; top: 8px; }
+    #btn-ctx { left: 300px; top: 60px; width: 140px; }
+    #spinner {
+      position: absolute;
+      left: 8px; top: 60px;
+      width: 24px; height: 24px;
+      background: transparent;
+    }
+    #spinner.hx-request { background: #c44; }
+    .hx-request { outline: 2px solid #c44; }
+  </style>
+</head>
+<body>
+  <!--
+    FIXTURE (engine-owned test data). Not a Designer mock.
+    Section `time-strip` listens to slice:time and swaps into #time-body.
+  -->
+  <section
+    id="time-strip"
+    hx-trigger="slice:time"
+    hx-target="#time-body"
+    hx-swap="innerHTML"
+  >
+    <div id="time-body">DATE 0000-00-00 · 1x</div>
+  </section>
+
+  <button
+    id="btn-pause"
+    hx-post="time.pause"
+    hx-trigger="click"
+    hx-indicator="#spinner"
+    hx-sync="drop"
+  >Pause</button>
+
+  <button
+    id="btn-speed"
+    hx-post="time.set_speed"
+    hx-trigger="click"
+    hx-indicator="#spinner"
+    hx-sync="queue"
+  >Speed</button>
+
+  <button
+    id="btn-menu"
+    hx-post="time.pause_menu"
+    hx-trigger="click, keydown[key=='Enter'] from:body"
+  >Menu</button>
+
+  <button
+    id="btn-bulk"
+    hx-post="time.set_speed.bulk"
+    hx-trigger="click[shiftKey]"
+  >Bulk</button>
+
+  <button
+    id="btn-ctx"
+    hx-post="time.context"
+    hx-trigger="contextmenu"
+  >Context</button>
+
+  <div id="spinner" aria-hidden="true"></div>
+</body>
+</html>

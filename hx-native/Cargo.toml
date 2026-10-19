@@ -1,0 +1,44 @@
+[package]
+name = "hx-native"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "In-process HTMX-style fragment engine for native Rust apps (offline, no JS)"
+readme = "../README.md"
+keywords = ["htmx", "html", "css", "ui", "offline"]
+categories = ["gui", "rendering"]
+
+[lib]
+name = "hx_native"
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[dependencies]
+# Blitz HTML/CSS surface (pinned; no blitz-net; no wgpu in default features)
+blitz-dom = { version = "=0.3.0-beta.4", default-features = false, features = ["svg", "woff", "accessibility"] }
+blitz-html = { version = "=0.3.0-beta.4", default-features = false }
+blitz-paint = { version = "=0.3.0-beta.4", default-features = false }
+blitz-traits = { version = "=0.3.0-beta.4", default-features = false }
+
+# anyrender + vello_cpu path compatible with Blitz 0.3.0-beta.4 (anyrender ^0.14)
+anyrender = "0.14"
+anyrender_vello_cpu = "0.18"
+
+[dev-dependencies]
+serde_json = "1"
+
+[[test]]
+name = "acceptance"
+path = "tests/acceptance.rs"
+
+[[test]]
+name = "a8_release_timing"
+path = "tests/a8_release_timing.rs"
+
+[[bin]]
+name = "check_deps"
+path = "src/bin/check_deps.rs"
