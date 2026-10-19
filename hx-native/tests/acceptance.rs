@@ -700,12 +700,23 @@ fn a6b_blocked_race_fallback() {
 // A8 — Paint budget (debug smoke) + clean-frame skip
 // ---------------------------------------------------------------------------
 /// Debug-profile smoke only. It does **not** claim FRAME_BUDGET compliance.
-/// What it guards: paint completes, reports timing when dirty, and respects
-/// `max_paint_ns` as a generous debug ceiling (50 ms via `boot`). Real chrome
-/// budget numbers: `cargo test --release --test a8_release_timing`.
+/// What it guards: paint completes, reports timing when dirty, and stays under
+/// a generous debug ceiling (100 ms here — GHA debug builds can exceed 50 ms
+/// on a cold first raster). Real chrome budget numbers:
+/// `cargo test --release --test a8_release_timing`.
 #[test]
 fn a8_paint_budget() {
-    let mut eng = boot(FIXTURE);
+    // Own config: wider ceiling than `boot`'s 50 ms so CI debug noise does not
+    // flake this smoke check. Engine behaviour is unchanged.
+    const DEBUG_CEILING_NS: u64 = 100_000_000;
+    let mut eng = Engine::new(EngineConfig {
+        max_paint_ns: DEBUG_CEILING_NS,
+        pending_timeout_frames: 5,
+        paint_mode: PaintMode::Exact,
+        ..Default::default()
+    });
+    eng.declare_actions(default_actions());
+    eng.load_html(FIXTURE).expect("load_html");
     let slices = MemSlices::new();
     let mut frags = SpyFrags::new();
     eng.sync(&slices, &mut frags).unwrap();
