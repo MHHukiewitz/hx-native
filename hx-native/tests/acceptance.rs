@@ -1211,3 +1211,108 @@ fn a21_tab_focus_order() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// HTML contract §2 — strict attribute dialect at load_html / swap fragments
+// ---------------------------------------------------------------------------
+
+fn load_err(html: &str) -> EngineError {
+    let mut eng = Engine::new(EngineConfig::default());
+    eng.declare_actions(default_actions());
+    let wrapped = format!("<!DOCTYPE html><html><body>{html}</body></html>");
+    eng.load_html(&wrapped).expect_err("expected load error")
+}
+
+#[test]
+fn strict_unknown_hx_attribute_fails_load() {
+    // Rule 1: any hx-* / data-hx-* outside the locked set is a load error.
+    for html in [
+        r##"<button id="b" hx-post="time.pause" hx-get="/x">x</button>"##,
+        r##"<button id="b" hx-post="time.pause" hx-vals='{}'>x</button>"##,
+        r##"<button id="b" hx-post="time.pause" hx-on="click:1">x</button>"##,
+        r##"<button id="b" hx-post="time.pause" hx-boost="true">x</button>"##,
+        r##"<button id="b" hx-post="time.pause" hx-select="#a">x</button>"##,
+        r##"<div id="d" data-hx-post="time.pause">x</div>"##,
+    ] {
+        let err = load_err(html);
+        assert!(
+            matches!(err, EngineError::InvalidAttribute { .. }),
+            "expected InvalidAttribute for {html}, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn strict_data_hx_reason_fails_load() {
+    // Rule 2: data-hx-reason is engine-written only.
+    let err = load_err(r##"<button id="b" hx-post="time.pause" data-hx-reason="nope">x</button>"##);
+    match err {
+        EngineError::InvalidAttribute { attr, .. } => assert_eq!(attr, "data-hx-reason"),
+        other => panic!("expected InvalidAttribute, got {other:?}"),
+    }
+}
+
+#[test]
+fn strict_hx_swap_and_sync_values_fail_load() {
+    // Rule 3: only innerHTML/outerHTML and drop/queue (existing variants).
+    let swap_err = load_err(r##"<div id="s" hx-trigger="slice:time" hx-swap="beforeend">x</div>"##);
+    assert!(matches!(swap_err, EngineError::UnsupportedSwap { .. }));
+    let sync_err = load_err(r##"<button id="b" hx-post="time.pause" hx-sync="abort">x</button>"##);
+    assert!(matches!(sync_err, EngineError::UnsupportedSync { .. }));
+}
+
+#[test]
+fn strict_hx_target_and_indicator_must_be_resolving_id() {
+    // Rule 4: hx-target / hx-indicator must be #id that resolves.
+    let bad_sel = load_err(
+        r##"<div id="s" hx-trigger="slice:time" hx-target=".box" hx-swap="innerHTML">x</div>"##,
+    );
+    assert!(
+        matches!(bad_sel, EngineError::InvalidAttribute { ref attr, .. } if attr == "hx-target"),
+        "got {bad_sel:?}"
+    );
+    let missing = load_err(
+        r##"<div id="s" hx-trigger="slice:time" hx-target="#missing" hx-swap="innerHTML">x</div>"##,
+    );
+    assert!(
+        matches!(missing, EngineError::InvalidAttribute { ref attr, .. } if attr == "hx-target"),
+        "got {missing:?}"
+    );
+    let ind_fmt = load_err(
+        r##"<button id="b" hx-post="time.pause" hx-indicator="spinner">x</button><div id="spinner"></div>"##,
+    );
+    assert!(
+        matches!(ind_fmt, EngineError::InvalidAttribute { ref attr, .. } if attr == "hx-indicator"),
+        "got {ind_fmt:?}"
+    );
+    let ind_miss =
+        load_err(r##"<button id="b" hx-post="time.pause" hx-indicator="#nope">x</button>"##);
+    assert!(
+        matches!(ind_miss, EngineError::InvalidAttribute { ref attr, .. } if attr == "hx-indicator"),
+        "got {ind_miss:?}"
+    );
+}
+
+#[test]
+fn strict_bad_fragment_errors_on_sync_not_applied() {
+    // Rule 5: fragment validation uses the sync EngineError channel; DOM unchanged.
+    let mut eng = boot(FIXTURE);
+    let mut slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    eng.sync(&slices, &mut frags).unwrap();
+    let before = eng.serialize_html().unwrap();
+
+    frags.set(
+        "time-strip",
+        r##"<span id="time-label" hx-get="/evil">DATE bad</span>"##,
+    );
+    slices.bump("time");
+    let err = eng.sync(&slices, &mut frags).expect_err("bad fragment");
+    assert!(
+        matches!(err, EngineError::InvalidAttribute { .. }),
+        "expected InvalidAttribute from sync, got {err:?}"
+    );
+    let after = eng.serialize_html().unwrap();
+    assert_eq!(before, after, "bad fragment must not be applied");
+    assert!(!after.contains("DATE bad"));
+}
