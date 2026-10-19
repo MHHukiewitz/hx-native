@@ -10,9 +10,9 @@ use blitz_dom::{
 use blitz_html::{HtmlDocument, HtmlProvider};
 use blitz_traits::shell::{ColorScheme, Viewport as BlitzViewport};
 
-use crate::dialect::{ElementBinding, SwapMode, SyncMode};
+use crate::dialect::{validate_loaded_attrs, ElementBinding, SwapMode, SyncMode};
 use crate::error::EngineError;
-use crate::focus::{focusable_ids, step_focus};
+use crate::focus::{focusable_ids, ids_in_document_order, step_focus};
 use crate::fonts::bundled_font_context;
 use crate::paint::paint_rgba;
 use crate::pending::{PendingEntry, PendingState, QueuedRelease};
@@ -121,22 +121,11 @@ impl Engine {
         self.bindings.clear();
         self.sections.clear();
 
-        let font_ctx = bundled_font_context();
-        let (w, h) = self.layout_viewport;
-        let mut doc = HtmlDocument::from_html(
-            html,
-            DocumentConfig {
-                viewport: Some(BlitzViewport::new(w, h, 1.0, ColorScheme::Light)),
-                html_parser_provider: Some(Arc::new(HtmlProvider)),
-                font_ctx: Some(font_ctx),
-                style_threading: StyleThreading::Sequential,
-                incremental: Some(true),
-                net_provider: None,
-                ..Default::default()
-            },
-        );
+        let mut doc = parse_html_document(html, self.layout_viewport);
 
-        // Index dialect attributes; validate actions + triggers + swap/sync.
+        // HTML contract §2: strict dialect on loaded HTML, then index bindings.
+        let known_ids = collect_element_ids(&doc);
+        self.validate_loaded_tree(&doc, &known_ids)?;
         self.index_document(&doc)?;
 
         doc.resolve(0.0);
@@ -146,6 +135,68 @@ impl Engine {
         self.cached_rgba = None;
         self.mark_paint_dirty();
         Ok(())
+    }
+
+    /// Walk a freshly parsed tree (document or fragment) and enforce the locked
+    /// attribute dialect. Does **not** run on live-DOM reindex after the engine
+    /// writes `data-hx-reason`.
+    fn validate_loaded_tree(
+        &self,
+        doc: &HtmlDocument,
+        known_ids: &HashSet<String>,
+    ) -> Result<(), EngineError> {
+        let root = doc.root_node().id;
+        let mut stack = vec![root];
+        while let Some(nid) = stack.pop() {
+            let Some(node) = doc.get_node(nid) else {
+                continue;
+            };
+            for &child in &node.children {
+                stack.push(child);
+            }
+            if !node.is_element() {
+                continue;
+            }
+            let (id_attr, attrs) = element_id_and_attrs(node);
+            validate_loaded_attrs(&id_attr, &attrs, known_ids)?;
+            if let Some(binding) = ElementBinding::from_attrs(&id_attr, &attrs)? {
+                if let Some(ref action) = binding.hx_post {
+                    if !self.declared_actions.contains(action) {
+                        return Err(EngineError::UndeclaredAction {
+                            name: action.clone(),
+                            source_id: binding.id.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate fragment HTML **before** applying a swap so a bad fragment is
+    /// never silently inserted. Errors surface on `sync` via `EngineError`.
+    ///
+    /// `hx-target` / `hx-indicator` `#id` refs resolve against the document **as
+    /// it will be after the swap**: current document ids, minus ids the swap
+    /// removes, plus ids introduced by the fragment. Sibling indicators outside
+    /// the swap target (e.g. `#tstrip-ind` next to `#tstrip-chips`) therefore
+    /// resolve; ids that only lived inside the replaced subtree do not.
+    fn validate_fragment_html(
+        &self,
+        html: &str,
+        target_nid: NodeId,
+        swap: SwapMode,
+    ) -> Result<(), EngineError> {
+        let frag_doc = parse_html_document(html, self.layout_viewport);
+        let doc = self.doc.as_ref().ok_or(EngineError::NotLoaded)?;
+        let mut known_ids = collect_element_ids(doc);
+        for id in ids_removed_by_swap(doc, target_nid, swap) {
+            known_ids.remove(&id);
+        }
+        for id in collect_element_ids(&frag_doc) {
+            known_ids.insert(id);
+        }
+        self.validate_loaded_tree(&frag_doc, &known_ids)
     }
 
     fn index_document(&mut self, doc: &HtmlDocument) -> Result<(), EngineError> {
@@ -161,25 +212,7 @@ impl Engine {
             if !node.is_element() {
                 continue;
             }
-            let id_attr = node
-                .attrs()
-                .and_then(|attrs| {
-                    attrs
-                        .iter()
-                        .find(|a| &*a.name.local == "id")
-                        .map(|a| a.value.to_string())
-                })
-                .unwrap_or_default();
-
-            let attrs: Vec<(String, String)> = node
-                .attrs()
-                .map(|list| {
-                    list.iter()
-                        .map(|a| (a.name.local.to_string(), a.value.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
-
+            let (id_attr, attrs) = element_id_and_attrs(node);
             if let Some(binding) = ElementBinding::from_attrs(&id_attr, &attrs)? {
                 if let Some(ref action) = binding.hx_post {
                     if !self.declared_actions.contains(action) {
@@ -216,23 +249,7 @@ impl Engine {
             if !node.is_element() {
                 continue;
             }
-            let id_attr = node
-                .attrs()
-                .and_then(|attrs| {
-                    attrs
-                        .iter()
-                        .find(|a| &*a.name.local == "id")
-                        .map(|a| a.value.to_string())
-                })
-                .unwrap_or_default();
-            let attrs: Vec<(String, String)> = node
-                .attrs()
-                .map(|list| {
-                    list.iter()
-                        .map(|a| (a.name.local.to_string(), a.value.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let (id_attr, attrs) = element_id_and_attrs(node);
             if let Some(binding) = ElementBinding::from_attrs(&id_attr, &attrs)? {
                 if let Some(ref action) = binding.hx_post {
                     if !self.declared_actions.contains(action) {
@@ -354,6 +371,10 @@ impl Engine {
             .unwrap_or_else(|| format!("#{section_id}"));
         let target_id = self.resolve_selector(&target_sel)?;
         let swap = binding.hx_swap;
+
+        // Same dialect rules as load_html; failure returns EngineError from sync
+        // and leaves the previous DOM in place for this section.
+        self.validate_fragment_html(html, target_id, swap)?;
 
         match swap {
             SwapMode::InnerHtml => {
@@ -984,38 +1005,67 @@ impl Engine {
             }
         }
 
-        // (d) from:body / from:document triggers.
+        // (d) from:body / from:document triggers — document order; prefer enabled.
+        // Among filter matches: first ENABLED (not greyed) emits Action; greyed
+        // matches are skipped; if every match is greyed → Blocked with the first
+        // greyed match's reason (Designer pause/resume Space pattern).
         {
             let ctx = filter_ctx_from_key(&key);
-            let candidates: Vec<(String, _)> = self
-                .bindings
-                .iter()
-                .flat_map(|(id, b)| {
-                    b.triggers
-                        .iter()
-                        .filter(|t| t.event == event && t.from == Some(FromTarget::Body))
-                        .map(|t| (id.clone(), t.clone()))
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-            for (id, t) in candidates {
-                if matches!(event, TriggerEvent::KeyDown)
-                    && key.repeat
-                    && !keydown_repeat_allowed(&t.filter, true)
-                {
+            let order = self
+                .doc
+                .as_ref()
+                .map(ids_in_document_order)
+                .unwrap_or_default();
+            let trigger_info = TriggerInfo::Key {
+                event: if key.pressed { "keydown" } else { "keyup" },
+                key: key.key.clone(),
+                code: key.code.clone(),
+                mods: key.mods,
+                repeat: key.repeat,
+            };
+            let mut first_greyed: Option<(String, String, String)> = None;
+            for id in order {
+                let Some(binding) = self.bindings.get(&id).cloned() else {
+                    continue;
+                };
+                let Some(action_name) = binding.hx_post.clone() else {
+                    continue;
+                };
+                let mut matched = false;
+                for t in &binding.triggers {
+                    if t.event != event || t.from != Some(FromTarget::Body) {
+                        continue;
+                    }
+                    if matches!(event, TriggerEvent::KeyDown)
+                        && key.repeat
+                        && !keydown_repeat_allowed(&t.filter, true)
+                    {
+                        continue;
+                    }
+                    let ok = t.filter.as_ref().map(|f| f.eval(&ctx)).unwrap_or(true);
+                    if ok {
+                        matched = true;
+                        break;
+                    }
+                }
+                if !matched {
                     continue;
                 }
-                let ok = t.filter.as_ref().map(|f| f.eval(&ctx)).unwrap_or(true);
-                if ok {
-                    let trigger_info = TriggerInfo::Key {
-                        event: if key.pressed { "keydown" } else { "keyup" },
-                        key: key.key.clone(),
-                        code: key.code.clone(),
-                        mods: key.mods,
-                        repeat: key.repeat,
-                    };
-                    return self.fire_on(&id, event, ctx, trigger_info, None, true);
+                if let Some(reason) = self.disabled_actions.get(&action_name).cloned() {
+                    if first_greyed.is_none() {
+                        first_greyed = Some((id, action_name, reason));
+                    }
+                    continue;
                 }
+                return self.fire_on(&id, event, ctx, trigger_info, None, true);
+            }
+            if let Some((source_id, name, reason)) = first_greyed {
+                return InputOutcome::Blocked {
+                    name,
+                    reason,
+                    source_id,
+                    trigger: trigger_info,
+                };
             }
         }
 
@@ -1249,6 +1299,96 @@ impl Engine {
     pub fn focusable_ids_for_test(&self) -> Vec<String> {
         self.doc.as_ref().map(focusable_ids).unwrap_or_default()
     }
+}
+
+fn parse_html_document(html: &str, layout_viewport: (u32, u32)) -> HtmlDocument {
+    let font_ctx = bundled_font_context();
+    let (w, h) = layout_viewport;
+    HtmlDocument::from_html(
+        html,
+        DocumentConfig {
+            viewport: Some(BlitzViewport::new(w, h, 1.0, ColorScheme::Light)),
+            html_parser_provider: Some(Arc::new(HtmlProvider)),
+            font_ctx: Some(font_ctx),
+            style_threading: StyleThreading::Sequential,
+            incremental: Some(true),
+            net_provider: None,
+            ..Default::default()
+        },
+    )
+}
+
+fn collect_element_ids(doc: &HtmlDocument) -> HashSet<String> {
+    collect_subtree_ids(doc, doc.root_node().id, true)
+}
+
+/// Ids under `root` in document order walk. `include_root` controls whether
+/// `root`'s own `id` is included (outerHTML removes the target; innerHTML keeps it).
+fn collect_subtree_ids(doc: &HtmlDocument, root: NodeId, include_root: bool) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    let mut stack = vec![root];
+    let mut first = true;
+    while let Some(nid) = stack.pop() {
+        let Some(node) = doc.get_node(nid) else {
+            continue;
+        };
+        for &child in &node.children {
+            stack.push(child);
+        }
+        if !node.is_element() {
+            continue;
+        }
+        let take = if first {
+            first = false;
+            include_root
+        } else {
+            true
+        };
+        if !take {
+            continue;
+        }
+        if let Some(id) = node.attrs().and_then(|attrs| {
+            attrs
+                .iter()
+                .find(|a| &*a.name.local == "id")
+                .map(|a| a.value.to_string())
+        }) {
+            if !id.is_empty() {
+                ids.insert(id);
+            }
+        }
+    }
+    ids
+}
+
+fn ids_removed_by_swap(doc: &HtmlDocument, target: NodeId, swap: SwapMode) -> HashSet<String> {
+    match swap {
+        // innerHTML replaces descendants only; the target element (and siblings) stay.
+        SwapMode::InnerHtml => collect_subtree_ids(doc, target, false),
+        // outerHTML replaces the target node itself.
+        SwapMode::OuterHtml => collect_subtree_ids(doc, target, true),
+    }
+}
+
+fn element_id_and_attrs(node: &blitz_dom::Node) -> (String, Vec<(String, String)>) {
+    let id_attr = node
+        .attrs()
+        .and_then(|attrs| {
+            attrs
+                .iter()
+                .find(|a| &*a.name.local == "id")
+                .map(|a| a.value.to_string())
+        })
+        .unwrap_or_default();
+    let attrs: Vec<(String, String)> = node
+        .attrs()
+        .map(|list| {
+            list.iter()
+                .map(|a| (a.name.local.to_string(), a.value.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    (id_attr, attrs)
 }
 
 fn class_tokens(class: &str) -> impl Iterator<Item = &str> {

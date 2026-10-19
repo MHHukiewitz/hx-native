@@ -1,0 +1,41 @@
+<!--
+  Designer time-strip chips fragment (Mainnet PR #686 shape:
+  docs/design/mocks/target/samples/time.strip/chips.html).
+  Inner content of #tstrip-chips. Every button uses hx-indicator="#tstrip-ind"
+  (sibling outside this fragment). No greying attrs — engine writes those.
+-->
+<button id="tstrip-pause"
+  hx-post="time.pause"
+  hx-trigger="click, keydown[key==' '&&!repeat] from:body"
+  hx-indicator="#tstrip-ind"
+  hx-sync="drop">Pause</button>
+<button id="tstrip-resume"
+  hx-post="time.resume"
+  hx-trigger="click, keydown[key==' '&&!repeat] from:body"
+  hx-indicator="#tstrip-ind"
+  hx-sync="drop">Resume</button>
+<button id="tstrip-1x"
+  hx-post="time.set_speed"
+  hx-trigger="click"
+  hx-indicator="#tstrip-ind"
+  hx-sync="drop">1x</button>
+<button id="tstrip-2x"
+  hx-post="time.set_speed"
+  hx-trigger="click"
+  hx-indicator="#tstrip-ind"
+  hx-sync="drop">2x</button>
+<button id="tstrip-5x"
+  hx-post="time.set_speed"
+  hx-trigger="click"
+  hx-indicator="#tstrip-ind"
+  hx-sync="drop">5x</button>
+<button id="tstrip-week"
+  hx-post="time.set_speed"
+  hx-trigger="click"
+  hx-indicator="#tstrip-ind"
+  hx-sync="drop">Week</button>
+<button id="tstrip-month"
+  hx-post="time.set_speed"
+  hx-trigger="click"
+  hx-indicator="#tstrip-ind"
+  hx-sync="drop">Month</button>

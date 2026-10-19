@@ -12,6 +12,14 @@ pub enum EngineError {
     UnsupportedSwap { value: String, source_id: String },
     /// Unsupported `hx-sync` value (outside drop / queue).
     UnsupportedSync { value: String, source_id: String },
+    /// Attribute outside the locked dialect, or an invalid dialect value/target.
+    /// Used for unknown `hx-*` / `data-hx-*` names, engine-only `data-hx-reason`
+    /// in loaded HTML, and `hx-target` / `hx-indicator` that are not a resolving `#id`.
+    InvalidAttribute {
+        id: String,
+        attr: String,
+        reason: String,
+    },
     /// Paint / layout failure.
     Paint(String),
     /// Engine used before `load_html`.
@@ -34,6 +42,9 @@ impl fmt::Display for EngineError {
             }
             EngineError::UnsupportedSync { value, source_id } => {
                 write!(f, "unsupported hx-sync `{value}` on `{source_id}`")
+            }
+            EngineError::InvalidAttribute { id, attr, reason } => {
+                write!(f, "invalid attribute `{attr}` on `{id}`: {reason}")
             }
             EngineError::Paint(msg) => write!(f, "paint error: {msg}"),
             EngineError::NotLoaded => write!(f, "engine has no loaded HTML"),

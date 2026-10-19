@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex};
 use hx_native::*;
 
 const FIXTURE: &str = include_str!("fixtures/time_strip.html");
+const TSTRIP_SHELL: &str = include_str!("fixtures/tstrip_shell.html");
+const CHIPS_FRAGMENT: &str = include_str!("fixtures/chips.html");
 
 fn default_actions() -> &'static [&'static str] {
     &[
@@ -1209,5 +1211,252 @@ fn a21_tab_focus_order() {
             assert_ne!(id, "greyed");
             assert_ne!(id, "skip-neg");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTML contract §2 — strict attribute dialect at load_html / swap fragments
+// ---------------------------------------------------------------------------
+
+fn load_err(html: &str) -> EngineError {
+    let mut eng = Engine::new(EngineConfig::default());
+    eng.declare_actions(default_actions());
+    let wrapped = format!("<!DOCTYPE html><html><body>{html}</body></html>");
+    eng.load_html(&wrapped).expect_err("expected load error")
+}
+
+#[test]
+fn strict_unknown_hx_attribute_fails_load() {
+    // Rule 1: any hx-* / data-hx-* outside the locked set is a load error.
+    for html in [
+        r##"<button id="b" hx-post="time.pause" hx-get="/x">x</button>"##,
+        r##"<button id="b" hx-post="time.pause" hx-vals='{}'>x</button>"##,
+        r##"<button id="b" hx-post="time.pause" hx-on="click:1">x</button>"##,
+        r##"<button id="b" hx-post="time.pause" hx-boost="true">x</button>"##,
+        r##"<button id="b" hx-post="time.pause" hx-select="#a">x</button>"##,
+        r##"<div id="d" data-hx-post="time.pause">x</div>"##,
+    ] {
+        let err = load_err(html);
+        assert!(
+            matches!(err, EngineError::InvalidAttribute { .. }),
+            "expected InvalidAttribute for {html}, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn strict_data_hx_reason_fails_load() {
+    // Rule 2: data-hx-reason is engine-written only.
+    let err = load_err(r##"<button id="b" hx-post="time.pause" data-hx-reason="nope">x</button>"##);
+    match err {
+        EngineError::InvalidAttribute { attr, .. } => assert_eq!(attr, "data-hx-reason"),
+        other => panic!("expected InvalidAttribute, got {other:?}"),
+    }
+}
+
+#[test]
+fn strict_hx_swap_and_sync_values_fail_load() {
+    // Rule 3: only innerHTML/outerHTML and drop/queue (existing variants).
+    let swap_err = load_err(r##"<div id="s" hx-trigger="slice:time" hx-swap="beforeend">x</div>"##);
+    assert!(matches!(swap_err, EngineError::UnsupportedSwap { .. }));
+    let sync_err = load_err(r##"<button id="b" hx-post="time.pause" hx-sync="abort">x</button>"##);
+    assert!(matches!(sync_err, EngineError::UnsupportedSync { .. }));
+}
+
+#[test]
+fn strict_hx_target_and_indicator_must_be_resolving_id() {
+    // Rule 4: hx-target / hx-indicator must be #id that resolves.
+    let bad_sel = load_err(
+        r##"<div id="s" hx-trigger="slice:time" hx-target=".box" hx-swap="innerHTML">x</div>"##,
+    );
+    assert!(
+        matches!(bad_sel, EngineError::InvalidAttribute { ref attr, .. } if attr == "hx-target"),
+        "got {bad_sel:?}"
+    );
+    let missing = load_err(
+        r##"<div id="s" hx-trigger="slice:time" hx-target="#missing" hx-swap="innerHTML">x</div>"##,
+    );
+    assert!(
+        matches!(missing, EngineError::InvalidAttribute { ref attr, .. } if attr == "hx-target"),
+        "got {missing:?}"
+    );
+    let ind_fmt = load_err(
+        r##"<button id="b" hx-post="time.pause" hx-indicator="spinner">x</button><div id="spinner"></div>"##,
+    );
+    assert!(
+        matches!(ind_fmt, EngineError::InvalidAttribute { ref attr, .. } if attr == "hx-indicator"),
+        "got {ind_fmt:?}"
+    );
+    let ind_miss =
+        load_err(r##"<button id="b" hx-post="time.pause" hx-indicator="#nope">x</button>"##);
+    assert!(
+        matches!(ind_miss, EngineError::InvalidAttribute { ref attr, .. } if attr == "hx-indicator"),
+        "got {ind_miss:?}"
+    );
+}
+
+#[test]
+fn strict_bad_fragment_errors_on_sync_not_applied() {
+    // Rule 5: fragment validation uses the sync EngineError channel; DOM unchanged.
+    let mut eng = boot(FIXTURE);
+    let mut slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    eng.sync(&slices, &mut frags).unwrap();
+    let before = eng.serialize_html().unwrap();
+
+    frags.set(
+        "time-strip",
+        r##"<span id="time-label" hx-get="/evil">DATE bad</span>"##,
+    );
+    slices.bump("time");
+    let err = eng.sync(&slices, &mut frags).expect_err("bad fragment");
+    assert!(
+        matches!(err, EngineError::InvalidAttribute { .. }),
+        "expected InvalidAttribute from sync, got {err:?}"
+    );
+    let after = eng.serialize_html().unwrap();
+    assert_eq!(before, after, "bad fragment must not be applied");
+    assert!(!after.contains("DATE bad"));
+
+    // Hand-written data-hx-reason in a swap fragment is also rejected (engine-only).
+    frags.set(
+        "time-strip",
+        r##"<span id="time-label" data-hx-reason="sample">DATE reason</span>"##,
+    );
+    slices.bump("time");
+    let err = eng
+        .sync(&slices, &mut frags)
+        .expect_err("data-hx-reason in fragment");
+    match err {
+        EngineError::InvalidAttribute { attr, .. } => assert_eq!(attr, "data-hx-reason"),
+        other => panic!("expected InvalidAttribute for data-hx-reason, got {other:?}"),
+    }
+    assert_eq!(
+        before,
+        eng.serialize_html().unwrap(),
+        "data-hx-reason fragment must not be applied"
+    );
+}
+
+#[test]
+fn fragment_indicator_resolves_sibling_outside_swap_target() {
+    // Designer chips.html: every button has hx-indicator="#tstrip-ind", and
+    // #tstrip-ind is a sibling of #tstrip-chips (outside the fragment).
+    let mut eng = Engine::new(EngineConfig::default());
+    eng.declare_actions(&["time.pause", "time.resume", "time.set_speed"]);
+    eng.load_html(TSTRIP_SHELL).expect("load tstrip shell");
+
+    let slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    frags.set("time-strip", CHIPS_FRAGMENT);
+    eng.sync(&slices, &mut frags)
+        .expect("chips fragment must apply");
+
+    let html = eng.serialize_html().unwrap();
+    assert!(html.contains("id=\"tstrip-pause\""), "pause chip present");
+    assert!(html.contains("id=\"tstrip-month\""), "7th chip present");
+    assert!(html.contains("id=\"tstrip-ind\""), "sibling indicator kept");
+    assert!(
+        html.matches("hx-indicator=\"#tstrip-ind\"").count() >= 7,
+        "all chips keep hx-indicator to sibling"
+    );
+    // No greying attrs in the Designer sample fragment.
+    assert!(!html.contains("data-hx-reason"));
+}
+
+#[test]
+fn fragment_indicator_missing_id_fails_sync() {
+    let mut eng = Engine::new(EngineConfig::default());
+    eng.declare_actions(&["time.pause", "time.resume", "time.set_speed"]);
+    eng.load_html(TSTRIP_SHELL).expect("load tstrip shell");
+
+    let mut slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    eng.sync(&slices, &mut frags).unwrap();
+    let before = eng.serialize_html().unwrap();
+
+    frags.set(
+        "time-strip",
+        r##"<button id="tstrip-pause" hx-post="time.pause" hx-trigger="click" hx-indicator="#nowhere">Pause</button>"##,
+    );
+    slices.bump("time");
+    let err = eng
+        .sync(&slices, &mut frags)
+        .expect_err("missing indicator id");
+    assert!(
+        matches!(err, EngineError::InvalidAttribute { ref attr, .. } if attr == "hx-indicator"),
+        "got {err:?}"
+    );
+    assert_eq!(before, eng.serialize_html().unwrap());
+}
+
+#[test]
+fn from_body_prefers_first_enabled_in_document_order() {
+    // Designer time-strip: pause + resume share Space from:body; exactly one greyed.
+    let html = r##"<!DOCTYPE html><html><body>
+      <button id="tstrip-pause"
+        hx-post="time.pause"
+        hx-trigger="click, keydown[key==' '&&!repeat] from:body">Pause</button>
+      <button id="tstrip-resume"
+        hx-post="time.resume"
+        hx-trigger="click, keydown[key==' '&&!repeat] from:body">Resume</button>
+    </body></html>"##;
+
+    let mut eng = Engine::new(EngineConfig::default());
+    eng.declare_actions(&["time.pause", "time.resume"]);
+    eng.load_html(html).expect("load designer pair");
+
+    let mut slices = MemSlices::new();
+    slices.actions.push((
+        "time.pause".into(),
+        ActionState::Disabled {
+            reason: "already paused".into(),
+        },
+    ));
+    // resume stays Enabled (absent from Disabled list)
+    let mut frags = SpyFrags::new();
+    eng.sync(&slices, &mut frags).unwrap();
+
+    let space = KeyEvent {
+        key: " ".into(),
+        code: "Space".into(),
+        mods: Modifiers::default(),
+        repeat: false,
+        pressed: true,
+    };
+    // No focus — step (d) only.
+    assert!(eng.focus_state().focused_id.is_none());
+
+    let out = eng.input(InputEvent::Key(space.clone()));
+    match out {
+        InputOutcome::Action {
+            name, source_id, ..
+        } => {
+            assert_eq!(name, "time.resume");
+            assert_eq!(source_id, "tstrip-resume");
+        }
+        other => panic!("expected Action time.resume, got {other:?}"),
+    }
+
+    // Flip: resume Disabled, pause Enabled → Space fires pause.
+    slices.actions.clear();
+    slices.actions.push((
+        "time.resume".into(),
+        ActionState::Disabled {
+            reason: "running".into(),
+        },
+    ));
+    slices.bump("actions");
+    eng.sync(&slices, &mut frags).unwrap();
+
+    let out = eng.input(InputEvent::Key(space));
+    match out {
+        InputOutcome::Action {
+            name, source_id, ..
+        } => {
+            assert_eq!(name, "time.pause");
+            assert_eq!(source_id, "tstrip-pause");
+        }
+        other => panic!("expected Action time.pause after flip, got {other:?}"),
     }
 }

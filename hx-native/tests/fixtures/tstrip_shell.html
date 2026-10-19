@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>tstrip shell — chips target + sibling indicator (engine test)</title>
+  <style>
+    body { width: 800px; height: 120px; margin: 0; font-family: "DejaVu Sans", sans-serif; }
+    #tstrip-chips { position: absolute; left: 8px; top: 8px; height: 40px; }
+    #tstrip-ind { position: absolute; left: 8px; top: 60px; width: 24px; height: 24px; }
+    button { height: 36px; margin-right: 4px; }
+  </style>
+</head>
+<body>
+  <!--
+    Designer shape: section swaps into #tstrip-chips; #tstrip-ind is a sibling
+    outside the fragment (Mainnet samples/time.strip pattern).
+  -->
+  <section
+    id="time-strip"
+    hx-trigger="slice:time"
+    hx-target="#tstrip-chips"
+    hx-swap="innerHTML"
+  >
+    <div id="tstrip-chips"><!-- chips fragment swapped here --></div>
+  </section>
+  <div id="tstrip-ind" aria-hidden="true"></div>
+</body>
+</html>

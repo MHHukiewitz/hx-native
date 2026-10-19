@@ -57,15 +57,17 @@
 
 Steal HTMX *shape*, not the web-server model. Attributes are data on host HTML; the Rust engine interprets them against named slices and typed actions.
 
+**Strict dialect (Mainnet HTML contract §2, locked by Mike 2026-10-19):** **Only these attributes exist.** Anything else is a **load error**, not ignored. The locked set is exactly: `hx-post`, `hx-target`, `hx-swap`, `hx-trigger`, `hx-sync`, `hx-indicator`. Any other attribute whose name starts with `hx-` or `data-hx-` (including htmx extras such as `hx-get`, `hx-vals`, `hx-on`, `hx-boost`, `hx-select`, and `data-hx-*` aliases of the locked names) makes `load_html` return `EngineError::InvalidAttribute`. **`data-hx-reason` must not appear in loaded HTML or swap fragments** — the engine writes it when greying / failing an action; presence in host HTML is `InvalidAttribute`. The same checks run on **fragments** returned from `FragmentSource` before a swap is applied: a bad fragment makes `sync` return `EngineError` and is **never** silently inserted. For fragments, `hx-target` / `hx-indicator` `#id` refs resolve against the document **after** the swap (fragment ids ∪ remaining document ids, minus ids the swap removes) — so a sibling like `#tstrip-ind` outside `#tstrip-chips` is valid.
+
 | Attribute | Meaning in this crate |
 |-----------|------------------------|
 | `hx-post="<action>"` | On trigger, the engine returns `InputOutcome::Action` for `<action>` (the host runs it later). The name must have been passed to `declare_actions` first: `load_html` rejects undeclared names, and a click-time check also fails loudly. |
-| `hx-target="<css-selector>"` | Swap destination inside the current document fragment tree. |
-| `hx-swap="<strategy>"` | **First swap set (Designer lock, 2026-10-19): `innerHTML` and `outerHTML` only.** An element with **no** `hx-swap` attribute **defaults to `innerHTML`** (same as htmx; keeps Canvas parity — decided 2026-10-19). `beforeend` / `afterbegin` are added only when a mock needs them. Any other or unsupported swap mode **fails tests loudly** (and errors in debug builds). |
+| `hx-target="#id"` | Swap destination: **must** be an id selector `#id` that resolves in the loaded document, or — for fragment HTML — in the **post-swap** document (fragment ids plus the rest of the document, minus whatever the swap removes). Any other selector form, or an id that does not resolve, is a load/`sync` error (`EngineError::InvalidAttribute`). |
+| `hx-swap="<strategy>"` | **First swap set (Designer lock, 2026-10-19): `innerHTML` and `outerHTML` only.** An element with **no** `hx-swap` attribute **defaults to `innerHTML`** (same as htmx; keeps Canvas parity — decided 2026-10-19). `beforeend` / `afterbegin` are added only when a mock needs them. Any other or unsupported swap mode **fails at `load_html`** (`EngineError::UnsupportedSwap`), not only at swap time. |
 | `hx-trigger="<event>"` | When to fire: at least `click`, plus host-driven slice events (e.g. `slice:time` when the `time` slice version changes). |
 | `hx-trigger` events, filters, `from:` *(locked in scope; Designer and Game reviews done 2026-10-19; pending seat review: UI (input wiring from egui/winit))* | **Events** (DOM names): `click` (primary button), `contextmenu` (secondary / right click; there is no native menu to suppress), `auxclick` (middle; optional), `keydown`, `keyup`, plus the existing `slice:<name>`. `dblclick` is **deferred** (load error until added). **Several triggers** are comma-separated, as in htmx: `hx-trigger="click, keydown[key=='Enter'] from:body"`. **Filters** in `[...]` come from a fixed whitelist, with no JS eval: `shiftKey`, `ctrlKey`, `altKey`, `metaKey`, `repeat`, `key=='X'` (single-quoted literal), each optionally negated with `!`, combined with `&&` and `\|\|` (`&&` binds tighter; no parentheses). **`from:`** only `from:body` / `from:document` (equivalent; window-level shortcut that fires without focus), and only on `keydown`/`keyup`. **Parsed at `load_html`:** an unknown event, filter, operator or `from:` target is a load error (`EngineError::InvalidTrigger`, like `UndeclaredAction`). See **Input: buttons, modifiers, keyboard**. |
-| `hx-indicator="#id"` | While this element's action is pending, the engine adds class `hx-request` to the element `#id` (e.g. a spinner). Designer styles it. See **Async actions and pending state**. |
-| `hx-sync="drop"` \| `"queue"` | What happens when the trigger fires again while this element's action is pending. **Locked modes:** `drop` (default; repeat triggers are ignored, never a duplicate `Action`) and `queue` (keep one; it fires after the pending one finishes). Any other value fails tests loudly. |
+| `hx-indicator="#id"` | While this element's action is pending, the engine adds class `hx-request` to the element `#id` (e.g. a spinner). **Must** be an id selector `#id` that resolves in the document, or — for fragment HTML — in the **post-swap** document (so a sibling indicator outside the swapped subtree is fine). Designer styles it. See **Async actions and pending state**. |
+| `hx-sync="drop"` \| `"queue"` | What happens when the trigger fires again while this element's action is pending. **Locked modes:** `drop` (default; repeat triggers are ignored, never a duplicate `Action`) and `queue` (keep one; it fires after the pending one finishes). Any other value **fails at `load_html`** (`EngineError::UnsupportedSync`). |
 
 **Stable ids:** every interactive element has a stable `id` (Designer contract). Tests and Game hooks key off ids, not ephemeral DOM order.
 
@@ -133,13 +135,20 @@ impl Engine {
 
     /// Load a full HTML document or shell (Designer file). No network fetch.
     /// Errors (EngineError::UndeclaredAction) if any `hx-post` names an action
-    /// not passed to `declare_actions`, and (EngineError::InvalidTrigger) on any
-    /// unknown `hx-trigger` event, filter, operator or `from:` target.
-    /// Either error fails A1 headless boot.
+    /// not passed to `declare_actions`, (EngineError::InvalidTrigger) on any
+    /// unknown `hx-trigger` event, filter, operator or `from:` target, and
+    /// (EngineError::InvalidAttribute) for any `hx-*`/`data-hx-*` outside the
+    /// locked set, for `data-hx-reason` in host HTML, or for `hx-target` /
+    /// `hx-indicator` that are not a resolving `#id`. Unsupported `hx-swap` /
+    /// `hx-sync` values use UnsupportedSwap / UnsupportedSync. Any of these
+    /// fails A1 headless boot.
     pub fn load_html(&mut self, html: &str) -> Result<(), EngineError> { /* … */ }
 
     /// Polls `version` for subscribed slices, re-renders only dirty sections via
     /// `FragmentSource`, swaps them in, and applies `actions` slice states.
+    /// Fragment HTML from `FragmentSource` is validated with the same dialect
+    /// rules as `load_html` before each swap; a bad fragment returns
+    /// `EngineError` (e.g. `InvalidAttribute`) and is not applied.
     pub fn sync(&mut self, slices: &dyn SliceSource, frags: &mut dyn FragmentSource)
         -> Result<DirtySet, EngineError> { /* … */ }
 
@@ -274,7 +283,7 @@ pub struct Hole {
    - (a) The **focused element** gets it first. A matching `keydown`/`keyup` trigger on it (or its ancestors, DOM bubbling) consumes it.
    - (b) Otherwise **Tab / Shift+Tab** move focus through the focus order (Blitz `focus_next_node`/`focus_prev_node`) and emit `FocusChanged`.
    - (c) Otherwise **Enter or Space on a focused button** (or element with `hx-post`) activates it exactly like a primary `click`: same Action, same pending/`hx-sync` rules, with `TriggerInfo::Key`.
-   - (d) Otherwise any `from:body`/`from:document` trigger whose filter matches consumes it, **even with no focus**.
+   - (d) Otherwise `from:body`/`from:document` triggers whose filter matches consume it, **even with no focus**. **Deterministic tie-break (Designer time-strip Space):** walk matching elements in **document order**. Emit `Action` for the **first ENABLED** match (action not `Disabled` in the `actions` slice). **Skip** greyed matches. If **every** match is greyed, return `Blocked` with the **first** greyed match's reason (and that element's `source_id`). Example: `#tstrip-pause` (`time.pause`) and `#tstrip-resume` (`time.resume`) both declare `hx-trigger="click, keydown[key==' '&&!repeat] from:body"`; exactly one is greyed at a time, so Space with no focus always fires the enabled one.
    - (e) Otherwise the engine returns **`InputOutcome::Unhandled(key)`** and the host routes it to game hotkeys.
    - **The engine never swallows Esc** unless an element has an explicit matching trigger (e.g. `keydown[key=='Escape']`). By default, Esc is `Unhandled`, so Game's `#530` Win95 order (close top inner dialog first, then building) stays in Rust.
 5. **Key repeat.** Default: `keydown` triggers **do not fire on OS auto-repeat**. A trigger opts in with the filter `[repeat]`, which fires on repeats only; use `[repeat||!repeat]` for both. Unconsumed repeats are still returned as `Unhandled`, so Game hotkeys can repeat. **Canvas note:** htmx.js fires `keydown` on repeats, so mocks that care should write `[!repeat]` explicitly. That way both behave identically.
