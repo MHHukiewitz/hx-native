@@ -422,6 +422,52 @@ pub fn control_is_disabled(doc: &HtmlDocument, node_id: NodeId) -> bool {
     doc.get_node(node_id).is_some_and(is_disabled)
 }
 
+/// Issue #15: checked state of the first `<input type=checkbox name=name>`
+/// inside `form_nid` (document order). `None` when no such checkbox exists.
+pub(crate) fn checkbox_checked_by_name(
+    doc: &HtmlDocument,
+    form_nid: NodeId,
+    name: &str,
+) -> Option<bool> {
+    for nid in descendants_document_order(doc, form_nid) {
+        let node = doc.get_node(nid)?;
+        if tag_name(node) != "input" || input_type(node) != "checkbox" {
+            continue;
+        }
+        if attr(node, "name").as_deref() != Some(name) {
+            continue;
+        }
+        return Some(checkbox_checked_state(node));
+    }
+    None
+}
+
+fn checkbox_checked_state(node: &Node) -> bool {
+    node.element_data()
+        .and_then(|el| el.checkbox_input_checked())
+        .unwrap_or_else(|| attr(node, "checked").is_some())
+}
+
+/// Issue #15: every `<input>` / `<select>` with `name == name` inside
+/// `form_nid` (document order) — the dependent-input targets of an
+/// `InputRule`.
+pub(crate) fn named_controls_in_form(doc: &HtmlDocument, form_nid: NodeId, name: &str) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    for nid in descendants_document_order(doc, form_nid) {
+        let Some(node) = doc.get_node(nid) else {
+            continue;
+        };
+        let tag = tag_name(node);
+        if !matches!(tag.as_str(), "input" | "select") {
+            continue;
+        }
+        if attr(node, "name").as_deref() == Some(name) {
+            out.push(nid);
+        }
+    }
+    out
+}
+
 pub fn is_change_eligible_tag(tag: &str, input_ty: Option<&str>) -> bool {
     match tag {
         "select" | "textarea" => true,

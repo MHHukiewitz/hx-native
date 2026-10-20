@@ -3756,11 +3756,11 @@ fn validate_loaded_tree(
             continue;
         }
         let (id_attr, attrs) = element_id_and_attrs(node);
-        validate_loaded_attrs(&id_attr, &attrs, known_ids)?;
         let tag = node
             .element_data()
             .map(|el| el.name.local.to_string())
             .unwrap_or_default();
+        validate_loaded_attrs(&id_attr, &attrs, known_ids, Some(&tag))?;
         let input_ty = attrs
             .iter()
             .find(|(k, _)| k == "type")

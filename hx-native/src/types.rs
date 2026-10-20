@@ -171,6 +171,29 @@ pub enum ActionState {
     Disabled {
         reason: String,
     },
+    /// Issue #15 (locked by Mike, Floor 2026-10-19 22:02 America/Asuncion):
+    /// greyed exactly like `Disabled` while the named `<form id>`'s live
+    /// control values equal their baseline (clean). The first edit that
+    /// changes a value ungreys it; editing back to the baseline greys it
+    /// again. Re-evaluated locally on every value change, no Game round
+    /// trip. `form` not in the document -> treated as `Enabled` (debug warn).
+    RequiresChange {
+        form: String,
+        reason: String,
+    },
+}
+
+/// Issue #15: an input-level dependency rule, keyed under the action that
+/// posts the form owning the dependent input (not its own reserved slice).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InputRule {
+    /// Grey the dependent input (same three attributes as `Disabled`) while
+    /// the named checkbox in the same form has `checked != checked`.
+    EnabledWhen {
+        input: String,
+        checked: bool,
+        reason: String,
+    },
 }
 
 /// Host hook: renders HTML for one section. Called only for dirty sections
@@ -184,6 +207,11 @@ pub trait SliceSource {
     fn version(&self, name: &str) -> Option<u64>;
     /// Only for the reserved `actions` slice (greyed-before-click).
     fn action_states(&self) -> Vec<(String, ActionState)>;
+    /// Issue #15: dependent-input rules, keyed by the action whose form owns
+    /// the input. `(action, input name, rule)`. Default empty (non-breaking).
+    fn input_rules(&self) -> Vec<(String, String, InputRule)> {
+        Vec::new()
+    }
 }
 
 /// Input the host (UI) converts from egui/winit. Raw: no platform remapping.

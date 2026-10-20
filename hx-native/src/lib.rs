@@ -28,7 +28,8 @@ pub mod worker;
 
 pub use damage::{element_border_box_css, element_border_box_device};
 pub use dialect::{
-    SwapMode, SyncMode, ATTR_HX_GROUP, ATTR_HX_STEP, ATTR_HX_STEP_FOR, SUPPORTED_HX_ATTRIBUTES,
+    SwapMode, SyncMode, ATTR_HX_APPLIED, ATTR_HX_GROUP, ATTR_HX_STEP, ATTR_HX_STEP_FOR,
+    SUPPORTED_HX_ATTRIBUTES,
 };
 pub use engine::{DirtySet, Engine};
 pub use error::EngineError;

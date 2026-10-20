@@ -129,13 +129,18 @@ fn engine_err(surface: Option<SurfaceId>, error: EngineError) -> WorkerError {
 pub struct SyncPacket {
     pub versions: HashMap<String, u64>,
     pub actions: Vec<(String, ActionState)>,
+    /// Issue #15: dependent-input rules, carried alongside `actions` so the
+    /// worker's `SliceSource` snapshot stays in parity with the sync `Engine`.
+    pub input_rules: Vec<(String, String, InputRule)>,
     pub fragments: HashMap<String, String>,
 }
 
 impl SyncPacket {
     /// Merge `newer` per slice / section (latest key wins). Used when coalescing.
     pub fn merge_per_slice(&mut self, newer: SyncPacket) {
-        let replace_actions = newer.versions.contains_key("actions") || !newer.actions.is_empty();
+        let replace_actions = newer.versions.contains_key("actions")
+            || !newer.actions.is_empty()
+            || !newer.input_rules.is_empty();
         for (k, v) in newer.versions {
             self.versions.insert(k, v);
         }
@@ -144,6 +149,7 @@ impl SyncPacket {
         }
         if replace_actions {
             self.actions = newer.actions;
+            self.input_rules = newer.input_rules;
         }
     }
 }
@@ -155,6 +161,10 @@ impl SliceSource for SyncPacket {
 
     fn action_states(&self) -> Vec<(String, ActionState)> {
         self.actions.clone()
+    }
+
+    fn input_rules(&self) -> Vec<(String, String, InputRule)> {
+        self.input_rules.clone()
     }
 }
 
