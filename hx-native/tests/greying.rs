@@ -930,6 +930,63 @@ fn a27_damage_scoped_to_changed_controls_partial_eq_full() {
     );
 }
 
+const ISOLATED_GREY_FORM: &str = r##"
+<form id="f">
+  <input id="music" type="checkbox" name="music" data-hx-applied="false" style="display:block"/>
+  <button id="apply" name="apply" hx-post="settings.apply" hx-trigger="click" style="display:block">Apply</button>
+</form>"##;
+
+/// Boot `ISOLATED_GREY_FORM`, sync `action` for `settings.apply` once, paint,
+/// then click `music`. `music` carries `data-hx-applied="false"` (issue #24
+/// opt-in) so checking it flips `hx-changed` identically regardless of
+/// `action` — isolating whatever damage difference `action` itself causes
+/// to Apply's own greying.
+fn click_music_with_action(action: ActionState) -> Engine {
+    let mut eng = boot(ISOLATED_GREY_FORM, &["settings.apply"]);
+    let mut slices = Slices::new();
+    let mut frags = Frags::default();
+    slices.actions = vec![("settings.apply".to_string(), action)];
+    slices.bump("actions");
+    eng.sync(&slices, &mut frags).unwrap();
+    let _ = eng.paint(vp());
+    let _ = click(&mut eng, "music");
+    eng
+}
+
+/// M5 gap (Graph review, PR #24 follow-up): the pixel-identity check above
+/// can pass by accident if damage rects happen to get merged into a
+/// bounding box that coincidentally still covers Apply (`music` and `apply`
+/// sit close together) — it does not on its own prove Apply's *own* node
+/// carries damage from the ungrey write. Compare the exact damaged-element
+/// count (read before resolve/paint clears the flags) between two
+/// identically-synced engines that each click `music`: one with
+/// `RequiresChange` wired to `settings.apply` (clicking `music` ungreys
+/// Apply), one with the same action left `Enabled` (clicking `music` has no
+/// greying effect — Apply was never greyed to begin with). Both still flip
+/// `hx-changed` on `music` itself identically (the `data-hx-applied`
+/// opt-in does not depend on the action), isolating the comparison to
+/// Apply's own greying damage: the `RequiresChange` run must damage
+/// strictly more elements (Apply's own node, plus any ancestor that now has
+/// a damaged descendant) than the `Enabled` run.
+#[test]
+fn a27_damage_scoped_to_changed_controls_exact_damaged_set() {
+    let with_requires_change = click_music_with_action(ActionState::RequiresChange {
+        form: "f".into(),
+        reason: REASON.into(),
+    });
+    let damaged_with = with_requires_change.test_damaged_element_count();
+
+    let without_requires_change = click_music_with_action(ActionState::Enabled);
+    let damaged_without = without_requires_change.test_damaged_element_count();
+
+    assert!(
+        damaged_with > damaged_without,
+        "ungreying Apply must add its own node (and ancestors) to the \
+         damaged set beyond what the identical hx-changed-flipping click \
+         damages on its own (with={damaged_with} without={damaged_without})"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // G: worker parity.
 // ---------------------------------------------------------------------------

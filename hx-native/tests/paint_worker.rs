@@ -704,3 +704,72 @@ fn paint_worker_handle_is_send() {
     assert_send::<FrameView>();
     assert_send::<WorkerOutcome>();
 }
+
+/// Graph review (PR #24 follow-up): a packet carrying only an actions update
+/// (its `input_rules` left at the `Vec::new()` default because this call has
+/// nothing new to say about rules) must not wipe a still-queued, non-empty
+/// `input_rules` from an earlier coalesced packet — `actions` and
+/// `input_rules` merge independently, each only on a non-empty `newer`.
+#[test]
+fn sync_packet_merge_per_slice_actions_only_keeps_queued_input_rules() {
+    let rule = InputRule::EnabledWhen {
+        input: "gate".into(),
+        checked: true,
+        reason: "gate off".into(),
+    };
+    let mut acc = SyncPacket {
+        versions: HashMap::from([("actions".into(), 1)]),
+        actions: Vec::new(),
+        input_rules: vec![("act.save".into(), "dep".into(), rule.clone())],
+        fragments: HashMap::new(),
+    };
+
+    let actions_only = SyncPacket {
+        versions: HashMap::from([("actions".into(), 2)]),
+        actions: vec![(
+            "act.other".into(),
+            ActionState::Disabled {
+                reason: "busy".into(),
+            },
+        )],
+        input_rules: Vec::new(),
+        fragments: HashMap::new(),
+    };
+    acc.merge_per_slice(actions_only);
+
+    assert_eq!(
+        acc.actions,
+        vec![(
+            "act.other".to_string(),
+            ActionState::Disabled {
+                reason: "busy".into()
+            }
+        )],
+        "the actions-only packet's actions must still land"
+    );
+    assert_eq!(
+        acc.input_rules,
+        vec![("act.save".to_string(), "dep".to_string(), rule)],
+        "an actions-only packet must not wipe already-queued input_rules"
+    );
+
+    // A packet that genuinely carries new (possibly different) rules still
+    // replaces the accumulated ones.
+    let new_rule = InputRule::EnabledWhen {
+        input: "gate2".into(),
+        checked: false,
+        reason: "gate2 on".into(),
+    };
+    let rules_update = SyncPacket {
+        versions: HashMap::from([("actions".into(), 3)]),
+        actions: Vec::new(),
+        input_rules: vec![("act.save".into(), "dep2".into(), new_rule.clone())],
+        fragments: HashMap::new(),
+    };
+    acc.merge_per_slice(rules_update);
+    assert_eq!(
+        acc.input_rules,
+        vec![("act.save".to_string(), "dep2".to_string(), new_rule)],
+        "a non-empty input_rules in the newer packet must still replace the accumulated one"
+    );
+}
