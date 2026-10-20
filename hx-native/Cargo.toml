@@ -60,6 +60,10 @@ name = "partial_repaint"
 path = "tests/partial_repaint.rs"
 
 [[test]]
+name = "swap_damage"
+path = "tests/swap_damage.rs"
+
+[[test]]
 name = "multi_surface"
 path = "tests/multi_surface.rs"
 
