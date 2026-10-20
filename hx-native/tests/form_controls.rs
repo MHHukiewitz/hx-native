@@ -1166,15 +1166,25 @@ fn open_select_closes_on_swap_replace() {
         }
     }
 
+    // Short panel so the open list (8 rows) hangs below the swapped area.
+    // Without close_select's pending list damage, swap subtree damage only
+    // covers the panel and leaves stale list pixels below it.
     let html = r##"
-<section id="panel" hx-trigger="slice:ui" hx-target="#panel" hx-swap="innerHTML">
+<section id="panel" hx-trigger="slice:ui" hx-target="#panel" hx-swap="innerHTML"
+        style="position:absolute;left:8px;top:8px;width:140px;height:30px;overflow:visible">
   <select id="lang" name="language" hx-post="set.lang" hx-trigger="change"
-          style="width:120px;height:22px;display:block;margin:8px">
+          style="width:128px;height:22px;display:block">
     <option value="en" selected="">English</option>
     <option value="de">Deutsch</option>
+    <option value="fr">Français</option>
+    <option value="es">Español</option>
+    <option value="it">Italiano</option>
+    <option value="pt">Português</option>
+    <option value="nl">Nederlands</option>
+    <option value="sv">Svenska</option>
   </select>
-  <button id="other">x</button>
 </section>
+<button id="other" style="position:absolute;left:200px;top:8px">x</button>
 "##;
     let mut eng = boot(html, &["set.lang"]);
     eng.test_set_focus("lang");
@@ -1185,7 +1195,7 @@ fn open_select_closes_on_swap_replace() {
         versions: HashMap::from([("ui".into(), 1), ("actions".into(), 1)]),
     };
     let mut frags = Frags {
-        body: r#"<button id="other">replaced</button>"#.into(),
+        body: r#"<span id="gone">replaced</span>"#.into(),
         calls: Arc::new(Mutex::new(0)),
     };
     // Initial sync replaces the open <select>; reconcile must close without a
@@ -1206,7 +1216,7 @@ fn open_select_closes_on_swap_replace() {
         "Esc after swap-close must be Unhandled, got {esc:?}"
     );
 
-    // Close-via-swap pending damage must clear the list at 0 px vs full.
+    // Close-via-swap pending damage must clear the overhanging list at 0 px vs full.
     let mut eng = boot(html, &["set.lang"]);
     eng.test_set_focus("lang");
     open_select_alt_down(&mut eng);
@@ -1215,7 +1225,7 @@ fn open_select_closes_on_swap_replace() {
         versions: HashMap::from([("ui".into(), 1), ("actions".into(), 1)]),
     };
     let mut frags = Frags {
-        body: r#"<button id="other">replaced</button>"#.into(),
+        body: r#"<span id="gone">replaced</span>"#.into(),
         calls: Arc::new(Mutex::new(0)),
     };
     let _ = eng.sync(&slices, &mut frags).unwrap();
@@ -1234,7 +1244,7 @@ fn open_select_closes_on_swap_replace() {
         versions: HashMap::from([("ui".into(), 1), ("actions".into(), 1)]),
     };
     let mut frags = Frags {
-        body: r#"<button id="other">replaced</button>"#.into(),
+        body: r#"<span id="gone">replaced</span>"#.into(),
         calls: Arc::new(Mutex::new(0)),
     };
     let _ = eng_full.sync(&slices, &mut frags).unwrap();
@@ -1350,27 +1360,33 @@ fn open_select_closes_when_disabled() {
 
 #[test]
 fn open_select_closes_on_focus_change() {
+    // Button is clear of the open list so a real click hits it (not a list row).
     let html = r#"
 <select id="lang" name="language" hx-post="set.lang" hx-trigger="change"
-        style="width:120px;height:22px;display:block;margin:8px">
+        style="position:absolute;left:8px;top:8px;width:120px;height:22px">
   <option value="en" selected="">English</option>
   <option value="de">Deutsch</option>
 </select>
-<button id="other" hx-post="noop">x</button>
+<button id="other" hx-post="noop"
+        style="position:absolute;left:200px;top:8px;width:80px;height:28px">x</button>
 "#;
+
+    // --- Tab away (engine.rs Tab reconcile). Do not use test_set_focus: it
+    // closes the list itself and masks a missing Tab close. ---
     let mut eng = boot(html, &["set.lang", "noop"]);
     eng.test_set_focus("lang");
     open_select_alt_down(&mut eng);
     let _ = eng.paint(vp()).unwrap();
-
-    // Tab away (or direct focus) must close the list.
-    eng.test_set_focus("other");
+    let tab = key(&mut eng, "Tab", Modifiers::default());
+    assert!(
+        matches!(tab, InputOutcome::FocusChanged(ref f) if f.focused_id.as_deref() == Some("other")),
+        "Tab must move focus to #other, got {tab:?}"
+    );
     let esc = key(&mut eng, "Escape", Modifiers::default());
     assert!(
         matches!(esc, InputOutcome::Unhandled(ref k) if k.key == "Escape"),
-        "Esc after focus-away close must be Unhandled, got {esc:?}"
+        "Esc after Tab-away close must be Unhandled, got {esc:?}"
     );
-    // Enter on the button must work (not swallowed by open select).
     let out = key(&mut eng, "Enter", Modifiers::default());
     assert!(
         matches!(
@@ -1380,33 +1396,58 @@ fn open_select_closes_on_focus_change() {
                 ..
             } if n == "noop"
         ),
-        "Enter after focus-away must activate button, got {out:?}"
+        "Enter after Tab-away must activate button, got {out:?}"
     );
 
-    // Close-via-focus-loss pending damage must clear the list at 0 px vs full.
+    // --- Pointer click elsewhere (pointer-down focus reconcile). ---
     let mut eng = boot(html, &["set.lang", "noop"]);
     eng.test_set_focus("lang");
     open_select_alt_down(&mut eng);
     let _ = eng.paint(vp()).unwrap();
-    eng.test_set_focus("other");
+    let other = eng.test_element_box("other").expect("other box");
+    let cx = other.0 + other.2 * 0.5;
+    let cy = other.1 + other.3 * 0.5;
+    let click_out = click(&mut eng, cx, cy);
+    let esc = key(&mut eng, "Escape", Modifiers::default());
+    assert!(
+        matches!(esc, InputOutcome::Unhandled(ref k) if k.key == "Escape"),
+        "Esc after click-away close must be Unhandled (click_out={click_out:?}), got {esc:?}"
+    );
+    assert_eq!(
+        eng.focus_state().focused_id.as_deref(),
+        Some("other"),
+        "click on #other must focus it"
+    );
+    let arrow = key(&mut eng, "ArrowDown", Modifiers::default());
+    assert!(
+        !matches!(arrow, InputOutcome::None),
+        "ArrowDown after click-away must not be consumed by open select; got {arrow:?}"
+    );
+
+    // Close-via-Tab pending damage must clear the list at 0 px vs full.
+    let mut eng = boot(html, &["set.lang", "noop"]);
+    eng.test_set_focus("lang");
+    open_select_alt_down(&mut eng);
+    let _ = eng.paint(vp()).unwrap();
+    let _ = key(&mut eng, "Tab", Modifiers::default());
     let partial = eng.paint(vp()).unwrap();
-    assert!(!partial.skipped, "focus-away close must paint");
+    assert!(!partial.skipped, "Tab-away close must paint");
     assert!(
         !eng.last_paint_stats().full_repaint,
-        "focus-away close must use pending damage, not full; stats={:?}",
+        "Tab-away close must use pending damage, not full; stats={:?}",
         eng.last_paint_stats()
     );
     let mut eng_full = boot(html, &["set.lang", "noop"]);
     eng_full.test_set_focus("lang");
     open_select_alt_down(&mut eng_full);
     let _ = eng_full.paint(vp()).unwrap();
-    eng_full.test_set_focus("other");
+    let _ = key(&mut eng_full, "Tab", Modifiers::default());
     eng_full.mark_theme_or_stylesheet_changed();
     let full = eng_full.paint(vp()).unwrap();
     assert_partial_eq_full(
         partial.rgba.as_ref().unwrap(),
         full.rgba.as_ref().unwrap(),
-        "select focus-away close",
+        "select Tab-away close",
     );
 }
 
@@ -1451,15 +1492,47 @@ fn boot_at(html: &str, actions: &[&str], scale: f64) -> Engine {
     eng
 }
 
-/// Open list placement + click targets must follow transform-aware geometry
-/// at scales 1 / 1.25 / 2. Mutation (absolute_position in control_rect_of)
-/// makes this fail — see agent verification notes.
+fn paint_partial_then_full_parity_at<F>(
+    html: &str,
+    actions: &[&str],
+    scale: f64,
+    run: F,
+    label: &str,
+) where
+    F: Fn(&mut Engine),
+{
+    let mut eng = boot_at(html, actions, scale);
+    run(&mut eng);
+    let partial = eng.paint(vp_at(scale)).unwrap();
+    assert!(
+        !partial.skipped && partial.rgba.is_some(),
+        "{label}: expected a raster paint"
+    );
+    assert!(
+        !eng.last_paint_stats().full_repaint,
+        "{label}: expected partial path, stats={:?}",
+        eng.last_paint_stats()
+    );
+    let partial_px = partial.rgba.unwrap();
+
+    let mut eng_full = boot_at(html, actions, scale);
+    run(&mut eng_full);
+    eng_full.mark_theme_or_stylesheet_changed();
+    let full = eng_full.paint(vp_at(scale)).unwrap();
+    assert_partial_eq_full(&partial_px, full.rgba.as_ref().unwrap(), label);
+}
+
+/// Open / pick / Esc-close + click targets + radio uncheck at scales 1 / 1.25 / 2.
+/// Asserts every scale ran so cutting the loop to `[1.0]` fails.
 #[test]
 fn select_open_in_translated_panel_parity_and_clicks() {
     const ROW_H: f32 = 18.0;
-    for scale in [1.0_f64, 1.25, 2.0] {
+    const SCALES: [f64; 3] = [1.0, 1.25, 2.0];
+    let mut seen = Vec::new();
+    for scale in SCALES {
+        seen.push(scale);
         let html = select_in_translated_panel_html();
-        // --- pixel parity: open list partial vs forced full ---
+        // --- open list partial vs forced full ---
         let mut eng = boot_at(html, &["set.lang"], scale);
         eng.test_set_focus("lang");
         open_select_alt_down(&mut eng);
@@ -1485,7 +1558,36 @@ fn select_open_in_translated_panel_parity_and_clicks() {
             &format!("select open in translated panel scale={scale}"),
         );
 
-        // --- click targets: pick row 1 (Deutsch) using transform-aware box ---
+        // --- pick (Enter) partial vs full ---
+        paint_partial_then_full_parity_at(
+            html,
+            &["set.lang"],
+            scale,
+            |eng| {
+                eng.test_set_focus("lang");
+                open_select_alt_down(eng);
+                let _ = eng.paint(vp_at(scale)).unwrap();
+                let _ = key(eng, "ArrowDown", Modifiers::default());
+                let _ = key(eng, "Enter", Modifiers::default());
+            },
+            &format!("select Enter pick in translated panel scale={scale}"),
+        );
+
+        // --- Esc close partial vs full ---
+        paint_partial_then_full_parity_at(
+            html,
+            &["set.lang"],
+            scale,
+            |eng| {
+                eng.test_set_focus("lang");
+                open_select_alt_down(eng);
+                let _ = eng.paint(vp_at(scale)).unwrap();
+                let _ = key(eng, "Escape", Modifiers::default());
+            },
+            &format!("select Esc close in translated panel scale={scale}"),
+        );
+
+        // --- click targets: pick row 1 (Deutsch) ---
         let mut eng = boot_at(html, &["set.lang"], scale);
         eng.test_set_focus("lang");
         open_select_alt_down(&mut eng);
@@ -1493,11 +1595,8 @@ fn select_open_in_translated_panel_parity_and_clicks() {
         let (cx, cy, cw, ch) = eng
             .test_element_box("lang")
             .expect("lang box after transform");
-        // List sits directly below the control; row 1 center.
         let click_x = cx + cw * 0.5;
         let click_y = cy + ch + 1.0 + ROW_H * 1.5;
-        // Sanity: transform must have moved the control off the untransformed
-        // top-left (margin-only) spot — otherwise the helper is unused.
         assert!(
             cx > 50.0 && cy > 50.0,
             "scale={scale}: expected centered select box, got ({cx},{cy},{cw},{ch})"
@@ -1511,5 +1610,123 @@ fn select_open_in_translated_panel_parity_and_clicks() {
             Some("de"),
             "scale={scale}: row 1 click must select Deutsch"
         );
+    }
+    assert_eq!(
+        seen,
+        vec![1.0, 1.25, 2.0],
+        "scale loop must cover 1 / 1.25 / 2 (cutting SCALES to [1.0] fails this)"
+    );
+
+    // Plain native radio uncheck at each scale.
+    let radio_html = r#"
+<form id="f">
+  <input id="r1" type="radio" name="ops" value="1" checked=""
+         hx-post="set.ops" hx-trigger="change"
+         style="position:absolute;left:20px;top:20px;width:24px;height:24px" />
+  <input id="r2" type="radio" name="ops" value="2"
+         hx-post="set.ops" hx-trigger="change"
+         style="position:absolute;left:60px;top:20px;width:24px;height:24px" />
+</form>
+"#;
+    let mut radio_seen = Vec::new();
+    for scale in SCALES {
+        radio_seen.push(scale);
+        let mut eng = boot_at(radio_html, &["set.ops"], scale);
+        let r1 = eng.test_element_box("r1").expect("r1");
+        let before = eng.last_frame().expect("frame").clone();
+        let r2 = eng.test_element_box("r2").expect("r2");
+        let out = click(&mut eng, r2.0 + r2.2 * 0.5, r2.1 + r2.3 * 0.5);
+        assert!(
+            action_change(&out).is_some(),
+            "scale={scale}: r2 click fires change, got {out:?}"
+        );
+        let after = eng.paint(vp_at(scale)).unwrap();
+        assert!(
+            !eng.last_paint_stats().full_repaint,
+            "scale={scale}: radio uncheck must be partial"
+        );
+        assert!(
+            count_pixel_diffs(&before, after.rgba.as_ref().unwrap(), r1, scale) > 0,
+            "scale={scale}: un-checking r1 must change its pixels"
+        );
+        let mut eng_full = boot_at(radio_html, &["set.ops"], scale);
+        let r2 = eng_full.test_element_box("r2").expect("r2");
+        let _ = click(&mut eng_full, r2.0 + r2.2 * 0.5, r2.1 + r2.3 * 0.5);
+        eng_full.mark_theme_or_stylesheet_changed();
+        let full = eng_full.paint(vp_at(scale)).unwrap();
+        assert_partial_eq_full(
+            after.rgba.as_ref().unwrap(),
+            full.rgba.as_ref().unwrap(),
+            &format!("radio uncheck scale={scale}"),
+        );
+    }
+    assert_eq!(
+        radio_seen.as_slice(),
+        &SCALES[..],
+        "radio scale loop must cover 1 / 1.25 / 2"
+    );
+}
+
+/// Overflowing open-list damage must be clamped to the surface (hosts upload
+/// damage rects to the texture). Mutation: drop the clamp around
+/// `select_damage_rects` in `resolve_and_plan_damage`.
+#[test]
+fn open_select_overflow_damage_clamped() {
+    let cases = [
+        // List hangs past the bottom.
+        r#"
+<select id="lang" name="language" hx-post="set.lang" hx-trigger="change"
+        style="position:absolute;left:8px;top:250px;width:128px;height:22px">
+  <option value="en" selected="">English</option>
+  <option value="de">Deutsch</option>
+  <option value="fr">Français</option>
+  <option value="es">Español</option>
+  <option value="it">Italiano</option>
+  <option value="pt">Português</option>
+  <option value="nl">Nederlands</option>
+  <option value="sv">Svenska</option>
+</select>
+"#,
+        // List hangs past the right edge.
+        r#"
+<select id="lang" name="language" hx-post="set.lang" hx-trigger="change"
+        style="position:absolute;left:330px;top:8px;width:128px;height:22px">
+  <option value="en" selected="">English</option>
+  <option value="de">Deutsch</option>
+  <option value="fr">Français</option>
+  <option value="es">Español</option>
+  <option value="it">Italiano</option>
+  <option value="pt">Português</option>
+  <option value="nl">Nederlands</option>
+  <option value="sv">Svenska</option>
+</select>
+"#,
+    ];
+    const SW: f32 = 400.0;
+    const SH: f32 = 300.0;
+    for (i, html) in cases.iter().enumerate() {
+        let mut eng = boot(html, &["set.lang"]);
+        let _ = eng.paint(vp()).unwrap();
+        eng.test_set_focus("lang");
+        open_select_alt_down(&mut eng);
+        let out = eng.paint(vp()).unwrap();
+        assert!(!out.skipped, "case {i}: open must paint");
+        assert!(
+            !eng.last_paint_stats().full_repaint,
+            "case {i}: open must be partial so damage rects are visible, stats={:?}",
+            eng.last_paint_stats()
+        );
+        assert!(
+            !out.damage.is_empty(),
+            "case {i}: expected non-empty damage, got {:?}",
+            out.damage
+        );
+        for r in &out.damage {
+            assert!(
+                r.x >= 0.0 && r.y >= 0.0 && r.x + r.width <= SW && r.y + r.height <= SH,
+                "case {i}: damage rect out of surface {SW}x{SH}: {r:?}; all={:?}",
+                out.damage
+            );
+        }
     }
 }

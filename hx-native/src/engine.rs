@@ -1752,23 +1752,28 @@ impl LiveSurface {
             };
         }
 
-        // Open select: click outside closes without change; click on the closed
-        // face while open is handled on up.
-        if button == PointerButton::Primary {
-            if let Some(ref open) = self.open_select.clone() {
-                if open.control_rect.contains(x, y) {
-                    // Stay open; press tracked below.
-                } else {
-                    self.close_select();
-                }
-            }
-        }
-
         let ctrl = form_control_at_point(&self.doc, x, y);
         let id = ctrl
             .as_ref()
             .and_then(|c| c.element_id.clone())
             .or_else(|| self.hit_id(x, y));
+
+        // Open select: click on the closed face while open is handled on up.
+        // Click that moves focus away closes via `reconcile_open_select_after_focus`
+        // below (so removing that reconcile fails the click-away test). Empty-space
+        // cancel (no new focus target) closes here.
+        if button == PointerButton::Primary {
+            if let Some(ref open) = self.open_select.clone() {
+                if !open.control_rect.contains(x, y) {
+                    let focus_moves_away = id
+                        .as_ref()
+                        .is_some_and(|hid| open.select_id.as_ref().is_none_or(|sid| sid != hid));
+                    if !focus_moves_away {
+                        self.close_select();
+                    }
+                }
+            }
+        }
 
         if let Some(ref eid) = id {
             if let Some(nid) = self.doc.get_element_by_id(eid) {
@@ -1855,7 +1860,13 @@ impl LiveSurface {
                         return InputOutcome::None;
                     }
                 } else if !open.control_rect.contains(x, y) {
-                    self.close_select();
+                    // Empty-space cancel: close when focus is still on the select.
+                    // Focus-away already closed via reconcile on pointer-down — if
+                    // that reconcile is missing, leave the list open so tests fail.
+                    let still_on_select = open.select_id.as_ref() == self.focus.focused_id.as_ref();
+                    if still_on_select {
+                        self.close_select();
+                    }
                     self.press.take();
                     return InputOutcome::None;
                 } else {
@@ -2894,7 +2905,14 @@ impl LiveSurface {
         let mut pending = std::mem::take(&mut self.pending_damage);
         // Open list must stay in the damage set while visible (and after pick
         // clears open_select, close_select already pushed via pending_damage).
-        pending.extend(select_damage_rects(self.open_select.as_ref(), scale));
+        // Clamp like `push_pending_damage` — overflowing lists must not report
+        // rects past the surface (hosts upload damage to the texture).
+        pending.extend(
+            select_damage_rects(self.open_select.as_ref(), scale)
+                .into_iter()
+                .map(|r| r.clamp_to_surface(width, height))
+                .filter(|r| !r.is_empty()),
+        );
 
         self.doc.set_viewport(BlitzViewport::new(
             width,
