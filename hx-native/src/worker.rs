@@ -317,6 +317,14 @@ enum Command {
     TestHold {
         release: Arc<AtomicBool>,
     },
+    /// Test-only (issue #25): force one caret blink phase flip on the
+    /// worker's own `Engine`, mirroring `Engine::test_force_caret_blink`.
+    TestForceCaretBlink,
+    /// Test-only (issue #25): read whether the caret is in its visible
+    /// blink phase, mirroring `Engine::test_caret_visible`.
+    TestCaretVisible {
+        reply: Reply<Option<bool>>,
+    },
     Shutdown,
 }
 
@@ -336,6 +344,8 @@ fn is_discrete_cmd(cmd: &Command) -> bool {
         | Command::LoadHtml { .. }
         | Command::TestPanic
         | Command::TestHold { .. }
+        | Command::TestForceCaretBlink
+        | Command::TestCaretVisible { .. }
         | Command::Shutdown => true,
         _ => false,
     }
@@ -1153,6 +1163,44 @@ impl PaintWorker {
     pub fn inject_hold_for_test(&self, release: Arc<AtomicBool>) -> Result<(), WorkerError> {
         self.mailbox.push_discrete(Command::TestHold { release })
     }
+
+    /// Test-only (issue #25): force one caret blink phase flip on the
+    /// worker's own `Engine` (default surface), mirroring
+    /// [`crate::Engine::test_force_caret_blink`]. Fire-and-forget like other
+    /// setup/test commands; pair with [`Self::flush`] or
+    /// [`Self::test_caret_visible`] to wait for it to apply.
+    pub fn force_caret_blink_for_test(&self) -> Result<(), WorkerError> {
+        self.check_stall_after_enqueue(self.mailbox.push_discrete(Command::TestForceCaretBlink))
+    }
+
+    /// Test-only (issue #25): read whether the caret is in its visible
+    /// blink phase on the worker's own `Engine` (default surface),
+    /// mirroring [`crate::Engine::test_caret_visible`]. Blocks (bounded by
+    /// [`WORKER_STALL_TIMEOUT_NS`]) until commands queued before this call
+    /// are applied, same as [`Self::flush`].
+    pub fn test_caret_visible(&self) -> Result<Option<bool>, WorkerError> {
+        if let Some(err) = self.poll_error() {
+            return Err(err);
+        }
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.mailbox
+            .push_discrete(Command::TestCaretVisible { reply: Reply(tx) })?;
+        match rx.recv_timeout(Duration::from_nanos(WORKER_STALL_TIMEOUT_NS)) {
+            Ok(v) => Ok(v),
+            Err(RecvTimeoutError::Timeout) => {
+                let err = WorkerError::Stalled;
+                self.shared.set_error(err.clone());
+                Err(err)
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                if let Some(err) = self.poll_error() {
+                    Err(err)
+                } else {
+                    Err(WorkerError::ShutDown)
+                }
+            }
+        }
+    }
 }
 
 impl Drop for PaintWorker {
@@ -1333,6 +1381,14 @@ fn process_command(
             while !release.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_millis(1));
             }
+            Ok(false)
+        }
+        Command::TestForceCaretBlink => {
+            eng.test_force_caret_blink();
+            Ok(false)
+        }
+        Command::TestCaretVisible { reply } => {
+            reply.send(eng.test_caret_visible());
             Ok(false)
         }
         Command::Shutdown => Ok(true),
