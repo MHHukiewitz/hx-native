@@ -32,8 +32,7 @@ fn boot(html: &str, actions: &[&str]) -> Engine {
         ..Default::default()
     });
     eng.declare_actions(actions);
-    let wrapped =
-        format!("<!DOCTYPE html><html><body style=\"margin:0\">{html}</body></html>");
+    let wrapped = format!("<!DOCTYPE html><html><body style=\"margin:0\">{html}</body></html>");
     eng.load_html(&wrapped).expect("load");
     let _ = eng.paint(vp());
     eng
@@ -95,7 +94,14 @@ impl FragmentSource for Frags {
 }
 
 /// Set a single `RequiresChange` action state and sync.
-fn requires_change(eng: &mut Engine, slices: &mut Slices, frags: &mut Frags, action: &str, form: &str, reason: &str) {
+fn requires_change(
+    eng: &mut Engine,
+    slices: &mut Slices,
+    frags: &mut Frags,
+    action: &str,
+    form: &str,
+    reason: &str,
+) {
     slices.actions = vec![(
         action.to_string(),
         ActionState::RequiresChange {
@@ -242,8 +248,18 @@ fn a27_range_edit_ungreys_revert_greys() {
     let mut eng = boot_big_form();
     let mut slices = Slices::new();
     let mut frags = Frags::default();
-    requires_change(&mut eng, &mut slices, &mut frags, "settings.apply", "f", REASON);
-    assert!(is_greyed(&eng, "apply", REASON), "clean form must grey Apply");
+    requires_change(
+        &mut eng,
+        &mut slices,
+        &mut frags,
+        "settings.apply",
+        "f",
+        REASON,
+    );
+    assert!(
+        is_greyed(&eng, "apply", REASON),
+        "clean form must grey Apply"
+    );
 
     let y = range_y(&eng, "vol");
     let from = (range_x_for(&eng, "vol", 50.0, 0.0, 100.0), y);
@@ -259,7 +275,10 @@ fn a27_range_edit_ungreys_revert_greys() {
     let back = (range_x_for(&eng, "vol", 50.0, 0.0, 100.0), y);
     let _ = drag(&mut eng, to, back);
     assert_eq!(eng.attr("vol", "value").unwrap(), "50");
-    assert!(is_greyed(&eng, "apply", REASON), "revert must grey Apply again");
+    assert!(
+        is_greyed(&eng, "apply", REASON),
+        "revert must grey Apply again"
+    );
 }
 
 #[test]
@@ -267,7 +286,14 @@ fn a27_number_typed_ungreys_revert_greys() {
     let mut eng = boot_big_form();
     let mut slices = Slices::new();
     let mut frags = Frags::default();
-    requires_change(&mut eng, &mut slices, &mut frags, "settings.apply", "f", REASON);
+    requires_change(
+        &mut eng,
+        &mut slices,
+        &mut frags,
+        "settings.apply",
+        "f",
+        REASON,
+    );
     assert!(is_greyed(&eng, "apply", REASON));
 
     set_field_text(&mut eng, "qty", "9");
@@ -276,7 +302,10 @@ fn a27_number_typed_ungreys_revert_greys() {
 
     set_field_text(&mut eng, "qty", "5");
     assert_eq!(eng.attr("qty", "value").unwrap(), "5");
-    assert!(is_greyed(&eng, "apply", REASON), "reverted number must grey Apply");
+    assert!(
+        is_greyed(&eng, "apply", REASON),
+        "reverted number must grey Apply"
+    );
 }
 
 #[test]
@@ -284,14 +313,24 @@ fn a27_text_typed_ungreys_revert_greys() {
     let mut eng = boot_big_form();
     let mut slices = Slices::new();
     let mut frags = Frags::default();
-    requires_change(&mut eng, &mut slices, &mut frags, "settings.apply", "f", REASON);
+    requires_change(
+        &mut eng,
+        &mut slices,
+        &mut frags,
+        "settings.apply",
+        "f",
+        REASON,
+    );
     assert!(is_greyed(&eng, "apply", REASON));
 
     set_field_text(&mut eng, "label", "Edited");
     assert!(is_enabled(&eng, "apply"), "typed text must ungrey Apply");
 
     set_field_text(&mut eng, "label", "Base");
-    assert!(is_greyed(&eng, "apply", REASON), "reverted text must grey Apply");
+    assert!(
+        is_greyed(&eng, "apply", REASON),
+        "reverted text must grey Apply"
+    );
 }
 
 #[test]
@@ -299,15 +338,28 @@ fn a27_checkbox_toggle_ungreys_revert_greys() {
     let mut eng = boot_big_form();
     let mut slices = Slices::new();
     let mut frags = Frags::default();
-    requires_change(&mut eng, &mut slices, &mut frags, "settings.apply", "f", REASON);
+    requires_change(
+        &mut eng,
+        &mut slices,
+        &mut frags,
+        "settings.apply",
+        "f",
+        REASON,
+    );
     assert!(is_greyed(&eng, "apply", REASON));
 
     let out = click(&mut eng, "music");
     assert!(!matches!(out, InputOutcome::Action { .. }));
-    assert!(is_enabled(&eng, "apply"), "checkbox toggle must ungrey Apply");
+    assert!(
+        is_enabled(&eng, "apply"),
+        "checkbox toggle must ungrey Apply"
+    );
 
     let _ = click(&mut eng, "music");
-    assert!(is_greyed(&eng, "apply", REASON), "reverted checkbox must grey Apply");
+    assert!(
+        is_greyed(&eng, "apply", REASON),
+        "reverted checkbox must grey Apply"
+    );
 }
 
 #[test]
@@ -315,7 +367,14 @@ fn a27_radio_pick_ungreys_revert_greys() {
     let mut eng = boot_big_form();
     let mut slices = Slices::new();
     let mut frags = Frags::default();
-    requires_change(&mut eng, &mut slices, &mut frags, "settings.apply", "f", REASON);
+    requires_change(
+        &mut eng,
+        &mut slices,
+        &mut frags,
+        "settings.apply",
+        "f",
+        REASON,
+    );
     assert!(is_greyed(&eng, "apply", REASON));
 
     let out = click(&mut eng, "mode-b");
@@ -323,7 +382,10 @@ fn a27_radio_pick_ungreys_revert_greys() {
     assert!(is_enabled(&eng, "apply"), "radio pick must ungrey Apply");
 
     let _ = click(&mut eng, "mode-a");
-    assert!(is_greyed(&eng, "apply", REASON), "reverted radio must grey Apply");
+    assert!(
+        is_greyed(&eng, "apply", REASON),
+        "reverted radio must grey Apply"
+    );
 }
 
 #[test]
@@ -331,16 +393,29 @@ fn a27_select_step_ungreys_revert_greys() {
     let mut eng = boot_big_form();
     let mut slices = Slices::new();
     let mut frags = Frags::default();
-    requires_change(&mut eng, &mut slices, &mut frags, "settings.apply", "f", REASON);
+    requires_change(
+        &mut eng,
+        &mut slices,
+        &mut frags,
+        "settings.apply",
+        "f",
+        REASON,
+    );
     assert!(is_greyed(&eng, "apply", REASON));
 
     eng.test_set_focus("quality");
     let out = key(&mut eng, "ArrowDown"); // closed-select step: low -> high
     assert!(!matches!(out, InputOutcome::Action { .. }));
-    assert!(is_enabled(&eng, "apply"), "select step must ungrey Apply, out={out:?}");
+    assert!(
+        is_enabled(&eng, "apply"),
+        "select step must ungrey Apply, out={out:?}"
+    );
 
     let _ = key(&mut eng, "ArrowUp");
-    assert!(is_greyed(&eng, "apply", REASON), "reverted select must grey Apply");
+    assert!(
+        is_greyed(&eng, "apply", REASON),
+        "reverted select must grey Apply"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -383,7 +458,14 @@ fn a27_rerender_resets_baseline() {
     let mut eng = boot_swappable_form();
     let mut slices = Slices::new();
     let mut frags = initial_swappable_frags();
-    requires_change(&mut eng, &mut slices, &mut frags, "settings.apply2b", "f2", REASON);
+    requires_change(
+        &mut eng,
+        &mut slices,
+        &mut frags,
+        "settings.apply2b",
+        "f2",
+        REASON,
+    );
     assert!(is_greyed(&eng, "apply2b", REASON));
 
     set_field_text(&mut eng, "label2", "Draft");
@@ -409,7 +491,14 @@ fn a27_unrelated_slice_bump_does_not_reset_baseline() {
     let mut eng = boot_swappable_form();
     let mut slices = Slices::new();
     let mut frags = initial_swappable_frags();
-    requires_change(&mut eng, &mut slices, &mut frags, "settings.apply2b", "f2", REASON);
+    requires_change(
+        &mut eng,
+        &mut slices,
+        &mut frags,
+        "settings.apply2b",
+        "f2",
+        REASON,
+    );
     assert!(is_greyed(&eng, "apply2b", REASON));
 
     set_field_text(&mut eng, "label2", "Draft");
@@ -436,7 +525,14 @@ fn a27_no_action_emitted_during_edits() {
     let mut eng = boot_big_form();
     let mut slices = Slices::new();
     let mut frags = Frags::default();
-    requires_change(&mut eng, &mut slices, &mut frags, "settings.apply", "f", REASON);
+    requires_change(
+        &mut eng,
+        &mut slices,
+        &mut frags,
+        "settings.apply",
+        "f",
+        REASON,
+    );
 
     let y = range_y(&eng, "vol");
     let from = (range_x_for(&eng, "vol", 50.0, 0.0, 100.0), y);
@@ -453,7 +549,10 @@ fn a27_no_action_emitted_during_edits() {
         mods: Modifiers::default(),
     });
     assert!(
-        !matches!(mid_out, InputOutcome::Action { .. } | InputOutcome::Blocked { .. }),
+        !matches!(
+            mid_out,
+            InputOutcome::Action { .. } | InputOutcome::Blocked { .. }
+        ),
         "mid-drag must not emit Action/Blocked: {mid_out:?}"
     );
     let _ = eng.input(InputEvent::PointerUp {
@@ -478,7 +577,14 @@ fn a27_blocked_race_fallback() {
     let mut eng = boot_big_form();
     let mut slices = Slices::new();
     let mut frags = Frags::default();
-    requires_change(&mut eng, &mut slices, &mut frags, "settings.apply", "f", REASON);
+    requires_change(
+        &mut eng,
+        &mut slices,
+        &mut frags,
+        "settings.apply",
+        "f",
+        REASON,
+    );
     assert!(is_greyed(&eng, "apply", REASON));
 
     // Click a just-greyed Apply (clean form, race): Blocked, not Action.
@@ -547,7 +653,10 @@ fn a27_dependent_inputs_grey_on_uncheck_ungrey_on_check() {
 
     let _ = click(&mut eng, "music2");
     for id in ["musicVolume", "musicLabel", "musicMuted"] {
-        assert!(is_enabled(&eng, id), "{id} must ungrey once Music is checked");
+        assert!(
+            is_enabled(&eng, id),
+            "{id} must ungrey once Music is checked"
+        );
     }
 
     let _ = click(&mut eng, "music2");
@@ -726,7 +835,14 @@ fn a27_missing_form_is_enabled_no_error() {
     let mut eng = boot(html, &["settings.ghost"]);
     let mut slices = Slices::new();
     let mut frags = Frags::default();
-    requires_change(&mut eng, &mut slices, &mut frags, "settings.ghost", "ghost", REASON);
+    requires_change(
+        &mut eng,
+        &mut slices,
+        &mut frags,
+        "settings.ghost",
+        "ghost",
+        REASON,
+    );
 
     assert!(
         is_enabled(&eng, "applyH"),
@@ -742,7 +858,8 @@ fn a27_missing_form_is_enabled_no_error() {
 
 fn assert_partial_eq_full(partial: &RgbaImage, full: &RgbaImage, label: &str) {
     assert_eq!(
-        partial.pixels, full.pixels,
+        partial.pixels,
+        full.pixels,
         "{label}: partial vs full differ ({} px)",
         partial
             .pixels
@@ -758,7 +875,14 @@ fn a27_damage_scoped_to_changed_controls_partial_eq_full() {
     let mut eng = boot_big_form();
     let mut slices = Slices::new();
     let mut frags = Frags::default();
-    requires_change(&mut eng, &mut slices, &mut frags, "settings.apply", "f", REASON);
+    requires_change(
+        &mut eng,
+        &mut slices,
+        &mut frags,
+        "settings.apply",
+        "f",
+        REASON,
+    );
     let _ = eng.paint(vp());
 
     let _ = click(&mut eng, "music");
@@ -787,12 +911,23 @@ fn a27_damage_scoped_to_changed_controls_partial_eq_full() {
     let mut eng_full = boot_big_form();
     let mut slices_full = Slices::new();
     let mut frags_full = Frags::default();
-    requires_change(&mut eng_full, &mut slices_full, &mut frags_full, "settings.apply", "f", REASON);
+    requires_change(
+        &mut eng_full,
+        &mut slices_full,
+        &mut frags_full,
+        "settings.apply",
+        "f",
+        REASON,
+    );
     let _ = eng_full.paint(vp());
     let _ = click(&mut eng_full, "music");
     eng_full.mark_theme_or_stylesheet_changed();
     let full = eng_full.paint(vp()).unwrap();
-    assert_partial_eq_full(&partial_px, full.rgba.as_ref().unwrap(), "hx-changed/RequiresChange damage");
+    assert_partial_eq_full(
+        &partial_px,
+        full.rgba.as_ref().unwrap(),
+        "hx-changed/RequiresChange damage",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -842,7 +977,10 @@ fn run_parity_script(
     let mut sync_outs = Vec::new();
     for ev in script {
         let o = sync_eng.input(ev.clone());
-        if matches!(o, InputOutcome::Action { .. } | InputOutcome::Blocked { .. }) {
+        if matches!(
+            o,
+            InputOutcome::Action { .. } | InputOutcome::Blocked { .. }
+        ) {
             sync_outs.push(o);
         }
     }
@@ -862,7 +1000,12 @@ fn run_parity_script(
         .poll_outcomes()
         .into_iter()
         .map(|o| o.outcome)
-        .filter(|o| matches!(o, InputOutcome::Action { .. } | InputOutcome::Blocked { .. }))
+        .filter(|o| {
+            matches!(
+                o,
+                InputOutcome::Action { .. } | InputOutcome::Blocked { .. }
+            )
+        })
         .collect();
 
     (sync_outs, worker_outs)
@@ -870,8 +1013,18 @@ fn run_parity_script(
 
 fn click_script(x: f32, y: f32) -> Vec<InputEvent> {
     vec![
-        InputEvent::PointerDown { x, y, button: PointerButton::Primary, mods: Modifiers::default() },
-        InputEvent::PointerUp { x, y, button: PointerButton::Primary, mods: Modifiers::default() },
+        InputEvent::PointerDown {
+            x,
+            y,
+            button: PointerButton::Primary,
+            mods: Modifiers::default(),
+        },
+        InputEvent::PointerUp {
+            x,
+            y,
+            button: PointerButton::Primary,
+            mods: Modifiers::default(),
+        },
     ]
 }
 
@@ -885,19 +1038,31 @@ fn a27_worker_parity_requires_change() {
     let mut pkt = base_packet();
     pkt.actions = vec![(
         "settings.apply".into(),
-        ActionState::RequiresChange { form: "f".into(), reason: REASON.into() },
+        ActionState::RequiresChange {
+            form: "f".into(),
+            reason: REASON.into(),
+        },
     )];
     pkt.versions.insert("actions".into(), 2);
 
     let mut script = click_script(ax, ay); // #1: click while clean -> Blocked
     script.extend(click_script(lx, ly)); // focus the label field
     script.push(InputEvent::Key(KeyEvent {
-        key: "a".into(), code: "KeyA".into(),
-        mods: Modifiers { ctrl: true, ..Default::default() }, repeat: false, pressed: true,
+        key: "a".into(),
+        code: "KeyA".into(),
+        mods: Modifiers {
+            ctrl: true,
+            ..Default::default()
+        },
+        repeat: false,
+        pressed: true,
     }));
     script.push(InputEvent::Key(KeyEvent {
-        key: "Backspace".into(), code: "Backspace".into(),
-        mods: Modifiers::default(), repeat: false, pressed: true,
+        key: "Backspace".into(),
+        code: "Backspace".into(),
+        mods: Modifiers::default(),
+        repeat: false,
+        pressed: true,
     }));
     script.push(InputEvent::Text("Edited".into()));
     script.extend(click_script(ax, ay)); // #2: click after the edit -> Action
@@ -913,7 +1078,8 @@ fn a27_worker_parity_requires_change() {
 
 #[test]
 fn a27_worker_parity_enabled_when() {
-    let html = format!("<!DOCTYPE html><html><body style=\"margin:0\">{DEPENDENT_FORM}</body></html>");
+    let html =
+        format!("<!DOCTYPE html><html><body style=\"margin:0\">{DEPENDENT_FORM}</body></html>");
     let probe = boot_dependent_form();
     let y = range_y(&probe, "musicVolume");
     let from_x = range_x_for(&probe, "musicVolume", 20.0, 0.0, 100.0);
@@ -925,11 +1091,35 @@ fn a27_worker_parity_enabled_when() {
     pkt.versions.insert("actions".into(), 2);
 
     let script = vec![
-        InputEvent::PointerDown { x: from_x, y, button: PointerButton::Primary, mods: Modifiers::default() },
-        InputEvent::PointerMove { x: to_x, y, mods: Modifiers::default() },
-        InputEvent::PointerUp { x: to_x, y, button: PointerButton::Primary, mods: Modifiers::default() },
-        InputEvent::PointerDown { x: ax, y: ay, button: PointerButton::Primary, mods: Modifiers::default() },
-        InputEvent::PointerUp { x: ax, y: ay, button: PointerButton::Primary, mods: Modifiers::default() },
+        InputEvent::PointerDown {
+            x: from_x,
+            y,
+            button: PointerButton::Primary,
+            mods: Modifiers::default(),
+        },
+        InputEvent::PointerMove {
+            x: to_x,
+            y,
+            mods: Modifiers::default(),
+        },
+        InputEvent::PointerUp {
+            x: to_x,
+            y,
+            button: PointerButton::Primary,
+            mods: Modifiers::default(),
+        },
+        InputEvent::PointerDown {
+            x: ax,
+            y: ay,
+            button: PointerButton::Primary,
+            mods: Modifiers::default(),
+        },
+        InputEvent::PointerUp {
+            x: ax,
+            y: ay,
+            button: PointerButton::Primary,
+            mods: Modifiers::default(),
+        },
     ];
 
     let (sync_outs, worker_outs) = run_parity_script(&html, &["settings.g"], pkt, &script);
@@ -955,7 +1145,14 @@ fn a27_applied_baseline_survives_rerender_with_draft_values() {
     let mut eng = boot_swappable_form();
     let mut slices = Slices::new();
     let mut frags = initial_swappable_frags();
-    requires_change(&mut eng, &mut slices, &mut frags, "settings.apply2b", "f2", REASON);
+    requires_change(
+        &mut eng,
+        &mut slices,
+        &mut frags,
+        "settings.apply2b",
+        "f2",
+        REASON,
+    );
     assert!(is_greyed(&eng, "apply2b", REASON));
 
     // Re-render with an unsaved draft value PLUS data-hx-applied carrying the
@@ -1002,11 +1199,17 @@ fn a27_applied_checkbox_both_directions() {
 
     // Check it to match applied "true": clean.
     let _ = click(&mut eng, "gift");
-    assert!(is_greyed(&eng, "applyH2", REASON), "matching the applied state must grey");
+    assert!(
+        is_greyed(&eng, "applyH2", REASON),
+        "matching the applied state must grey"
+    );
 
     // Uncheck again: dirty.
     let _ = click(&mut eng, "gift");
-    assert!(is_enabled(&eng, "applyH2"), "diverging from applied again must ungrey");
+    assert!(
+        is_enabled(&eng, "applyH2"),
+        "diverging from applied again must ungrey"
+    );
 }
 
 const APPLIED_RADIO_FORM: &str = r##"
@@ -1021,12 +1224,22 @@ fn a27_applied_radio_both_directions() {
     let mut eng = boot(APPLIED_RADIO_FORM, &["settings.h2"]);
     let mut slices = Slices::new();
     let mut frags = Frags::default();
-    requires_change(&mut eng, &mut slices, &mut frags, "settings.h2", "h2", REASON);
+    requires_change(
+        &mut eng,
+        &mut slices,
+        &mut frags,
+        "settings.h2",
+        "h2",
+        REASON,
+    );
 
     // "a" is rendered checked ("true") but data-hx-applied="false" (unset on
     // "a"); "b" is rendered unchecked ("false") but applied "true": both
     // radios mismatch their applied state -> dirty.
-    assert!(is_enabled(&eng, "applyH3"), "radio mismatch vs applied must be dirty");
+    assert!(
+        is_enabled(&eng, "applyH3"),
+        "radio mismatch vs applied must be dirty"
+    );
 
     let _ = click(&mut eng, "opt-b");
     assert!(
@@ -1035,7 +1248,10 @@ fn a27_applied_radio_both_directions() {
     );
 
     let _ = click(&mut eng, "opt-a");
-    assert!(is_enabled(&eng, "applyH3"), "picking away from applied again must ungrey");
+    assert!(
+        is_enabled(&eng, "applyH3"),
+        "picking away from applied again must ungrey"
+    );
 }
 
 #[test]
@@ -1052,7 +1268,14 @@ fn a27_applied_missing_falls_back_to_rendered_value() {
     let mut eng = boot(html, &["settings.h3"]);
     let mut slices = Slices::new();
     let mut frags = Frags::default();
-    requires_change(&mut eng, &mut slices, &mut frags, "settings.h3", "h3", REASON);
+    requires_change(
+        &mut eng,
+        &mut slices,
+        &mut frags,
+        "settings.h3",
+        "h3",
+        REASON,
+    );
     // withApplied differs from "base" -> dirty regardless of noApplied.
     assert!(is_enabled(&eng, "applyH4"));
 
@@ -1072,7 +1295,9 @@ fn a27_applied_attribute_rejected_on_non_control_element() {
     let mut eng = Engine::new(EngineConfig::default());
     eng.declare_actions(&["a.x"]);
     let err = eng
-        .load_html(r#"<!DOCTYPE html><html><body><div id="d" data-hx-applied="x">x</div></body></html>"#)
+        .load_html(
+            r#"<!DOCTYPE html><html><body><div id="d" data-hx-applied="x">x</div></body></html>"#,
+        )
         .expect_err("data-hx-applied on a div");
     match err {
         EngineError::InvalidAttribute { attr, .. } => assert_eq!(attr, ATTR_HX_APPLIED),
@@ -1093,24 +1318,36 @@ fn a27_applied_attribute_rejected_on_non_control_element() {
 
 #[test]
 fn a27_worker_parity_applied_baseline() {
-    let html = format!("<!DOCTYPE html><html><body style=\"margin:0\">{APPLIED_CHECKBOX_FORM}</body></html>");
+    let html = format!(
+        "<!DOCTYPE html><html><body style=\"margin:0\">{APPLIED_CHECKBOX_FORM}</body></html>"
+    );
     let probe = boot(APPLIED_CHECKBOX_FORM, &["settings.h"]);
     let (ax, ay) = center(&probe, "applyH2");
 
     let mut pkt = base_packet();
     pkt.actions = vec![(
         "settings.h".into(),
-        ActionState::RequiresChange { form: "h".into(), reason: REASON.into() },
+        ActionState::RequiresChange {
+            form: "h".into(),
+            reason: REASON.into(),
+        },
     )];
     pkt.versions.insert("actions".into(), 2);
 
     // The checkbox is rendered unchecked but `data-hx-applied="true"`:
     // dirty from the very first sync, on both engines.
-    let (sync_outs, worker_outs) = run_parity_script(&html, &["settings.h"], pkt, &click_script(ax, ay));
+    let (sync_outs, worker_outs) =
+        run_parity_script(&html, &["settings.h"], pkt, &click_script(ax, ay));
     assert_eq!(sync_outs.len(), 1, "{sync_outs:?}");
     assert_eq!(worker_outs.len(), 1, "{worker_outs:?}");
-    assert!(matches!(sync_outs[0], InputOutcome::Action { .. }), "{sync_outs:?}");
-    assert!(matches!(worker_outs[0], InputOutcome::Action { .. }), "{worker_outs:?}");
+    assert!(
+        matches!(sync_outs[0], InputOutcome::Action { .. }),
+        "{sync_outs:?}"
+    );
+    assert!(
+        matches!(worker_outs[0], InputOutcome::Action { .. }),
+        "{worker_outs:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1122,16 +1359,28 @@ fn a27_hx_changed_appears_on_edit_clears_on_revert_all_kinds() {
     let mut eng = boot_big_form();
     let mut slices = Slices::new();
     let mut frags = Frags::default();
-    requires_change(&mut eng, &mut slices, &mut frags, "settings.apply", "f", REASON);
+    requires_change(
+        &mut eng,
+        &mut slices,
+        &mut frags,
+        "settings.apply",
+        "f",
+        REASON,
+    );
 
-    for id in ["label", "qty", "vol", "music", "mode-a", "mode-b", "quality"] {
+    for id in [
+        "label", "qty", "vol", "music", "mode-a", "mode-b", "quality",
+    ] {
         assert!(!eng.has_class(id, "hx-changed"), "{id} must start clean");
     }
 
     set_field_text(&mut eng, "label", "Edited");
     assert!(eng.has_class("label", "hx-changed"));
     set_field_text(&mut eng, "label", "Base");
-    assert!(!eng.has_class("label", "hx-changed"), "reverted text must clear hx-changed");
+    assert!(
+        !eng.has_class("label", "hx-changed"),
+        "reverted text must clear hx-changed"
+    );
 
     set_field_text(&mut eng, "qty", "9");
     assert!(eng.has_class("qty", "hx-changed"));
@@ -1147,12 +1396,18 @@ fn a27_hx_changed_appears_on_edit_clears_on_revert_all_kinds() {
     assert!(!eng.has_class("vol", "hx-changed"));
 
     let _ = click(&mut eng, "music");
-    assert!(eng.has_class("music", "hx-changed"), "checkbox toggle must set hx-changed");
+    assert!(
+        eng.has_class("music", "hx-changed"),
+        "checkbox toggle must set hx-changed"
+    );
     let _ = click(&mut eng, "music");
     assert!(!eng.has_class("music", "hx-changed"));
 
     let _ = click(&mut eng, "mode-b");
-    assert!(eng.has_class("mode-b", "hx-changed"), "newly-picked radio must be changed");
+    assert!(
+        eng.has_class("mode-b", "hx-changed"),
+        "newly-picked radio must be changed"
+    );
     assert!(
         eng.has_class("mode-a", "hx-changed"),
         "the radio that was the baseline pick is now unchecked -> also changed"
@@ -1173,7 +1428,14 @@ fn a27_hx_changed_rerender_with_matching_value_has_no_class() {
     let mut eng = boot_swappable_form();
     let mut slices = Slices::new();
     let mut frags = initial_swappable_frags();
-    requires_change(&mut eng, &mut slices, &mut frags, "settings.apply2b", "f2", REASON);
+    requires_change(
+        &mut eng,
+        &mut slices,
+        &mut frags,
+        "settings.apply2b",
+        "f2",
+        REASON,
+    );
     assert!(!eng.has_class("label2", "hx-changed"));
 
     frags.set(
@@ -1193,7 +1455,14 @@ fn a27_hx_changed_flip_damage_stays_within_control_bounds() {
     let mut eng = boot_big_form();
     let mut slices = Slices::new();
     let mut frags = Frags::default();
-    requires_change(&mut eng, &mut slices, &mut frags, "settings.apply", "f", REASON);
+    requires_change(
+        &mut eng,
+        &mut slices,
+        &mut frags,
+        "settings.apply",
+        "f",
+        REASON,
+    );
     let _ = eng.paint(vp());
 
     let _ = click(&mut eng, "music");
@@ -1206,12 +1475,23 @@ fn a27_hx_changed_flip_damage_stays_within_control_bounds() {
     // rect is scoped near the checkbox and none approach a full repaint.
     let near_checkbox = out.damage.iter().any(|r| {
         let pad = 24.0;
-        r.x <= mx + mw + pad && r.x + r.width >= mx - pad && r.y <= my + mh + pad && r.y + r.height >= my - pad
+        r.x <= mx + mw + pad
+            && r.x + r.width >= mx - pad
+            && r.y <= my + mh + pad
+            && r.y + r.height >= my - pad
     });
-    assert!(near_checkbox, "no damage rect near the checkbox: {:?}", out.damage);
+    assert!(
+        near_checkbox,
+        "no damage rect near the checkbox: {:?}",
+        out.damage
+    );
     let full_area = 500.0 * 500.0;
     let damaged_area: f64 = out.damage.iter().map(|r| (r.width * r.height) as f64).sum();
-    assert!(damaged_area < full_area * 0.5, "damage must not blow up to a full repaint: {:?}", out.damage);
+    assert!(
+        damaged_area < full_area * 0.5,
+        "damage must not blow up to a full repaint: {:?}",
+        out.damage
+    );
 }
 
 #[test]
@@ -1219,7 +1499,14 @@ fn a27_hx_changed_second_keystroke_same_state_no_class_write_no_extra_damage() {
     let mut eng = boot_big_form();
     let mut slices = Slices::new();
     let mut frags = Frags::default();
-    requires_change(&mut eng, &mut slices, &mut frags, "settings.apply", "f", REASON);
+    requires_change(
+        &mut eng,
+        &mut slices,
+        &mut frags,
+        "settings.apply",
+        "f",
+        REASON,
+    );
     let _ = eng.paint(vp());
 
     eng.test_set_focus("label");
@@ -1270,7 +1557,10 @@ fn a27_hx_changed_worker_parity() {
     let mut pkt = base_packet();
     pkt.actions = vec![(
         "settings.apply".into(),
-        ActionState::RequiresChange { form: "f".into(), reason: REASON.into() },
+        ActionState::RequiresChange {
+            form: "f".into(),
+            reason: REASON.into(),
+        },
     )];
     pkt.versions.insert("actions".into(), 2);
 
@@ -1279,6 +1569,12 @@ fn a27_hx_changed_worker_parity() {
     let (sync_outs, worker_outs) = run_parity_script(&html, &["settings.apply"], pkt, &script);
     assert_eq!(sync_outs.len(), 1, "{sync_outs:?}");
     assert_eq!(worker_outs.len(), 1, "{worker_outs:?}");
-    assert!(matches!(sync_outs[0], InputOutcome::Action { .. }), "{sync_outs:?}");
-    assert!(matches!(worker_outs[0], InputOutcome::Action { .. }), "{worker_outs:?}");
+    assert!(
+        matches!(sync_outs[0], InputOutcome::Action { .. }),
+        "{sync_outs:?}"
+    );
+    assert!(
+        matches!(worker_outs[0], InputOutcome::Action { .. }),
+        "{worker_outs:?}"
+    );
 }

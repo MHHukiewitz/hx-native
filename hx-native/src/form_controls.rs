@@ -451,7 +451,11 @@ fn checkbox_checked_state(node: &Node) -> bool {
 /// Issue #15: every `<input>` / `<select>` with `name == name` inside
 /// `form_nid` (document order) — the dependent-input targets of an
 /// `InputRule`.
-pub(crate) fn named_controls_in_form(doc: &HtmlDocument, form_nid: NodeId, name: &str) -> Vec<NodeId> {
+pub(crate) fn named_controls_in_form(
+    doc: &HtmlDocument,
+    form_nid: NodeId,
+    name: &str,
+) -> Vec<NodeId> {
     let mut out = Vec::new();
     for nid in descendants_document_order(doc, form_nid) {
         let Some(node) = doc.get_node(nid) else {
