@@ -793,6 +793,8 @@ fn caret_truth_fields() -> String {
 <input id="g" type="text" name="g" value="hello" style="position:absolute;left:150px;top:17.7px;width:120px;height:22px;font-size:14px;background:linear-gradient(90deg,#ff4040,#4040ff)"/>
 <input id="st" type="text" name="st" value="hello" style="position:absolute;left:13.3px;top:67.7px;width:120px;height:26px;font-size:14px;background:repeating-linear-gradient(0deg,#ffffff 0px,#ffffff 2px,#a0a0a0 2px,#a0a0a0 4px)"/>
 <input id="al" type="text" name="al" value="hello" style="position:absolute;left:150px;top:67.7px;width:120px;height:22px;font-size:14px;background:rgba(255,255,255,0.35)"/>
+<div id="ell_src" style="position:absolute;left:13.3px;top:107.7px;width:120px;height:22px;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;background:#fff">a quite very extremely long line of text here</div>
+<input id="ell" type="text" name="ell" value="" style="position:absolute;left:115px;top:107.7px;width:18px;height:22px;font-size:14px;background:transparent;border:none;padding:0"/>
 <button id="other" style="position:absolute;left:150px;top:140px">other</button>"##
         .to_string()
 }
@@ -919,7 +921,7 @@ fn caret_blink_off_matches_transparent_caret_truth() {
     let mut truth_checked = 0usize;
     for transformed in [false, true] {
         for scale in [1.0, 1.25, 2.0] {
-            for field in ["t", "g", "st", "al", "edge"] {
+            for field in ["t", "g", "st", "al", "ell", "edge"] {
                 for (name, steps) in &scen {
                     total += 1;
                     let mut a = caret_truth_boot(transformed, scale, false);

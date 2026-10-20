@@ -3572,6 +3572,24 @@ impl LiveSurface {
         scale: f64,
         paint_mode: PaintMode,
     ) -> Result<RgbaImage, EngineError> {
+        // Blink-off caret rect, computed against the full (pre-truncation)
+        // layout before the ellipsis session below swaps any truncated
+        // TextLayouts in. The node is the focused text input, never an
+        // ellipsis-truncated box, so the untruncated geometry here matches
+        // what the session will later restore.
+        let blink_off_caret: Option<(NodeId, IntRect)> = self
+            .text_edit
+            .as_ref()
+            .filter(|s| !s.caret_visible)
+            .map(|s| s.node_id)
+            .and_then(|nid| {
+                if has_selection(&mut self.doc, nid) {
+                    None
+                } else {
+                    caret_device_rect(&mut self.doc, nid, scale, width, height).map(|r| (nid, r))
+                }
+            });
+
         // Issue #12: swap cached truncated TextLayouts for paint only. DOM text
         // stays full; EllipsisPaintSession restores layouts on Drop (also on
         // `?` / panic) — no document needs_resolve and no truncated geometry.
@@ -3595,7 +3613,7 @@ impl LiveSurface {
         let full = plan.full_repaint
             || plan.rects.len() == 1 && plan.rects[0] == IntRect::full_surface(width, height);
 
-        let rgba = if full {
+        let mut rgba = if full {
             paint_rgba(session.doc_mut(), width, height, scale)
         } else {
             let mut frame = self.cached_rgba.take().unwrap_or_else(|| RgbaImage {
@@ -3620,27 +3638,27 @@ impl LiveSurface {
             Ok(frame)
         };
 
+        // Blink-off: re-rasterize the caret damage rect with FOCUS cleared so
+        // Blitz skips caret drawing (render.rs is_focussed check). No colour
+        // overlay — that clipped glyphs and flattened gradients/stripes. Done
+        // while the ellipsis session above is still installed: dropping the
+        // session first would restore full (uncut) TextLayouts, so this redraw
+        // would re-rasterize any ellipsis box overlapping the caret rect with
+        // its full, uncut text instead of the truncated text the rest of the
+        // frame shows.
+        if let (Ok(frame), Some((nid, r))) = (rgba.as_mut(), blink_off_caret) {
+            let mut suppress = SuppressCaretFocus::clear(session.doc_mut(), nid);
+            let result = paint_damage_into(suppress.doc_mut(), frame, scale, &[r], paint_mode);
+            // Drop restores ElementState::FOCUS before overlays / before the
+            // ellipsis session restores the full text layouts below.
+            drop(suppress);
+            result?;
+        }
+
         // Explicit drop before returning so restore order is obvious; also runs
         // on `?` / panic via Drop.
         drop(session);
         let mut frame = rgba?;
-
-        // Blink-off: re-rasterize the caret damage rect with FOCUS cleared so
-        // Blitz skips caret drawing (render.rs is_focussed check). No colour
-        // overlay — that clipped glyphs and flattened gradients/stripes.
-        if self.text_edit.as_ref().is_some_and(|s| !s.caret_visible) {
-            let nid = self.text_edit.as_ref().map(|s| s.node_id);
-            if let Some(nid) = nid {
-                if !has_selection(&mut self.doc, nid) {
-                    if let Some(r) = caret_device_rect(&mut self.doc, nid, scale, width, height) {
-                        let mut suppress = SuppressCaretFocus::clear(&mut self.doc, nid);
-                        paint_damage_into(suppress.doc_mut(), &mut frame, scale, &[r], paint_mode)?;
-                        // Drop restores ElementState::FOCUS before overlays.
-                        drop(suppress);
-                    }
-                }
-            }
-        }
 
         // Engine-drawn select face button + open list (above Blitz content).
         paint_select_overlays(
