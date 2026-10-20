@@ -770,3 +770,104 @@ fn warm_cache_matches_fresh_on_hover_color_only_control() {
     // Color is paint-only; even an incomplete cache key must stay byte-identical.
     warm_vs_fresh_hover("hover color:#fff (control)", "color: #fff;");
 }
+
+fn ellipsis_box_page(extra_css: &str, inner_html: &str) -> String {
+    format!(
+        r##"<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/>
+<style>
+* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+body {{ width: 320px; height: 80px; background: #1a1f2a; color: #9aa3b5;
+  font-family: "DejaVu Sans", sans-serif; font-size: 13px; }}
+#t {{
+  position: absolute; left: 8px; top: 24px;
+  width: 200px; height: 20px; line-height: 20px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  {extra_css}
+}}
+</style></head><body>
+<div id="t">{inner_html}</div>
+</body></html>"##
+    )
+}
+
+#[test]
+fn ellipsis_cut_preserves_document_order_with_inline_elements() {
+    // Multiple text nodes around <b>: cut must use Blitz document order, not a
+    // reversed DOM walk (old path painted " settlement rail for this or…").
+    let html = ellipsis_box_page(
+        "",
+        "Disabled: <b>not enough</b> credit on the active settlement rail for this order size",
+    );
+    let mut eng = boot(&html);
+    let _ = eng.paint(vp()).unwrap();
+    let truncated = eng
+        .test_ellipsis_truncated("t")
+        .expect("expected truncation");
+    assert!(
+        truncated.starts_with("Disabled: not enough"),
+        "cut must keep document order; got {truncated:?}"
+    );
+    assert!(
+        !truncated.trim_start().starts_with("settlement"),
+        "reversed text-node walk would start near the tail: {truncated:?}"
+    );
+}
+
+#[test]
+fn ellipsis_cut_collapses_whitespace_like_blitz() {
+    // Indented template text: cut against Blitz's collapsed layout text, not
+    // raw DOM (old path cut too early at "Disabled: not en…").
+    let html = ellipsis_box_page(
+        "",
+        "\n  Disabled: not enough credit on the active settlement rail for this order size\n",
+    );
+    let mut eng = boot(&html);
+    let _ = eng.paint(vp()).unwrap();
+    let truncated = eng
+        .test_ellipsis_truncated("t")
+        .expect("expected truncation");
+    assert!(
+        truncated.starts_with("Disabled: not enough credit"),
+        "collapsed cut must keep a longer prefix; got {truncated:?}"
+    );
+    assert!(
+        !truncated.starts_with("Disabled: not en\u{2026}")
+            && !truncated.starts_with("Disabled: not en…"),
+        "raw-DOM cut truncates too early: {truncated:?}"
+    );
+}
+
+#[test]
+fn ellipsis_paint_matches_blitz_with_text_transform() {
+    // Truncated reshape must use Blitz's already-transformed layout text;
+    // hover-driven text-transform must also invalidate the cache key.
+    let text = long_reason();
+    let page = |overflow: &str, body: &str| {
+        ellipsis_box_page(&format!("text-transform: uppercase; {overflow}"), body)
+    };
+
+    let mut with_e = boot(&page("text-overflow: ellipsis;", text));
+    let with_img = with_e.paint(vp()).unwrap().rgba.unwrap();
+    let truncated = with_e
+        .test_ellipsis_truncated("t")
+        .expect("expected truncation");
+    assert!(
+        truncated.chars().all(|c| !c.is_ascii_lowercase()),
+        "layout text should already be uppercase: {truncated:?}"
+    );
+
+    let mut blitz = boot(&page("", &truncated));
+    let blitz_img = blitz.paint(vp()).unwrap().rgba.unwrap();
+    let diff = pixel_diff(&with_img, &blitz_img);
+    assert_eq!(
+        diff, 0,
+        "text-transform ellipsis paint must match Blitz painting the \
+         truncated uppercase string (diff_pixels={diff}, truncated={truncated:?})"
+    );
+
+    warm_vs_fresh_hover(
+        "hover text-transform:uppercase",
+        "text-transform: uppercase;",
+    );
+}

@@ -30,16 +30,12 @@
 //! [`Drop`], so early `?` returns and panics still undo the swap.
 //!
 //! Truncated layouts are cached under a key of
-//! `(original text, content-box width rounded to 1/64 px, font/style fingerprint)`.
-//! A cache miss reshapes once via parley (not counted as a document style/layout
-//! pass). Clear the cache when the DOM mutates (`EllipsisCache::clear`).
-//!
-//! # Mixed inline styling
-//!
-//! Truncated paint uses a single style taken from the ellipsis element (first
-//! text node's brush id). Nested inline styling such as `<b>` / `<em>` is
-//! flattened to that style for the truncated string. Full mixed-run restyling
-//! is out of scope until needed.
+//! `(Blitz layout text, content-box width @ 1/64 px, scale bits,
+//! TextStyle+AlignParams fingerprint)`. The layout text is Blitz's
+//! whitespace-collapsed, `text-transform`ed string in document order — not the
+//! raw DOM concatenation. A cache miss reshapes once via parley (not counted as
+//! a document style/layout pass). Clear the cache when the DOM mutates
+//! (`EllipsisCache::clear`).
 //!
 //! # Pin sensitivity (Blitz / stylo)
 //!
@@ -51,7 +47,8 @@
 //! - `Node::final_layout()` — content-box width
 //! - `Node::primary_styles()` + `format!("{:?}", styles.clone_text_overflow())`
 //!   (and wrap / overflow-x / font fingerprint fields) — style detection
-//! - `TextLayout::{text, layout, block_offset, span_cb_flags}` — paint payload
+//! - `TextLayout::{text, layout, block_offset, span_cb_flags}` — paint payload;
+//!   `text` is the source string for the cut (collapsed / transformed)
 //! - `TextBrush { id }` — glyph brush for paint / hit attribution
 //! - [`crate::stylo_text_style`] — copy of Blitz's `pub(crate)`
 //!   `stylo_to_parley::style` (font-size/family/weight/style, letter-/word-spacing,
@@ -67,6 +64,9 @@
 //! - [`crate::stylo_text_style::{text_align,text_align_last,base_direction}`] —
 //!   copies of Blitz helpers applied outside `TextStyle` the way Blitz does
 //!   (`construct.rs` `set_base_direction`, `inline.rs` `layout.align`).
+//! - Parley `TextStyle` / layout `Alignment` / `BaseDirection` `Debug` output
+//!   format — used by `shaping_fingerprint`; a parley bump that changes Debug
+//!   can invalidate cache keys silently (tests catch paint mismatches).
 //!
 //! Detection and pixel-match tests in `tests/text_overflow.rs` run in CI's
 //! normal test job (not `#[ignore]`, not feature-gated) so a bump that breaks
@@ -76,6 +76,10 @@
 //!
 //! - RTL / bidirectional ellipsis sides
 //! - Multi-line clamp (`-webkit-line-clamp` / `line-clamp`)
+//! - Child-element styling inside the ellipsis element (e.g. `<b>` / `<em>`):
+//!   truncated paint flattens to the ellipsis element's own style. Document
+//!   order of text is preserved via Blitz's `TextLayout.text`; per-span style
+//!   is not.
 
 use std::collections::HashMap;
 
@@ -97,6 +101,7 @@ const ELLIPSIS: &str = "\u{2026}";
 /// Cache key for a truncated shaped layout.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct TruncationKey {
+    /// Blitz `TextLayout.text` (collapsed / transformed, document order).
     original: String,
     /// Content-box width in CSS px, quantized to 1/64 px (`to_bits` of the rounded value).
     content_w_bits: u32,
@@ -236,7 +241,6 @@ pub(crate) fn prepare_ellipsis_for_paint<'a>(
 struct Candidate {
     element_id: NodeId,
     content_w_css: f32,
-    text_nodes: Vec<NodeId>,
 }
 
 struct Prepared {
@@ -269,14 +273,16 @@ fn find_ellipsis_candidates(doc: &HtmlDocument, scale: f32) -> Vec<Candidate> {
         if text_w_css <= content_w_css + 0.5 {
             continue;
         }
-        let text_nodes = collect_text_nodes(doc, nid);
-        if text_nodes.is_empty() {
+        let has_text = node
+            .element_data()
+            .and_then(|el| el.inline_layout_data.as_ref())
+            .is_some_and(|tl| !tl.text.is_empty());
+        if !has_text {
             continue;
         }
         out.push(Candidate {
             element_id: nid,
             content_w_css,
-            text_nodes,
         });
     }
     out
@@ -316,36 +322,9 @@ fn inline_text_width_css(node: &blitz_dom::Node, scale: f32) -> Option<f32> {
     Some(inline.layout.full_width() / scale)
 }
 
-fn collect_text_nodes(doc: &HtmlDocument, root: NodeId) -> Vec<NodeId> {
-    let mut out = Vec::new();
-    let mut stack = vec![root];
-    while let Some(nid) = stack.pop() {
-        let Some(node) = doc.get_node(nid) else {
-            continue;
-        };
-        for &c in node.children.iter().rev() {
-            stack.push(c);
-        }
-        if node.is_text_node() {
-            out.push(nid);
-        }
-    }
-    out.reverse();
-    out
-}
-
-fn read_combined_text(doc: &HtmlDocument, text_nodes: &[NodeId]) -> String {
-    let mut s = String::new();
-    for &tid in text_nodes {
-        if let Some(td) = doc.get_node(tid).and_then(|n| n.text_data()) {
-            s.push_str(&td.content);
-        }
-    }
-    s
-}
-
 /// Fingerprint the full parley [`TextStyle`] plus [`AlignParams`] used for reshape.
 /// Must include every field that affects cut point or paint (scale is keyed separately).
+/// Pin sensitivity: depends on parley `Debug` formatting — see module rustdoc.
 fn shaping_fingerprint(style: &TextStyle<'static, 'static, TextBrush>, align: &AlignParams) -> u64 {
     let raw = format!("{style:?}|{align:?}");
     let mut h: u64 = 0xcbf29ce484222325;
@@ -531,7 +510,15 @@ fn prepare_one(
     cand: &Candidate,
     scale: f32,
 ) -> Option<Prepared> {
-    let original_text = read_combined_text(doc, &cand.text_nodes);
+    // Cut against Blitz's shaped text (document order, whitespace-collapsed,
+    // text-transform applied) — not a raw DOM concatenation.
+    let original_layout = {
+        let node = doc.get_node(cand.element_id)?;
+        let el = node.element_data()?;
+        let inline = el.inline_layout_data.as_ref()?;
+        Box::new((**inline).clone())
+    };
+    let original_text = original_layout.text.clone();
     if original_text.is_empty() {
         return None;
     }
@@ -547,10 +534,11 @@ fn prepare_one(
 
     if let Some(entry) = cache.by_node.get(&cand.element_id) {
         if entry.key == key {
+            let truncated_layout = Box::new((*entry.layout).clone());
             let original_layout = take_inline_layout(doc, cand.element_id)?;
             return Some(Prepared {
                 original_layout,
-                truncated_layout: Box::new((*entry.layout).clone()),
+                truncated_layout,
                 reshaped: false,
             });
         }
@@ -558,13 +546,6 @@ fn prepare_one(
 
     // Cache miss: cut from shaped cluster advances, reshape truncated string
     // directly (no DOM mutation, no document resolve).
-    let original_layout = {
-        let node = doc.get_node(cand.element_id)?;
-        let el = node.element_data()?;
-        let inline = el.inline_layout_data.as_ref()?;
-        Box::new((**inline).clone())
-    };
-
     let budget = cand.content_w_css * scale;
     let ellipsis_adv = measure_ellipsis_advance(shaper, &style, scale, &align);
     let truncated = truncate_by_clusters(
