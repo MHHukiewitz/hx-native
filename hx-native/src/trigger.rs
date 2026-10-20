@@ -4,6 +4,10 @@ use crate::error::EngineError;
 use crate::types::{KeyEvent, Modifiers};
 
 /// DOM event names accepted by the dialect.
+///
+/// `#[non_exhaustive]` so adding events (e.g. `Change` in #14) does not break
+/// exhaustive matches downstream.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TriggerEvent {
     Click,
@@ -11,6 +15,9 @@ pub enum TriggerEvent {
     AuxClick,
     KeyDown,
     KeyUp,
+    /// Commit-only form control event (range release, checkbox/radio toggle,
+    /// select pick, arrow step). Takes no filters.
+    Change,
     Slice(String),
 }
 
@@ -22,6 +29,7 @@ impl TriggerEvent {
             TriggerEvent::AuxClick => "auxclick",
             TriggerEvent::KeyDown => "keydown",
             TriggerEvent::KeyUp => "keyup",
+            TriggerEvent::Change => "change",
             TriggerEvent::Slice(_) => "slice",
         }
     }
@@ -169,6 +177,16 @@ fn parse_one_trigger(raw: &str, source_id: &str) -> Result<ParsedTrigger, Engine
         }
     }
 
+    // `change` is commit-only and takes no filters (issue #14).
+    if event == TriggerEvent::Change {
+        if filter.is_some() {
+            return Err(invalid(source_id, "change takes no filters"));
+        }
+        if from.is_some() {
+            return Err(invalid(source_id, "change does not allow from:"));
+        }
+    }
+
     Ok(ParsedTrigger {
         event,
         filter,
@@ -213,6 +231,7 @@ fn parse_event_name(name: &str, source_id: &str) -> Result<TriggerEvent, EngineE
         "auxclick" => Ok(TriggerEvent::AuxClick),
         "keydown" => Ok(TriggerEvent::KeyDown),
         "keyup" => Ok(TriggerEvent::KeyUp),
+        "change" => Ok(TriggerEvent::Change),
         "dblclick" => Err(invalid(
             source_id,
             "dblclick is deferred (load error until added)",

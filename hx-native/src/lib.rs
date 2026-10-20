@@ -15,9 +15,11 @@ mod error;
 mod focus;
 mod fonts;
 mod form_args;
+mod form_controls;
 mod memory;
 mod paint;
 mod pending;
+mod select_ui;
 mod stylo_text_style;
 mod trigger;
 mod types;
@@ -27,6 +29,7 @@ pub use damage::{element_border_box_css, element_border_box_device};
 pub use dialect::{SwapMode, SyncMode};
 pub use engine::{DirtySet, Engine};
 pub use error::EngineError;
+pub use form_args::{args_get, args_get_all};
 pub use memory::{
     estimate_document_bytes, estimate_rgba_bytes, estimate_surface_engine_bytes,
     DOCUMENT_ESTIMATE_BASE_BYTES, DOCUMENT_ESTIMATE_PER_HTML_BYTE, RGBA_BYTES_PER_PIXEL,

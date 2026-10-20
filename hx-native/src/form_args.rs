@@ -2,10 +2,35 @@
 //!
 //! Order: triggering element's own pair first (if named), then named controls
 //! in the closest ancestor `<form>` in document order (trigger not repeated).
+//!
+//! Repeated names (e.g. several checked checkboxes with `name="state"`) each
+//! contribute a `(name, value)` pair in document order — the same shape as
+//! HTML form serialization and htmx. Use [`args_get`] for the first value and
+//! [`args_get_all`] for every value. The args type stays `Vec<(String, String)>`
+//! so Mainnet's existing consumers keep working.
+//!
+//! When the triggering element has `name=` / `value=` and the form also has a
+//! field with that name, both appear: the trigger's value first, then the
+//! form's (htmx parity).
 
 use blitz_dom::node::Node;
 use blitz_dom::{qual_name, NodeId};
 use blitz_html::HtmlDocument;
+
+/// First value for `name`, if any (htmx / HTML single-value accessor).
+pub fn args_get<'a>(args: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    args.iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, v)| v.as_str())
+}
+
+/// Every value for `name`, in args order (document order for form fields).
+pub fn args_get_all<'a>(args: &'a [(String, String)], name: &str) -> Vec<&'a str> {
+    args.iter()
+        .filter(|(n, _)| n == name)
+        .map(|(_, v)| v.as_str())
+        .collect()
+}
 
 /// Collect args for an action fired from `source_id`.
 pub fn collect_action_args(doc: &HtmlDocument, source_id: &str) -> Vec<(String, String)> {
@@ -18,8 +43,11 @@ pub fn collect_action_args(doc: &HtmlDocument, source_id: &str) -> Vec<(String, 
     };
 
     // (1) Triggering element first, if it has a non-empty name.
+    // Any element (button, tr, input, select, …) with name= contributes a
+    // pair, matching htmx. Form controls use their control value (selected
+    // option, checkbox value, …); other elements use the `value` attribute.
     if let Some(name) = named_attr(source, "name") {
-        args.push((name, control_value(source)));
+        args.push((name, trigger_element_value(doc, source)));
     }
 
     // Then named controls in the closest ancestor form (document order).
@@ -38,6 +66,29 @@ pub fn collect_action_args(doc: &HtmlDocument, source_id: &str) -> Vec<(String, 
         }
     }
     args
+}
+
+/// Value for a triggering element: real control value for form controls,
+/// otherwise the `value` attribute (empty when missing).
+fn trigger_element_value(doc: &HtmlDocument, node: &Node) -> String {
+    let tag = tag_name(node);
+    match tag.as_str() {
+        "select" => select_value(doc, node),
+        "input" => {
+            let ty = input_type(node);
+            match ty.as_str() {
+                "checkbox" | "radio" => {
+                    // Trigger always contributes its value attr (htmx); default "on".
+                    match attr(node, "value") {
+                        None => "on".to_string(),
+                        Some(v) => v,
+                    }
+                }
+                _ => attr(node, "value").unwrap_or_default(),
+            }
+        }
+        _ => attr(node, "value").unwrap_or_default(),
+    }
 }
 
 /// True when `node` is an `<input type="number|range">`.

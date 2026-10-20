@@ -241,6 +241,10 @@ pub struct KeyEvent {
 }
 
 /// What fired an Action/Blocked.
+///
+/// `#[non_exhaustive]` so adding variants (e.g. `Change` in #14) does not break
+/// exhaustive matches in Mainnet / other downstream crates.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq)]
 pub enum TriggerInfo {
     Pointer {
@@ -255,6 +259,8 @@ pub enum TriggerInfo {
         mods: Modifiers,
         repeat: bool,
     },
+    /// Commit-only form control change (range release, toggle, select pick, step).
+    Change,
     Slice {
         name: String,
     },

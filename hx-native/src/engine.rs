@@ -20,12 +20,20 @@ use crate::error::EngineError;
 use crate::focus::{focusable_ids, ids_in_document_order, step_focus};
 use crate::fonts::bundled_font_context;
 use crate::form_args::{
-    collect_action_args, is_numeric_input, is_range_input, set_range_value_from_x,
-    step_numeric_value,
+    collect_action_args, is_numeric_input, set_range_value_from_x, step_numeric_value,
+};
+use crate::form_controls::{
+    activate_checkable, control_is_disabled, form_control_at_point, select_options, select_radio,
+    select_set_index, select_step, sync_outputs_for, toggle_checkbox, FormControlKind,
+    FormControlRef,
 };
 use crate::memory::estimate_surface_engine_bytes;
 use crate::paint::{paint_damage_into, paint_rgba};
 use crate::pending::{PendingEntry, PendingState, PendingTimeout, QueuedRelease};
+use crate::select_ui::{
+    collect_select_nids, control_rect_of, list_row_at, open_select_state, paint_select_overlays,
+    select_damage_rects, select_row_damage_rect, select_ua_stylesheet, OpenSelect, SELECT_MAX_ROWS,
+};
 use crate::trigger::{
     filter_ctx_from_key, keydown_repeat_allowed, FilterCtx, FromTarget, TriggerEvent,
 };
@@ -179,6 +187,17 @@ struct LiveSurface {
     pending_damage: Vec<IntRect>,
     /// Primary-button drag on an `<input type="range">`.
     range_drag_id: Option<String>,
+    /// Set when a range drag was active on the press that is about to release,
+    /// so `PointerUp` can fire `change` once and suppress `click`.
+    range_drag_released: Option<String>,
+    /// Open Win95 `<select>` drop list (engine-drawn overlay).
+    open_select: Option<OpenSelect>,
+    /// Hovered row in the open list (document coords from last move).
+    select_hover_row: Option<usize>,
+    /// `<select>` node ids cached at index / reindex time.
+    select_nids: Vec<NodeId>,
+    /// Consume the next Esc key-up (key-down closed an open select).
+    consume_escape_keyup: bool,
     /// Cached truncated paint layouts for `text-overflow: ellipsis` (issue #12).
     ellipsis_cache: EllipsisCache,
     /// Lazily created on the first ellipsis candidate (shared DejaVu bytes).
@@ -1012,6 +1031,7 @@ impl Engine {
     }
 
     /// Test helper: set focus by element id (for keyboard tests without Tab walking).
+    #[doc(hidden)]
     pub fn test_set_focus(&mut self, id: &str) {
         if let Some(live) = self
             .surfaces
@@ -1021,8 +1041,65 @@ impl Engine {
             if let Some(nid) = live.doc.get_element_by_id(id) {
                 live.doc.set_focus_to(nid);
                 live.focus.focused_id = Some(id.to_string());
+                live.mark_paint_dirty();
+                live.reconcile_open_select_after_focus();
             }
         }
+    }
+
+    /// Test helper: whether element `id` has a pending Stylo state snapshot
+    /// (set by `snapshot_node_state_only` before a `:checked` flip).
+    #[doc(hidden)]
+    pub fn test_node_has_snapshot(&self, id: &str) -> bool {
+        let live = self.live(SurfaceId::DEFAULT).expect("default surface");
+        let Some(nid) = live.doc.get_element_by_id(id) else {
+            return false;
+        };
+        live.doc.get_node(nid).is_some_and(|n| n.has_snapshot())
+    }
+
+    /// Test helper: whether an ancestor of `id` has `dirty_descendants`
+    /// (set by `mark_ancestors_dirty` after a toggle).
+    #[doc(hidden)]
+    pub fn test_ancestor_has_dirty_descendants(&self, id: &str) -> bool {
+        let live = self.live(SurfaceId::DEFAULT).expect("default surface");
+        let Some(nid) = live.doc.get_element_by_id(id) else {
+            return false;
+        };
+        let Some(node) = live.doc.get_node(nid) else {
+            return false;
+        };
+        let mut parent = node.parent;
+        while let Some(pid) = parent {
+            let Some(p) = live.doc.get_node(pid) else {
+                break;
+            };
+            if p.has_dirty_descendants() {
+                return true;
+            }
+            parent = p.parent;
+        }
+        false
+    }
+
+    /// Test helper: toggle a checkbox by id without firing `change` (so snapshot
+    /// / damage probes are not masked by pending-attribute writes).
+    #[doc(hidden)]
+    pub fn test_toggle_checkbox(&mut self, id: &str) -> bool {
+        let live = self
+            .surfaces
+            .get_mut(&SurfaceId::DEFAULT)
+            .and_then(|s| s.live.as_mut())
+            .expect("default surface");
+        let Some(nid) = live.doc.get_element_by_id(id) else {
+            return false;
+        };
+        let changed = toggle_checkbox(&mut live.doc, nid);
+        if changed {
+            live.mark_dom_dirty();
+            live.mark_paint_dirty();
+        }
+        changed
     }
 
     /// Test helper: push a device-pixel damage rect that must be merged into the
@@ -1115,7 +1192,9 @@ impl LiveSurface {
         validate_loaded_tree(declared_actions, &doc, &known_ids)?;
         let (bindings, sections) = index_bindings(declared_actions, &doc)?;
 
+        doc.add_user_agent_stylesheet(select_ua_stylesheet());
         doc.resolve(0.0);
+        let select_nids = collect_select_nids(&doc);
         Ok(Self {
             doc,
             bindings,
@@ -1136,6 +1215,11 @@ impl LiveSurface {
             last_bounds: BoundsSnapshot::new(),
             pending_damage: Vec::new(),
             range_drag_id: None,
+            range_drag_released: None,
+            open_select: None,
+            select_hover_row: None,
+            select_nids,
+            consume_escape_keyup: false,
             ellipsis_cache: EllipsisCache::default(),
             ellipsis_shaper: None,
             resolve_count: 1,
@@ -1230,6 +1314,8 @@ impl LiveSurface {
         let (bindings, sections) = index_bindings(declared_actions, &self.doc)?;
         self.bindings = bindings;
         self.sections = sections;
+        self.select_nids = collect_select_nids(&self.doc);
+        self.reconcile_open_select();
         Ok(())
     }
 
@@ -1495,6 +1581,7 @@ impl LiveSurface {
         }
         self.mark_dom_dirty();
         self.mark_paint_dirty();
+        self.reconcile_open_select();
     }
 
     fn count_damage(&self) -> (usize, usize) {
@@ -1578,6 +1665,8 @@ impl LiveSurface {
     fn on_pointer_leave(&mut self) -> InputOutcome {
         self.press = None;
         self.range_drag_id = None;
+        self.range_drag_released = None;
+        self.select_hover_row = None;
         if self.doc.clear_hover() {
             self.mark_paint_dirty();
         }
@@ -1591,7 +1680,27 @@ impl LiveSurface {
     fn on_pointer_move(&mut self, x: f32, y: f32) -> InputOutcome {
         self.ensure_resolved();
         if let Some(ref rid) = self.range_drag_id.clone() {
-            let _ = self.apply_range_from_x(rid, x);
+            if !self.element_is_disabled_id(rid) {
+                let _ = self.apply_range_from_x(rid, x);
+            }
+        }
+        // Open select: track hovered row for navy highlight; damage only old/new rows.
+        if let Some(ref open) = self.open_select.clone() {
+            let n = select_options(&self.doc, open.select_nid).len();
+            let row = list_row_at(open, x, y, n);
+            if row != self.select_hover_row {
+                let scale = self.layout_scale;
+                let old = self.select_hover_row.or(Some(open.highlight)).unwrap_or(0);
+                self.push_pending_damage(select_row_damage_rect(open, old, scale));
+                if let Some(r) = row {
+                    self.push_pending_damage(select_row_damage_rect(open, r, scale));
+                    if let Some(os) = self.open_select.as_mut() {
+                        os.highlight = r;
+                    }
+                }
+                self.select_hover_row = row;
+                self.mark_paint_dirty();
+            }
         }
         let (vw, vh) = self.layout_viewport;
         let out_of_bounds = x < 0.0 || y < 0.0 || x >= vw as f32 || y >= vh as f32;
@@ -1625,19 +1734,66 @@ impl LiveSurface {
         button: PointerButton,
         mods: Modifiers,
     ) -> InputOutcome {
-        let id = self.hit_id(x, y);
+        self.ensure_resolved();
+        self.range_drag_released = None;
+
+        // Open select: press inside the list must not hit-test the element under
+        // the overlay (focus + reconcile would close the list and steal the click).
+        let press_in_open_list = button == PointerButton::Primary
+            && self.open_select.as_ref().is_some_and(|open| {
+                let n = select_options(&self.doc, open.select_nid).len();
+                list_row_at(open, x, y, n).is_some()
+            });
+        if press_in_open_list {
+            self.press = None;
+            self.range_drag_id = None;
+            return InputOutcome::Press {
+                id: self.open_select.as_ref().and_then(|o| o.select_id.clone()),
+            };
+        }
+
+        // Open select: click outside closes without change; click on the closed
+        // face while open is handled on up.
+        if button == PointerButton::Primary {
+            if let Some(ref open) = self.open_select.clone() {
+                if open.control_rect.contains(x, y) {
+                    // Stay open; press tracked below.
+                } else {
+                    self.close_select();
+                }
+            }
+        }
+
+        let ctrl = form_control_at_point(&self.doc, x, y);
+        let id = ctrl
+            .as_ref()
+            .and_then(|c| c.element_id.clone())
+            .or_else(|| self.hit_id(x, y));
+
         if let Some(ref eid) = id {
-            // Focus the element on press.
             if let Some(nid) = self.doc.get_element_by_id(eid) {
                 self.doc.set_focus_to(nid);
                 self.focus.focused_id = Some(eid.clone());
             }
-            // Primary press on a range: set value from x and begin drag.
-            self.range_drag_id = None;
-            if button == PointerButton::Primary && self.element_is_range(eid) {
-                self.apply_range_from_x(eid, x);
-                self.range_drag_id = Some(eid.clone());
+        } else if let Some(ref c) = ctrl {
+            self.doc.set_focus_to(c.node_id);
+            self.focus.focused_id = c.element_id.clone();
+        }
+        self.reconcile_open_select_after_focus();
+
+        self.range_drag_id = None;
+        if button == PointerButton::Primary {
+            if let Some(ref c) = ctrl {
+                if c.kind == FormControlKind::Range && !control_is_disabled(&self.doc, c.node_id) {
+                    if let Some(ref eid) = c.element_id {
+                        self.apply_range_from_x(eid, x);
+                        self.range_drag_id = Some(eid.clone());
+                    }
+                }
             }
+        }
+
+        if let Some(ref eid) = id {
             self.press = Some(PressState {
                 id: eid.clone(),
                 button,
@@ -1659,14 +1815,75 @@ impl LiveSurface {
         button: PointerButton,
         mods: Modifiers,
     ) -> InputOutcome {
+        // Range drag commit: clear drag, fire change once, suppress click.
+        let mut suppress_click = false;
         if let Some(ref rid) = self.range_drag_id.clone() {
             if button == PointerButton::Primary {
-                self.apply_range_from_x(rid, x);
+                if !self.element_is_disabled_id(rid) {
+                    self.apply_range_from_x(rid, x);
+                    let _ = sync_outputs_for(&mut self.doc, rid);
+                    self.mark_dom_dirty();
+                    self.mark_paint_dirty();
+                }
+                self.range_drag_released = Some(rid.clone());
+                suppress_click = true;
             }
         }
         self.range_drag_id = None;
-        let up_id = self.hit_id(x, y);
+
+        // Open select: pick a row, or cancel outside.
+        if button == PointerButton::Primary {
+            if let Some(ref open) = self.open_select.clone() {
+                let opts = select_options(&self.doc, open.select_nid);
+                let n = opts.len();
+                if let Some(row) = list_row_at(open, x, y, n) {
+                    let pick = row.min(SELECT_MAX_ROWS - 1).min(n.saturating_sub(1));
+                    if !opts[pick].disabled && !control_is_disabled(&self.doc, open.select_nid) {
+                        let changed = select_set_index(&mut self.doc, open.select_nid, pick);
+                        self.close_select();
+                        self.press.take();
+                        if changed {
+                            if let Some(ref sid) = open.select_id.clone() {
+                                let _ = sync_outputs_for(&mut self.doc, sid);
+                                self.mark_dom_dirty();
+                                self.mark_paint_dirty();
+                                return self.fire_change(ctx, sid);
+                            }
+                        }
+                        self.mark_dom_dirty();
+                        self.mark_paint_dirty();
+                        return InputOutcome::None;
+                    }
+                } else if !open.control_rect.contains(x, y) {
+                    self.close_select();
+                    self.press.take();
+                    return InputOutcome::None;
+                } else {
+                    // Click on the closed face while open: leave open (or toggle closed).
+                    self.close_select();
+                    self.press.take();
+                    return InputOutcome::None;
+                }
+            }
+        }
+
+        let up_ctrl = form_control_at_point(&self.doc, x, y);
+        let up_id = up_ctrl
+            .as_ref()
+            .and_then(|c| c.element_id.clone())
+            .or_else(|| self.hit_id(x, y));
         let press = self.press.take();
+
+        // Fire change for a completed range drag even if press/up ids differ.
+        if let Some(rid) = self.range_drag_released.take() {
+            if button == PointerButton::Primary && !self.element_is_disabled_id(&rid) {
+                let out = self.fire_change(ctx, &rid);
+                if suppress_click {
+                    return out;
+                }
+            }
+        }
+
         let Some(press) = press else {
             return InputOutcome::Press { id: None };
         };
@@ -1675,7 +1892,23 @@ impl LiveSurface {
         }
         // Release off target → Press{None}, no click.
         if up_id.as_deref() != Some(press.id.as_str()) {
+            // Label/control id mismatch: still allow toggle when the control matches.
+            if button == PointerButton::Primary {
+                if let Some(out) = self.try_activate_control_at(ctx, x, y) {
+                    return out;
+                }
+            }
             return InputOutcome::Press { id: None };
+        }
+
+        if button == PointerButton::Primary {
+            if let Some(out) = self.try_activate_control_at(ctx, x, y) {
+                return out;
+            }
+        }
+
+        if suppress_click {
+            return InputOutcome::None;
         }
 
         let event_name: &'static str = match button {
@@ -1709,6 +1942,153 @@ impl LiveSurface {
                 id: press.id.clone(),
             }),
         )
+    }
+
+    /// Toggle checkbox/radio, open/step select, or no-op. Fires `change` when committed.
+    fn try_activate_control_at(
+        &mut self,
+        ctx: &mut ActionCtx<'_>,
+        x: f32,
+        y: f32,
+    ) -> Option<InputOutcome> {
+        let ctrl = form_control_at_point(&self.doc, x, y)?;
+        if control_is_disabled(&self.doc, ctrl.node_id) {
+            return Some(InputOutcome::None);
+        }
+        match ctrl.kind {
+            FormControlKind::Checkbox => {
+                if toggle_checkbox(&mut self.doc, ctrl.node_id) {
+                    self.after_control_commit(ctx, &ctrl)
+                } else {
+                    Some(InputOutcome::None)
+                }
+            }
+            FormControlKind::Radio => {
+                if let Some(result) = select_radio(&mut self.doc, ctrl.node_id) {
+                    self.damage_previous_radio(result.previous_checked, ctrl.node_id);
+                    self.after_control_commit(ctx, &ctrl)
+                } else {
+                    Some(InputOutcome::None)
+                }
+            }
+            FormControlKind::Select => {
+                if self.open_select.is_some() {
+                    self.close_select();
+                    Some(InputOutcome::None)
+                } else if let Some(open) = open_select_state(&self.doc, &ctrl) {
+                    self.open_select = Some(open);
+                    self.select_hover_row = None;
+                    self.mark_paint_dirty();
+                    Some(InputOutcome::None)
+                } else {
+                    Some(InputOutcome::None)
+                }
+            }
+            FormControlKind::Range | FormControlKind::Number => None,
+        }
+    }
+
+    fn after_control_commit(
+        &mut self,
+        ctx: &mut ActionCtx<'_>,
+        ctrl: &FormControlRef,
+    ) -> Option<InputOutcome> {
+        self.mark_dom_dirty();
+        self.mark_paint_dirty();
+        if let Some(ref sid) = ctrl.element_id {
+            let _ = sync_outputs_for(&mut self.doc, sid);
+            Some(self.fire_change(ctx, sid))
+        } else {
+            Some(InputOutcome::None)
+        }
+    }
+
+    /// Close the open list on every path. Pushes control+list rects into the
+    /// single `pending_damage` list so the next plan clears the overlay even
+    /// when `open_select` is already `None` (pick / Enter) and when the list
+    /// overflowed the surface.
+    fn close_select(&mut self) {
+        let Some(open) = self.open_select.take() else {
+            return;
+        };
+        self.select_hover_row = None;
+        let scale = self.layout_scale;
+        for r in select_damage_rects(Some(&open), scale) {
+            self.push_pending_damage(r);
+        }
+    }
+
+    /// Damage the previously checked radio's box when exclusivity moves.
+    fn damage_previous_radio(&mut self, previous: Option<NodeId>, new_nid: NodeId) {
+        let Some(prev) = previous else {
+            return;
+        };
+        if prev == new_nid {
+            return;
+        }
+        self.ensure_resolved();
+        if let Some(rect) = control_rect_of(&self.doc, prev) {
+            self.push_pending_damage(rect.as_device(self.layout_scale));
+        }
+        self.mark_paint_dirty();
+    }
+
+    /// Close the open list when its node is gone, replaced, or disabled.
+    fn reconcile_open_select(&mut self) {
+        let Some(open) = self.open_select.clone() else {
+            return;
+        };
+        let node_ok = self.doc.get_node(open.select_nid).is_some_and(|n| {
+            n.element_data()
+                .is_some_and(|el| &*el.name.local == "select")
+        });
+        let id_ok = match &open.select_id {
+            Some(id) => self.doc.get_element_by_id(id) == Some(open.select_nid),
+            None => node_ok,
+        };
+        let disabled = control_is_disabled(&self.doc, open.select_nid);
+        if !node_ok || !id_ok || disabled {
+            self.close_select();
+        }
+    }
+
+    /// Close the open list when focus leaves its control.
+    fn reconcile_open_select_after_focus(&mut self) {
+        let Some(open) = self.open_select.clone() else {
+            return;
+        };
+        let focused_on_select = match (&open.select_id, &self.focus.focused_id) {
+            (Some(sid), Some(fid)) => sid == fid,
+            (None, _) => false,
+            (Some(_), None) => false,
+        };
+        if !focused_on_select {
+            self.close_select();
+        }
+    }
+
+    /// Single commit path for `hx-trigger="change"` (range release, toggle,
+    /// select pick, arrow step). Typed entry (#17) hooks Enter/blur here too.
+    fn fire_change(&mut self, ctx: &mut ActionCtx<'_>, node_id: &str) -> InputOutcome {
+        self.fire_on(
+            ctx,
+            node_id,
+            TriggerEvent::Change,
+            FilterCtx {
+                mods: Modifiers::default(),
+                repeat: false,
+                key: None,
+            },
+            TriggerInfo::Change,
+            None,
+            false,
+        )
+    }
+
+    fn element_is_disabled_id(&self, id: &str) -> bool {
+        self.doc
+            .get_element_by_id(id)
+            .is_some_and(|nid| control_is_disabled(&self.doc, nid))
     }
 
     fn fire_pointer_or_key_on(
@@ -1850,45 +2230,158 @@ impl LiveSurface {
         collect_action_args(&self.doc, source_id)
     }
 
-    fn element_is_range(&self, id: &str) -> bool {
-        self.doc
-            .get_element_by_id(id)
-            .and_then(|nid| self.doc.get_node(nid))
-            .is_some_and(is_range_input)
-    }
-
     fn apply_range_from_x(&mut self, id: &str, x: f32) -> bool {
         self.ensure_resolved();
         let changed = set_range_value_from_x(&mut self.doc, id, x);
         if changed {
+            let _ = sync_outputs_for(&mut self.doc, id);
             self.mark_dom_dirty();
             self.mark_paint_dirty();
         }
         changed
     }
 
-    fn try_step_focused_numeric(&mut self, key: &str) -> bool {
-        let Some(fid) = self.focus.focused_id.clone() else {
-            return false;
-        };
+    /// Step focused number/range; returns `Some(outcome)` when handled (always
+    /// consumes the key for a focused numeric, and fires `change` when the
+    /// value actually moved).
+    fn try_step_focused_numeric(
+        &mut self,
+        ctx: &mut ActionCtx<'_>,
+        key: &str,
+    ) -> Option<InputOutcome> {
+        let fid = self.focus.focused_id.clone()?;
+        if self.element_is_disabled_id(&fid) {
+            return None;
+        }
         let is_numeric = self
             .doc
             .get_element_by_id(&fid)
             .and_then(|nid| self.doc.get_node(nid))
             .is_some_and(is_numeric_input);
         if !is_numeric {
-            return false;
+            return None;
         }
         let dir = match key {
             "ArrowUp" | "ArrowRight" => 1,
             "ArrowDown" | "ArrowLeft" => -1,
-            _ => return false,
+            _ => return None,
         };
         if step_numeric_value(&mut self.doc, &fid, dir) {
+            let _ = sync_outputs_for(&mut self.doc, &fid);
             self.mark_dom_dirty();
             self.mark_paint_dirty();
+            Some(self.fire_change(ctx, &fid))
+        } else {
+            Some(InputOutcome::None)
         }
-        true
+    }
+
+    /// Closed select: ArrowUp/Down step value + change. Open select: move highlight.
+    fn try_select_keys(&mut self, ctx: &mut ActionCtx<'_>, key: &KeyEvent) -> Option<InputOutcome> {
+        // Esc key-up after a consumed Esc key-down (list was open).
+        if !key.pressed && key.key == "Escape" && self.consume_escape_keyup {
+            self.consume_escape_keyup = false;
+            return Some(InputOutcome::None);
+        }
+        if !key.pressed {
+            return None;
+        }
+        // Esc while open: consume key-down and the following key-up.
+        if key.key == "Escape" {
+            if self.open_select.is_some() {
+                self.close_select();
+                self.consume_escape_keyup = true;
+                return Some(InputOutcome::None);
+            }
+            return None;
+        }
+
+        if let Some(ref open) = self.open_select.clone() {
+            if control_is_disabled(&self.doc, open.select_nid) {
+                return Some(InputOutcome::None);
+            }
+            let opts = select_options(&self.doc, open.select_nid);
+            let rows = opts.len().min(SELECT_MAX_ROWS);
+            match key.key.as_str() {
+                "ArrowDown" => {
+                    if let Some(os) = self.open_select.as_mut() {
+                        if os.highlight + 1 < rows {
+                            os.highlight += 1;
+                        }
+                    }
+                    self.mark_paint_dirty();
+                    return Some(InputOutcome::None);
+                }
+                "ArrowUp" => {
+                    if let Some(os) = self.open_select.as_mut() {
+                        os.highlight = os.highlight.saturating_sub(1);
+                    }
+                    self.mark_paint_dirty();
+                    return Some(InputOutcome::None);
+                }
+                "Enter" => {
+                    let pick = open.highlight.min(rows.saturating_sub(1));
+                    if opts.get(pick).is_some_and(|o| !o.disabled) {
+                        let changed = select_set_index(&mut self.doc, open.select_nid, pick);
+                        self.close_select();
+                        if changed {
+                            if let Some(ref sid) = open.select_id.clone() {
+                                let _ = sync_outputs_for(&mut self.doc, sid);
+                                self.mark_dom_dirty();
+                                self.mark_paint_dirty();
+                                return Some(self.fire_change(ctx, sid));
+                            }
+                        }
+                        self.mark_dom_dirty();
+                        self.mark_paint_dirty();
+                    }
+                    return Some(InputOutcome::None);
+                }
+                _ => {}
+            }
+        }
+
+        let fid = self.focus.focused_id.clone()?;
+        if self.element_is_disabled_id(&fid) {
+            return None;
+        }
+        let nid = self.doc.get_element_by_id(&fid)?;
+        let is_select = self.doc.get_node(nid).is_some_and(|n| {
+            n.element_data()
+                .is_some_and(|el| &*el.name.local == "select")
+        });
+        if !is_select {
+            return None;
+        }
+
+        // Alt+ArrowDown opens the list.
+        if key.key == "ArrowDown" && key.mods.alt {
+            let ctrl = FormControlRef {
+                node_id: nid,
+                element_id: Some(fid),
+                kind: FormControlKind::Select,
+            };
+            if let Some(open) = open_select_state(&self.doc, &ctrl) {
+                self.open_select = Some(open);
+                self.select_hover_row = None;
+                self.mark_paint_dirty();
+            }
+            return Some(InputOutcome::None);
+        }
+
+        let dir = match key.key.as_str() {
+            "ArrowDown" | "ArrowRight" => 1,
+            "ArrowUp" | "ArrowLeft" => -1,
+            _ => return None,
+        };
+        if select_step(&mut self.doc, nid, dir) {
+            let _ = sync_outputs_for(&mut self.doc, &fid);
+            self.mark_dom_dirty();
+            self.mark_paint_dirty();
+            Some(self.fire_change(ctx, &fid))
+        } else {
+            Some(InputOutcome::None)
+        }
     }
 
     fn parent_element_id(&self, id: &str) -> Option<String> {
@@ -2005,15 +2498,72 @@ impl LiveSurface {
             TriggerEvent::KeyUp
         };
 
-        // Number/range arrow editing (before action triggers).
+        // Select open/closed keys (Esc consumed only while the list is open).
+        if let Some(out) = self.try_select_keys(ctx, &key) {
+            return out;
+        }
+
+        // Number/range arrow editing (before action triggers) — fires change.
         if key.pressed
             && matches!(
                 key.key.as_str(),
                 "ArrowUp" | "ArrowRight" | "ArrowDown" | "ArrowLeft"
             )
-            && self.try_step_focused_numeric(&key.key)
         {
-            return InputOutcome::None;
+            if let Some(out) = self.try_step_focused_numeric(ctx, &key.key) {
+                return out;
+            }
+        }
+
+        // Space on focused checkbox/radio toggles and fires change.
+        // Always consume Space on a checkable so (c) does not treat it as a button.
+        if key.pressed && key.key == " " && !key.repeat {
+            if let Some(ref fid) = self.focus.focused_id.clone() {
+                if let Some(nid) = self.doc.get_element_by_id(fid) {
+                    let is_checkable = self.doc.get_node(nid).is_some_and(|n| {
+                        let ty = n
+                            .attrs()
+                            .and_then(|a| {
+                                a.iter()
+                                    .find(|a| &*a.name.local == "type")
+                                    .map(|a| a.value.to_ascii_lowercase())
+                            })
+                            .unwrap_or_default();
+                        n.element_data()
+                            .is_some_and(|el| &*el.name.local == "input")
+                            && matches!(ty.as_str(), "checkbox" | "radio")
+                    });
+                    if is_checkable {
+                        if control_is_disabled(&self.doc, nid) {
+                            return InputOutcome::None;
+                        }
+                        let input_ty = self.doc.get_node(nid).and_then(|n| {
+                            n.attrs().and_then(|a| {
+                                a.iter()
+                                    .find(|a| &*a.name.local == "type")
+                                    .map(|a| a.value.to_ascii_lowercase())
+                            })
+                        });
+                        let changed = if input_ty.as_deref() == Some("radio") {
+                            if let Some(result) = select_radio(&mut self.doc, nid) {
+                                self.damage_previous_radio(result.previous_checked, nid);
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            activate_checkable(&mut self.doc, nid)
+                        };
+                        if changed {
+                            let _ = sync_outputs_for(&mut self.doc, fid);
+                            self.mark_dom_dirty();
+                            self.mark_paint_dirty();
+                            return self.fire_change(ctx, fid);
+                        }
+                        return InputOutcome::None;
+                    }
+                }
+            }
         }
 
         // (a) Focused element first.
@@ -2081,6 +2631,7 @@ impl LiveSurface {
                 self.doc.clear_focus();
             }
             self.focus.focused_id = next;
+            self.reconcile_open_select_after_focus();
             self.mark_paint_dirty();
             return InputOutcome::FocusChanged(self.focus.clone());
         }
@@ -2340,7 +2891,17 @@ impl LiveSurface {
     ) -> (DamagePlan, u64) {
         let had_previous = !self.last_bounds.is_empty() && self.cached_rgba.is_some();
         let previous = std::mem::take(&mut self.last_bounds);
-        let pending = std::mem::take(&mut self.pending_damage);
+        let mut pending = std::mem::take(&mut self.pending_damage);
+        // Open list must stay in the damage set while visible (and after pick
+        // clears open_select, close_select already pushed via pending_damage).
+        // Clamp like `push_pending_damage` — overflowing lists must not report
+        // rects past the surface (hosts upload damage to the texture).
+        pending.extend(
+            select_damage_rects(self.open_select.as_ref(), scale)
+                .into_iter()
+                .map(|r| r.clamp_to_surface(width, height))
+                .filter(|r| !r.is_empty()),
+        );
 
         self.doc.set_viewport(BlitzViewport::new(
             width,
@@ -2477,7 +3038,18 @@ impl LiveSurface {
         // Explicit drop before returning so restore order is obvious; also runs
         // on `?` / panic via Drop.
         drop(session);
-        rgba
+        let mut frame = rgba?;
+        // Engine-drawn select face button + open list (above Blitz content).
+        paint_select_overlays(
+            &self.doc,
+            &mut frame,
+            scale,
+            self.open_select.as_ref(),
+            self.select_hover_row
+                .or_else(|| self.open_select.as_ref().map(|o| o.highlight)),
+            &self.select_nids,
+        );
+        Ok(frame)
     }
 
     /// Read an attribute from an element by id.
@@ -2515,7 +3087,17 @@ fn validate_loaded_tree(
         }
         let (id_attr, attrs) = element_id_and_attrs(node);
         validate_loaded_attrs(&id_attr, &attrs, known_ids)?;
-        if let Some(binding) = ElementBinding::from_attrs(&id_attr, &attrs)? {
+        let tag = node
+            .element_data()
+            .map(|el| el.name.local.to_string())
+            .unwrap_or_default();
+        let input_ty = attrs
+            .iter()
+            .find(|(k, _)| k == "type")
+            .map(|(_, v)| v.as_str());
+        if let Some(binding) =
+            ElementBinding::from_attrs_with_tag(&id_attr, &attrs, Some(&tag), input_ty)?
+        {
             if let Some(ref action) = binding.hx_post {
                 if !declared_actions.contains(action) {
                     return Err(EngineError::UndeclaredAction {
@@ -2554,7 +3136,17 @@ fn index_bindings(
             continue;
         }
         let (id_attr, attrs) = element_id_and_attrs(node);
-        if let Some(binding) = ElementBinding::from_attrs(&id_attr, &attrs)? {
+        let tag = node
+            .element_data()
+            .map(|el| el.name.local.to_string())
+            .unwrap_or_default();
+        let input_ty = attrs
+            .iter()
+            .find(|(k, _)| k == "type")
+            .map(|(_, v)| v.as_str());
+        if let Some(binding) =
+            ElementBinding::from_attrs_with_tag(&id_attr, &attrs, Some(&tag), input_ty)?
+        {
             if let Some(ref action) = binding.hx_post {
                 if !declared_actions.contains(action) {
                     // Click-time unknown still fails loudly; keep load-time rule on reindex.
