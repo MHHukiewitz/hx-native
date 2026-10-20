@@ -9,6 +9,7 @@
 
 mod damage;
 mod dialect;
+mod ellipsis;
 mod engine;
 mod error;
 mod focus;

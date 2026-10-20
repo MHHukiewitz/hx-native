@@ -15,6 +15,7 @@ use crate::damage::{
     DamagePlan, IntRect,
 };
 use crate::dialect::{validate_loaded_attrs, ElementBinding, SwapMode, SyncMode};
+use crate::ellipsis::apply_text_overflow_ellipsis;
 use crate::error::EngineError;
 use crate::focus::{focusable_ids, ids_in_document_order, step_focus};
 use crate::fonts::bundled_font_context;
@@ -2216,26 +2217,43 @@ impl LiveSurface {
         scale: f64,
         paint_mode: PaintMode,
     ) -> Result<RgbaImage, EngineError> {
-        if plan.full_repaint
-            || plan.rects.len() == 1 && plan.rects[0] == IntRect::full_surface(width, height)
-        {
-            return paint_rgba(&mut self.doc, width, height, scale);
+        // Issue #12: truncate single-line ellipsis candidates for this paint only.
+        // Damage was planned on the full text (element boxes unchanged under
+        // overflow:hidden). Restore originals after raster so hit-testing / sync
+        // keep the real string; see `ellipsis` module docs.
+        let backup = apply_text_overflow_ellipsis(&mut self.doc);
+        if backup.did_mutate() {
+            self.doc.resolve(0.0);
         }
 
-        let mut frame = self.cached_rgba.take().unwrap_or_else(|| RgbaImage {
-            width,
-            height,
-            pixels: vec![0u8; (width as usize) * (height as usize) * 4],
-        });
-        if frame.width != width || frame.height != height {
-            frame = RgbaImage {
+        let rgba = if plan.full_repaint
+            || plan.rects.len() == 1 && plan.rects[0] == IntRect::full_surface(width, height)
+        {
+            paint_rgba(&mut self.doc, width, height, scale)
+        } else {
+            let mut frame = self.cached_rgba.take().unwrap_or_else(|| RgbaImage {
                 width,
                 height,
                 pixels: vec![0u8; (width as usize) * (height as usize) * 4],
-            };
+            });
+            if frame.width != width || frame.height != height {
+                frame = RgbaImage {
+                    width,
+                    height,
+                    pixels: vec![0u8; (width as usize) * (height as usize) * 4],
+                };
+            }
+            paint_damage_into(&mut self.doc, &mut frame, scale, &plan.rects, paint_mode)?;
+            Ok(frame)
+        };
+
+        let mutated = backup.did_mutate();
+        backup.restore(&mut self.doc);
+        if mutated {
+            // Layout still reflects truncated text until the next resolve.
+            self.needs_resolve = true;
         }
-        paint_damage_into(&mut self.doc, &mut frame, scale, &plan.rects, paint_mode)?;
-        Ok(frame)
+        rgba
     }
 
     /// Read an attribute from an element by id.

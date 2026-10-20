@@ -56,6 +56,10 @@ path = "tests/multi_surface.rs"
 name = "paint_worker"
 path = "tests/paint_worker.rs"
 
+[[test]]
+name = "text_overflow"
+path = "tests/text_overflow.rs"
+
 [[example]]
 name = "paint_bench"
 path = "examples/paint_bench.rs"

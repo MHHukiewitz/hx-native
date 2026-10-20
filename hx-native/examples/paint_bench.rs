@@ -640,6 +640,68 @@ fn bench_eviction_pressure(phys_w: u32, phys_h: u32) {
     }
 }
 
+fn bench_text_overflow_ellipsis() {
+    // Issue #12: per-frame cost of single-line ellipsis (Mainnet `#gmode-why` shape).
+    const N: usize = 80;
+    const W: usize = 10;
+    let html = r##"<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { width: 320px; height: 80px; background: #1a1f2a; color: #9aa3b5;
+  font-family: "DejaVu Sans", sans-serif; font-size: 13px; }
+#gmode-why {
+  position: absolute; left: 8px; top: 24px;
+  width: 200px; height: 20px; line-height: 20px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+</style></head><body>
+<div id="gmode-why">Disabled: not enough credit on the active settlement rail for this order size</div>
+</body></html>"##;
+    let mut eng = Engine::new(EngineConfig {
+        paint_mode: PaintMode::Exact,
+        max_paint_ns: 50_000_000,
+        ..EngineConfig::default()
+    });
+    eng.declare_actions(&["act.do"]);
+    eng.load_html(html).unwrap();
+    let view = Viewport::new(320, 80);
+    let mut samples = Vec::with_capacity(N);
+    for i in 0..(W + N) {
+        // Tiny dirty each frame: toggle a no-op by re-painting after theme mark
+        // on every other frame so we always rasterize (not skip).
+        if i % 2 == 0 {
+            eng.mark_theme_or_stylesheet_changed();
+        } else {
+            // Force dirty via a harmless pointer leave/move cycle outside the box.
+            let _ = eng.input(InputEvent::PointerMove {
+                x: 10.0,
+                y: 10.0,
+                mods: Modifiers::default(),
+            });
+            let _ = eng.input(InputEvent::PointerLeave);
+            eng.mark_theme_or_stylesheet_changed();
+        }
+        let t0 = std::time::Instant::now();
+        let _ = eng.paint(view.clone()).unwrap();
+        let ns = t0.elapsed().as_nanos() as u64;
+        if i >= W {
+            samples.push(ns);
+        }
+    }
+    samples.sort_unstable();
+    let mean = samples.iter().sum::<u64>() as f64 / samples.len() as f64;
+    let p95 = samples[((samples.len() as f64) * 0.95) as usize];
+    println!();
+    println!("### text-overflow: ellipsis (issue #12, 320×80, Exact)");
+    println!(
+        "per-frame: mean={:.3} ms  p95={:.3} ms  n={}",
+        mean / 1e6,
+        p95 as f64 / 1e6,
+        samples.len()
+    );
+}
+
 fn main() {
     let cpu = std::fs::read_to_string("/proc/cpuinfo")
         .ok()
@@ -661,4 +723,5 @@ fn main() {
     bench_resolution("1440p (2560x1440)", 2560, 1440);
     bench_open_paths(1920, 1080);
     bench_eviction_pressure(1920, 1080);
+    bench_text_overflow_ellipsis();
 }
