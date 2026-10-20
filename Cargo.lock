@@ -715,6 +715,7 @@ dependencies = [
  "parley",
  "peniko",
  "serde_json",
+ "stylo",
 ]
 
 [[package]]

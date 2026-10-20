@@ -53,28 +53,30 @@
 //!   (and wrap / overflow-x / font fingerprint fields) — style detection
 //! - `TextLayout::{text, layout, block_offset, span_cb_flags}` — paint payload
 //! - `TextBrush { id }` — glyph brush for paint / hit attribution
+//! - [`crate::stylo_text_style`] — copy of Blitz's `pub(crate)`
+//!   `stylo_to_parley::style` (font-size/family/weight/style, letter-/word-spacing,
+//!   line-height, features). Must stay aligned when bumping Blitz/stylo.
 //!
-//! Detection tests in `tests/text_overflow.rs` run in CI's normal test job
-//! (not `#[ignore]`, not feature-gated) so a bump that breaks ellipsis fails CI.
+//! Detection and pixel-match tests in `tests/text_overflow.rs` run in CI's
+//! normal test job (not `#[ignore]`, not feature-gated) so a bump that breaks
+//! ellipsis fails CI.
 //!
 //! # Out of scope
 //!
 //! - RTL / bidirectional ellipsis sides
 //! - Multi-line clamp (`-webkit-line-clamp` / `line-clamp`)
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 
 use blitz_dom::node::{TextBrush, TextLayout};
 use blitz_dom::{FontContext, NodeId};
 use blitz_html::HtmlDocument;
 use parley::layout::Layout;
-use parley::style::{
-    FontFamily, FontFamilyName, GenericFamily, TextStyle, TextWrapMode, WhiteSpaceCollapse,
-};
+use parley::style::TextStyle;
 use parley::LayoutContext;
 
 use crate::fonts::bundled_font_context;
+use crate::stylo_text_style::text_style_from_computed;
 
 /// U+2026 HORIZONTAL ELLIPSIS — CSS `text-overflow: ellipsis` marker.
 const ELLIPSIS: &str = "\u{2026}";
@@ -169,10 +171,12 @@ impl Drop for EllipsisPaintSession<'_> {
 /// Install truncated inline layouts for paint. Call after the document’s normal
 /// style+layout resolve (DOM still holds the full text). Does not mutate DOM
 /// text and does not call `HtmlDocument::resolve`.
+///
+/// `shaper` is created lazily on the first ellipsis candidate (shared font bytes).
 pub(crate) fn prepare_ellipsis_for_paint<'a>(
     doc: &'a mut HtmlDocument,
     cache: &mut EllipsisCache,
-    shaper: &mut EllipsisShaper,
+    shaper: &mut Option<EllipsisShaper>,
 ) -> EllipsisPaintSession<'a> {
     let scale = doc.viewport().scale().max(0.000_1);
     let candidates = find_ellipsis_candidates(doc, scale);
@@ -185,6 +189,7 @@ pub(crate) fn prepare_ellipsis_for_paint<'a>(
         };
     }
 
+    let shaper = shaper.get_or_insert_with(EllipsisShaper::new);
     let mut backups = Vec::new();
     let mut applied = false;
     let mut reshaped = false;
@@ -376,54 +381,44 @@ fn cluster_cum_advances(layout: &Layout<TextBrush>) -> Vec<(usize, f32)> {
     out
 }
 
-fn first_run_font_size_css(layout: &Layout<TextBrush>, scale: f32) -> f32 {
-    for line in layout.lines() {
-        if let Some(run) = line.runs().next() {
-            return (run.font_size() / scale.max(0.000_1)).max(1.0);
-        }
-    }
-    13.0
-}
-
-fn paint_brush_from_layout(layout: &Layout<TextBrush>, fallback: NodeId) -> TextBrush {
-    for line in layout.lines() {
-        for item in line.items() {
-            if let parley::PositionedLayoutItem::GlyphRun(run) = item {
-                return run.style().brush;
+/// Build a parley TextStyle from the element's computed styles (Blitz parity).
+fn text_style_for_element(
+    doc: &HtmlDocument,
+    element_id: NodeId,
+) -> Option<TextStyle<'static, 'static, TextBrush>> {
+    let node = doc.get_node(element_id)?;
+    let styles = node.primary_styles()?;
+    // Prefer the brush id from the original layout's first glyph run when present;
+    // fall back to the element id (Blitz root span brush).
+    let brush_id = node
+        .element_data()
+        .and_then(|el| el.inline_layout_data.as_ref())
+        .and_then(|tl| {
+            for line in tl.layout.lines() {
+                for item in line.items() {
+                    if let parley::PositionedLayoutItem::GlyphRun(run) = item {
+                        return Some(run.style().brush.id);
+                    }
+                }
             }
-        }
-    }
-    TextBrush { id: fallback }
+            None
+        })
+        .unwrap_or(element_id);
+    Some(text_style_from_computed(brush_id, &styles))
 }
 
-fn text_style_for(font_size_css: f32, brush: TextBrush) -> TextStyle<'static, 'static, TextBrush> {
-    // Bundled DejaVu is registered for every generic family in `bundled_font_context`.
-    const FAMILIES: &[FontFamilyName<'static>] =
-        &[FontFamilyName::Generic(GenericFamily::SansSerif)];
-    TextStyle {
-        font_family: FontFamily::List(Cow::Borrowed(FAMILIES)),
-        font_size: font_size_css,
-        brush,
-        text_wrap_mode: TextWrapMode::NoWrap,
-        white_space_collapse: WhiteSpaceCollapse::Preserve,
-        ..Default::default()
-    }
-}
-
-/// Shape `text` with the ellipsis element's style; returns a ready-to-paint `TextLayout`.
+/// Shape `text` with the ellipsis element's computed style; returns a paint `TextLayout`.
 fn shape_text_layout(
     shaper: &mut EllipsisShaper,
     text: &str,
-    font_size_css: f32,
-    brush: TextBrush,
+    style: &TextStyle<'static, 'static, TextBrush>,
     scale: f32,
     max_advance: Option<f32>,
     template: &TextLayout,
 ) -> Box<TextLayout> {
-    let style = text_style_for(font_size_css, brush);
     let mut builder = shaper
         .layout_ctx
-        .tree_builder(&mut shaper.font_ctx, scale, true, &style);
+        .tree_builder(&mut shaper.font_ctx, scale, true, style);
     builder.push_text(text);
     let mut layout = Layout::new();
     let shaped_text = builder.build_into(&mut layout);
@@ -439,14 +434,12 @@ fn shape_text_layout(
 
 fn measure_ellipsis_advance(
     shaper: &mut EllipsisShaper,
-    font_size_css: f32,
-    brush: TextBrush,
+    style: &TextStyle<'static, 'static, TextBrush>,
     scale: f32,
 ) -> f32 {
-    let style = text_style_for(font_size_css, brush);
     let mut builder = shaper
         .layout_ctx
-        .tree_builder(&mut shaper.font_ctx, scale, true, &style);
+        .tree_builder(&mut shaper.font_ctx, scale, true, style);
     builder.push_text(ELLIPSIS);
     let mut layout = Layout::new();
     let _ = builder.build_into(&mut layout);
@@ -538,9 +531,8 @@ fn prepare_one(
     };
 
     let budget = cand.content_w_css * scale;
-    let font_size_css = first_run_font_size_css(&original_layout.layout, scale);
-    let brush = paint_brush_from_layout(&original_layout.layout, cand.element_id);
-    let ellipsis_adv = measure_ellipsis_advance(shaper, font_size_css, brush, scale);
+    let style = text_style_for_element(doc, cand.element_id)?;
+    let ellipsis_adv = measure_ellipsis_advance(shaper, &style, scale);
     let truncated = truncate_by_clusters(
         &original_text,
         &original_layout.layout,
@@ -554,8 +546,7 @@ fn prepare_one(
     let truncated_layout = shape_text_layout(
         shaper,
         &truncated,
-        font_size_css,
-        brush,
+        &style,
         scale,
         Some(budget),
         &original_layout,

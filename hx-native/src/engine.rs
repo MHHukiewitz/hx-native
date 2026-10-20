@@ -177,8 +177,8 @@ struct LiveSurface {
     range_drag_id: Option<String>,
     /// Cached truncated paint layouts for `text-overflow: ellipsis` (issue #12).
     ellipsis_cache: EllipsisCache,
-    /// Parley contexts for shaping truncated text without a document resolve.
-    ellipsis_shaper: EllipsisShaper,
+    /// Lazily created on the first ellipsis candidate (shared DejaVu bytes).
+    ellipsis_shaper: Option<EllipsisShaper>,
     /// Total `doc.resolve` calls on this surface (tests: idle frames must not grow).
     resolve_count: u64,
     /// Test hook: next paint returns `EngineError::Paint` after ellipsis swap.
@@ -908,6 +908,7 @@ impl Engine {
 
     /// Test harness: force the next paint to error after the ellipsis swap
     /// (Drop must restore DOM text + inline layouts).
+    #[doc(hidden)]
     pub fn test_fail_next_paint(&mut self) {
         if let Some(live) = self.live_mut(SurfaceId::DEFAULT) {
             live.fail_next_paint = true;
@@ -916,6 +917,7 @@ impl Engine {
     }
 
     /// Test harness: panic on the next paint after the ellipsis swap.
+    #[doc(hidden)]
     pub fn test_panic_next_paint(&mut self) {
         if let Some(live) = self.live_mut(SurfaceId::DEFAULT) {
             live.panic_next_paint = true;
@@ -924,6 +926,7 @@ impl Engine {
     }
 
     /// Test harness: read text content of `#id` from the live DOM.
+    #[doc(hidden)]
     pub fn test_element_text(&self, elem_id: &str) -> Option<String> {
         let live = self.live(SurfaceId::DEFAULT)?;
         let nid = live.doc.get_element_by_id(elem_id)?;
@@ -931,7 +934,17 @@ impl Engine {
         Some(node.text_content())
     }
 
+    /// Test harness: `inline_layout_data.text` for `#id` (full original after restore).
+    #[doc(hidden)]
+    pub fn test_inline_layout_text(&self, elem_id: &str) -> Option<String> {
+        let live = self.live(SurfaceId::DEFAULT)?;
+        let nid = live.doc.get_element_by_id(elem_id)?;
+        let el = live.doc.get_node(nid)?.element_data()?;
+        Some(el.inline_layout_data.as_ref()?.text.clone())
+    }
+
     /// Test harness: whether `#id` currently has inline_layout_data.
+    #[doc(hidden)]
     pub fn test_has_inline_layout(&self, elem_id: &str) -> bool {
         let Some(live) = self.live(SurfaceId::DEFAULT) else {
             return false;
@@ -1091,7 +1104,7 @@ impl LiveSurface {
             last_bounds: BoundsSnapshot::new(),
             range_drag_id: None,
             ellipsis_cache: EllipsisCache::default(),
-            ellipsis_shaper: EllipsisShaper::new(),
+            ellipsis_shaper: None,
             resolve_count: 1,
             fail_next_paint: false,
             panic_next_paint: false,

@@ -390,7 +390,12 @@ fn paint_error_restores_dom_and_layout() {
     assert!(!first.skipped);
     assert!(eng.test_ellipsis_truncated("gmode-why").is_some());
     assert_eq!(eng.test_element_text("gmode-why").as_deref(), Some(reason));
-    assert!(eng.test_has_inline_layout("gmode-why"));
+    // After a successful paint, Drop restored the full-text layout.
+    assert_eq!(
+        eng.test_inline_layout_text("gmode-why").as_deref(),
+        Some(reason),
+        "restored inline_layout_data.text must be the full original"
+    );
 
     eng.mark_theme_or_stylesheet_changed();
     eng.test_fail_next_paint();
@@ -402,9 +407,11 @@ fn paint_error_restores_dom_and_layout() {
         Some(reason),
         "DOM text must be restored after paint error"
     );
-    assert!(
-        eng.test_has_inline_layout("gmode-why"),
-        "inline layout must be restored after paint error"
+    assert_eq!(
+        eng.test_inline_layout_text("gmode-why").as_deref(),
+        Some(reason),
+        "inline_layout_data.text must be the full original after paint error \
+         (fails if Drop restore is removed)"
     );
     // Next paint must still detect overflow and apply ellipsis.
     eng.mark_theme_or_stylesheet_changed();
@@ -414,7 +421,10 @@ fn paint_error_restores_dom_and_layout() {
         .test_ellipsis_truncated("gmode-why")
         .expect("ellipsis still applied after error recovery");
     assert!(truncated.ends_with('\u{2026}'));
-    assert_eq!(eng.test_element_text("gmode-why").as_deref(), Some(reason));
+    assert_eq!(
+        eng.test_inline_layout_text("gmode-why").as_deref(),
+        Some(reason)
+    );
 }
 
 #[test]
@@ -423,6 +433,10 @@ fn paint_panic_restores_dom_and_layout() {
     let mut eng = boot(&gmode_why_page(reason));
     let _ = eng.paint(vp()).unwrap();
     assert!(eng.test_ellipsis_truncated("gmode-why").is_some());
+    assert_eq!(
+        eng.test_inline_layout_text("gmode-why").as_deref(),
+        Some(reason)
+    );
 
     eng.mark_theme_or_stylesheet_changed();
     eng.test_panic_next_paint();
@@ -436,9 +450,11 @@ fn paint_panic_restores_dom_and_layout() {
         Some(reason),
         "DOM text must be restored after panic"
     );
-    assert!(
-        eng.test_has_inline_layout("gmode-why"),
-        "inline layout must be restored after panic"
+    assert_eq!(
+        eng.test_inline_layout_text("gmode-why").as_deref(),
+        Some(reason),
+        "inline_layout_data.text must be the full original after panic \
+         (fails if Drop restore is removed)"
     );
     eng.mark_theme_or_stylesheet_changed();
     let out = eng.paint(vp()).unwrap();
@@ -448,13 +464,17 @@ fn paint_panic_restores_dom_and_layout() {
             .is_some_and(|t| t.ends_with('\u{2026}')),
         "ellipsis still applied after panic recovery"
     );
+    assert_eq!(
+        eng.test_inline_layout_text("gmode-why").as_deref(),
+        Some(reason)
+    );
 }
 
 #[test]
 fn flex_ellipsis_hover_matches_without_ellipsis() {
-    // Content-sized flex item (min-width:0) with ellipsis next to a hover target.
-    // Hit-test / hover must match the same page with ellipsis disabled — proves
-    // we do not leave truncated geometry behind after a cache-miss reshape.
+    // Content-sized flex item (`flex: 0 1 auto` + max-width) with ellipsis, then a
+    // hover target. Probe just inside the *full* text's right edge — if a cache miss
+    // left truncated geometry, that point would miss #title (or shift #act left).
     fn page(ellipsis: bool) -> String {
         let overflow = if ellipsis {
             "white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"
@@ -466,18 +486,18 @@ fn flex_ellipsis_hover_matches_without_ellipsis() {
 <html lang="en"><head><meta charset="utf-8"/>
 <style>
 * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-body {{ width: 320px; height: 80px; background: #1a1f2a; color: #9aa3b5;
+body {{ width: 400px; height: 80px; background: #1a1f2a; color: #9aa3b5;
   font-family: "DejaVu Sans", sans-serif; font-size: 13px; }}
 #row {{
   display: flex; flex-direction: row; align-items: center;
-  position: absolute; left: 8px; top: 20px; width: 300px; height: 28px;
+  position: absolute; left: 8px; top: 20px; height: 28px;
 }}
 #title {{
-  flex: 1 1 auto; min-width: 0; height: 20px; line-height: 20px;
+  flex: 0 1 auto; max-width: 200px; height: 20px; line-height: 20px;
   {overflow}
 }}
 #act {{
-  flex: 0 0 auto; width: 72px; height: 28px;
+  flex: 0 0 auto; width: 72px; height: 28px; margin-left: 4px;
   background: #2d3648; color: #e8ecf4; border: 1px solid #556;
 }}
 #act:hover {{ background: #3d7ea6; }}
@@ -490,53 +510,56 @@ body {{ width: 320px; height: 80px; background: #1a1f2a; color: #9aa3b5;
         )
     }
 
+    let view = Viewport::new(400, 80);
     let mut with_e = boot(&page(true));
     let mut without = boot(&page(false));
-    let _ = with_e.paint(vp()).unwrap();
-    let _ = without.paint(vp()).unwrap();
+    let _ = with_e.paint(view.clone()).unwrap();
+    let _ = without.paint(view.clone()).unwrap();
     assert!(
         with_e.test_ellipsis_truncated("title").is_some(),
         "flex title should truncate"
     );
 
-    // Hover the button (right side of the row).
-    let hx = with_e.input(InputEvent::PointerMove {
-        x: 280.0,
-        y: 34.0,
-        mods: Modifiers::default(),
-    });
-    let ho = without.input(InputEvent::PointerMove {
-        x: 280.0,
-        y: 34.0,
-        mods: Modifiers::default(),
-    });
-    assert!(
-        matches!(hx, InputOutcome::Hover { id: Some(ref id) } if id == "act"),
-        "ellipsis page hover: {hx:?}"
-    );
-    assert!(
-        matches!(ho, InputOutcome::Hover { id: Some(ref id) } if id == "act"),
-        "plain page hover: {ho:?}"
-    );
-
-    // Hover over the title text band — both should report #title (full geometry).
+    // Just inside the full #title content box (max-width 200 at x=8 → edge ~208).
+    // Truncated geometry would shrink the hit target and miss here.
+    let edge_x = 200.0;
     let tx = with_e.input(InputEvent::PointerMove {
-        x: 40.0,
+        x: edge_x,
         y: 34.0,
         mods: Modifiers::default(),
     });
     let to = without.input(InputEvent::PointerMove {
-        x: 40.0,
+        x: edge_x,
         y: 34.0,
         mods: Modifiers::default(),
     });
     assert!(
         matches!(tx, InputOutcome::Hover { id: Some(ref id) } if id == "title"),
-        "ellipsis title hit: {tx:?}"
+        "ellipsis title hit at full edge: {tx:?}"
     );
     assert!(
         matches!(to, InputOutcome::Hover { id: Some(ref id) } if id == "title"),
-        "plain title hit: {to:?}"
+        "plain title hit at full edge: {to:?}"
+    );
+
+    // Button sits after the 200px title (+ margin); both pages must hit #act.
+    let hx = with_e.input(InputEvent::PointerMove {
+        x: 230.0,
+        y: 34.0,
+        mods: Modifiers::default(),
+    });
+    let ho = without.input(InputEvent::PointerMove {
+        x: 230.0,
+        y: 34.0,
+        mods: Modifiers::default(),
+    });
+    assert!(
+        matches!(hx, InputOutcome::Hover { id: Some(ref id) } if id == "act"),
+        "ellipsis page button hover: {hx:?}"
+    );
+    assert!(
+        matches!(ho, InputOutcome::Hover { id: Some(ref id) } if id == "act"),
+        "plain page button hover: {ho:?}"
     );
 }
 
@@ -568,4 +591,60 @@ fn ellipsis_cache_miss_does_not_exceed_style_layout_budget() {
         (1..=2).contains(&delta_hit),
         "cache-hit paint must use 1–2 document passes, got {delta_hit}"
     );
+}
+
+/// Graph font probe: ellipsis-on paint must be byte-identical to Blitz painting the
+/// same truncated string with ellipsis off (same box / styles).
+#[test]
+fn ellipsis_paint_matches_blitz_truncated_string() {
+    fn page(extra: &str, overflow: &str, text: &str) -> String {
+        format!(
+            r##"<!DOCTYPE html><html><head><meta charset="utf-8"/><style>
+* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+body {{ width: 320px; height: 80px; background: #1a1f2a; color: #9aa3b5;
+  font-family: "DejaVu Sans", sans-serif; font-size: 13px; }}
+#t {{ position: absolute; left: 8px; top: 24px; width: 200px; height: 20px;
+  line-height: 20px; white-space: nowrap; overflow: hidden; {overflow} {extra} }}
+</style></head><body><div id="t">{text}</div></body></html>"##
+        )
+    }
+    fn paint_img(html: &str) -> (Engine, RgbaImage) {
+        let mut e = boot(html);
+        let img = e.paint(vp()).unwrap().rgba.unwrap();
+        (e, img)
+    }
+    fn band_diff(a: &RgbaImage, b: &RgbaImage) -> usize {
+        a.pixels
+            .chunks_exact(4)
+            .zip(b.pixels.chunks_exact(4))
+            .filter(|(p, q)| p != q)
+            .count()
+    }
+
+    let text = long_reason();
+    // Cases Graph required (plus the Mainnet default). Zero tolerance: byte-identical.
+    let cases = [
+        ("default", ""),
+        ("line-height 12px", "line-height: 12px;"),
+        ("letter-spacing 1px", "letter-spacing: 1px;"),
+        ("word-spacing 4px", "word-spacing: 4px;"),
+        ("italic", "font-style: italic;"),
+    ];
+    for (name, extra) in cases {
+        let (e, with_ellipsis) = paint_img(&page(extra, "text-overflow: ellipsis;", text));
+        let truncated = e
+            .test_ellipsis_truncated("t")
+            .unwrap_or_else(|| panic!("{name}: expected truncation"));
+        assert!(
+            truncated.ends_with('\u{2026}'),
+            "{name}: truncated={truncated:?}"
+        );
+        let (_e2, blitz_truncated) = paint_img(&page(extra, "", &truncated));
+        let diff = band_diff(&with_ellipsis, &blitz_truncated);
+        assert_eq!(
+            diff, 0,
+            "{name}: ellipsis-on paint must be byte-identical to Blitz painting \
+             the truncated string (diff_pixels={diff}, truncated={truncated:?})"
+        );
+    }
 }
