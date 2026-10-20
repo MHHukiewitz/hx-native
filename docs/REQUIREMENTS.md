@@ -115,12 +115,24 @@ pub trait SliceSource {
     fn version(&self, name: &str) -> Option<u64>;
     /// Only for the reserved `actions` slice (greyed-before-click).
     fn action_states(&self) -> Vec<(String, ActionState)>;
+    /// `(action, input name) -> InputLimits` from the reserved `actions`
+    /// slice (issue #16: `actions.<action>.limits.<input>`). Default: none —
+    /// a non-breaking addition. See "Range / number limits" below.
+    fn input_limits(&self) -> Vec<(String, String, InputLimits)> { Vec::new() }
 }
 
 /// Published by the host as the reserved `actions` slice.
 pub enum ActionState {
     Enabled,
     Disabled { reason: String }, // one plain string; the crate never invents copy
+}
+
+/// Per-input numeric bounds declared via `SliceSource::input_limits`
+/// (issue #16). `step: None` means any value (htmx `step="any"`).
+pub struct InputLimits {
+    pub min: f64,
+    pub max: f64,
+    pub step: Option<f64>,
 }
 
 /// Engine configuration: offline, no network, no JS.
@@ -314,6 +326,30 @@ pub struct Hole {
 9. **Element-level Esc still goes through Game (Game, 2026-10-19).** A mock's `keydown[key=='Escape']` trigger only makes the engine enqueue an `Action` on Game's queue. Game runs it only if that window is top of the stack. Otherwise Game does the normal `#530` close of the top dialog. The engine never reorders close behaviour. Game tests this on its side, and A20 is unchanged.
 10. **Greying is per action name (Game, 2026-10-19).** The `actions` slice greys by action **name**. If shift-click and plain click can ever differ in availability, they must be **two action names**, split with filters (`click[!shiftKey]` → `x`, `click[shiftKey]` → `x.bulk`). Use one name plus `trigger` info only when availability is always identical. A2b already records `trigger`.
 
+## Range / number limits from the `actions` slice (issue #16)
+
+**Locked (Designer + Game + UI, 2026-10-19; Mike's Floor lock covers #14/#15/#16).** Designer-authored samples and mock fragments never hand-write `min`, `max` or `step` on `<input type=range|number>` — Game's `actions` slice is the source of truth (`actions.<action>.limits.<input name>`), and it always wins over markup.
+
+**API:**
+- `InputLimits { min: f64, max: f64, step: Option<f64> }` — `step: None` means any value (htmx `step="any"`); arrow/spin stepping still falls back to a step of `1` in that case, the same default `numeric_limits` already uses for a missing/invalid `step` attribute (issue #17).
+- `SliceSource::input_limits(&self) -> Vec<(String /* action */, String /* input name */, InputLimits)>` is a **default** trait method (`Vec::new()` when not overridden) — a non-breaking addition; existing `SliceSource` implementors in Mainnet compile unchanged until they choose to supply limits.
+- `worker::SyncPacket` carries a matching `pub input_limits: Vec<(String, String, InputLimits)>` field and implements `input_limits()` from it, so `PaintWorker` stays at parity with the synchronous `Engine`. `SyncPacket::merge_per_slice` keeps an older packet's `input_limits` when a newer coalesced packet carries none (limits are "fixed per build," usually sent once; see the tick-cost rule below), and adopts a newer non-empty list when one arrives.
+- Two new `EngineError` variants: `UnknownLimitInput { action, input }` and `InvalidInputLimits { action, input, reason }` (see below). **`EngineError` is not `#[non_exhaustive]`** (unlike `TriggerInfo` / `InputOutcome` / `InputEvent`), so adding these variants is a source-breaking change for any exhaustive `match` over `EngineError` in Mainnet or other downstream crates — Mainnet needs a match arm (or a wildcard) for them before taking this revision.
+
+**Tick cost (Game's request).** `sync` calls `SliceSource::input_limits` only on the very first sync, and again only when the reserved `actions` slice's own `version` changes. A host that hands the real limits over once — either via constants decided at `declare_actions` time, or an `actions` slice whose version never bumps — pays for `input_limits` exactly once per engine. The returned `(action, input, InputLimits)` list is cached, and the cache (not a fresh `input_limits` call) is what gets re-applied whenever a later `sync` swaps a section, since Designer's sample/fragment HTML never carries `min`/`max`/`step` by design.
+
+**Scope.** For every `(action, input name, limits)` entry: the engine writes `min`, `max` and `step` onto every `<input type=range|number name=<input name>>` inside a `<form>` that is, or contains, an element whose `hx-post` names `action` (the usual shape: one Save button per Settings form; the range/number inputs themselves need no `hx-*` attributes of their own). `step: None` writes the literal `step="any"` (never an absent attribute — once applied, the slice is the final word on all three attributes). The slice always wins over markup: an input that already has `min`/`max`/`step` in its loaded HTML gets them overwritten, and a debug build logs one warning when the slice value differs from markup.
+
+**Unknown input / missing form.** An unknown input name is an error on `sync` (`UnknownLimitInput`) **only when a form for `action` exists somewhere in the document but none of its range/number inputs are named `input`.** When no element with `hx-post="<action>"` exists in the document at all, that entry is silently skipped — the action's form may be on another surface, or simply not rendered on this one yet; that is not a host bug.
+
+**Validation.** Every entry needs finite `min`/`max` with `min <= max`, and a finite, strictly positive `step` when `Some`. Any violation fails `sync` with `InvalidInputLimits { action, input, reason }`, checked before anything is written to the DOM: either every entry in one `input_limits()` call applies, or `sync` returns an error and leaves the previous limits/cache untouched.
+
+**Clamping.** When limits are (re-)applied and the current `value` sits outside `[min, max]` or off the `step` grid, the engine clamps/snaps it locally — reusing the exact integer-scaled clamp (`clamp_snap_value` / `NumericLimits`) issue #17 already uses for typed-commit and spin-step clamping, so there is no float drift either way. A clamp is a **local value change only**: it never fires `change`, never emits `InputOutcome::Action`, and never creates pending state. The unfocused display re-groups (thousands separators) for number inputs, and any `<output for="id">` bound to the input updates, exactly like a committed edit.
+
+**Damage.** Writing limits / clamping a value damages only the changed input (plus its bound `<output>`, if any) through the same DOM-mutation-then-resolve path every other attribute write in this crate uses; partial repaint stays byte-identical to a forced full repaint.
+
+**Follow-up for issue #15 (not in this branch).** Issue #15 (PR #24, greying / dirty baseline) is off `main` as of this branch and is **not** touched here. When #15 lands, a clamp must count as a local edit against #15's dirty-before-apply baseline the same way a typed edit does — otherwise a value that silently moved because its limits tightened would look "clean" (unchanged) to the baseline tracker even though it no longer matches what the user last set. That wiring is explicitly **out of scope for #16**; see Open decisions below.
+
 ## Mainnet integration seams
 
 1. **Chrome shell HTML** from Designer (same file Canvas uses). First spike: time strip replacing egui `time_controls` face (date, speed chips, pause affordance) without removing pause/menu behaviour owned by Game/UI.
@@ -396,6 +432,7 @@ Numbered so agents can tick them on the GitHub issue once this doc is locked.
 | **A25** | Engine `<select>` *(issue #14)* | Plain `<select>`/`<option>`: closed face shows selected text + ▼; click opens ≤8-row list; row click / Enter picks and fires `change`; Esc or outside click cancels; Esc consumed only while open; closed ArrowUp/Down step + `change`; open list is in damage rects / paints above content. |
 | **Form args (K1 / #14)** | Multi-value + trigger `name`/`value` | Documented contract (not tests-only): `Action.args` stays `Vec<(String, String)>`. Repeated checkbox names (e.g. several `name="state"`) each contribute a pair in document order; unchecked boxes contribute nothing. `args_get` returns the first value; `args_get_all` returns every value. Any triggering element with `name=`/`value=` (button, `<tr>`, …) contributes that pair first; if the enclosing form also has that name, **both** appear (trigger first — htmx parity). |
 | **A26** | Typed text / number entry (issue #17) | Typing, editing and selection on text/number inputs; number filter + clamp on commit; Enter/blur fires `change` via `LiveSurface::fire_change` (issue #14 / PR #18); Esc reverts when focused and stays Unhandled without focus; typed values ride in action args; disabled fields refuse input; thousands grouping on display with canonical args and `data-hx-group="off"` opt-out; spin-box `data-hx-step` / `data-hx-step-for` (Designer-locked names) steps/clamps/regroups and fires `change` once per click with decimal precision; caret blink produces only a small damage rect (not a full repaint); engine drops Cc/bidi controls from `Text`/`Paste` (paste newlines → space); host clipboard via `Paste`/`Copy`/`Cut`/`ClipboardWrite`. |
+| **A28** | Range/number limits from the `actions` slice (issue #16) | `actions.<action>.limits.<input>` limits appear on matching `<input type=range\|number>` after `sync` (`step: None` → `step="any"`); the slice always wins over markup; changing the `actions` slice version re-applies and re-clamps, while an unchanged version (even across an unrelated swap) never re-calls `input_limits`; a swap still re-applies the cached limits onto fresh fragment markup; posted args (`collect_action_args`) and typed/arrow/spin commits all stay within the slice bounds; an unknown input name inside a form that does exist for the action fails `sync`, a missing form for the action does not; invalid limits (non-finite, `min > max`, `step <= 0`) fail `sync`; a clamp fires no `Action` / `change`; damage stays scoped to the changed input, partial == full; `PaintWorker` parity, including `SyncPacket::merge_per_slice` keeping coalesced limits. |
 | **A4** | Dialect: click → action | `hx-post` + `hx-trigger="click"` returns `InputOutcome::Action { name, args, source_id }`. The engine calls no host code during `input`. The click-time check still fails loudly on an unknown name. |
 | **A5** | Dialect: slice → swap | Bumping one slice version re-renders only the dirty target (`hx-target` + `hx-swap` `innerHTML` and `outerHTML`); assert **no full-document relayout** (instrument layout roots / damage flags). |
 | **A5b** | Unsupported swap fails | Any `hx-swap` value outside the locked set (today `innerHTML`, `outerHTML`) fails the test loudly. |
@@ -428,6 +465,9 @@ Evidence for every pick below: `research/CRATE_SURVEY.md` (2026-10-19). Mike sai
 7. **CLOSED by issue #17 (Mike lock 2026-10-19 Floor: no walkabouts).** Typed text and number entry for single-line `<input type=text|number>` ships in the engine (see Input rule 7). `InputEvent::Text` is handled when a field is focused; otherwise `Unhandled`. Out of scope remain: `<textarea>`, IME, RTL/bidi.
 8. **RESOLVED by default at lock (Mike, 2026-10-19): no macOS Ctrl+click remap.** The engine reports raw (Primary + `ctrl`). Should UI map macOS Ctrl+Primary to `Secondary` (the macOS right-click convention)? **Htmx recommends no mapping by default**: two-finger/trackpad right click already arrives as Secondary, and a raw Ctrl+click stays available to `click[ctrlKey]` triggers. The default stands: UI does not remap, and Ctrl+Primary arrives raw.
 9. **Open (Designer): `dblclick`.** Deferred (load error) until a mock needs it. It needs a double-click time threshold, which UI would supply from the OS setting.
+
+10. **Open (issue #16 follow-up, flagged by Htmx for whoever picks up #15).** A clamp from a limits change must count as a local edit against #15's dirty-before-apply baseline once #15 lands — otherwise a value that moved only because its limits tightened would look unchanged to the baseline tracker. Not implemented here: it is out of this branch (#15 is off `main` as of #16), and #15's author should wire it in.
+11. **Open interface gap (flagged by Htmx; no action taken).** Mainnet has no way to push updated `InputLimits` except by bumping the reserved `actions` slice's own `version` — by design, matching Game's "hand them over once" request, and no new engine API (e.g. a `declare_limits`) was added. If a future need arises to change limits on a cadence independent of any action's enabled/disabled state (e.g. per-player bounds that change without touching availability), the host still has to bump `actions`'s version to get a fresh `input_limits()` pull. Flagging this in case it ever becomes a real constraint — nothing is broken today.
 
 Locked 2026-10-19 12:51 (UTC-3). Crate code starts with Layer 1 (time-strip spike, gate G1) in the `hx-native` repo. Open items still standing: 6 (wgpu 30 bump, Mike yes/no) and 9 (`dblclick`, deferred).
 
