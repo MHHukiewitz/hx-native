@@ -1578,3 +1578,104 @@ fn a27_hx_changed_worker_parity() {
         "{worker_outs:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// K: `hx-changed` opt-in by `data-hx-applied` alone (issue #24, Designer
+// lock 2026-10-20 15:10 America/Asuncion). The attribute turns the class on
+// for that control in ANY form (even one with no `RequiresChange` action at
+// all) or in no form at all — independent of Apply/Confirm greying, which
+// stays scoped to `RequiresChange` forms only. Pixel-level worker parity for
+// this path is covered in `paint_worker_pixel_parity.rs` (the worker exposes
+// no attribute/class read, so an outcome-only parity check here would add
+// nothing beyond that pixel coverage).
+// ---------------------------------------------------------------------------
+
+const NO_ACTION_FORM: &str = r##"
+<form id="plan">
+  <input id="plan-qty" type="text" name="qty" value="Base" data-hx-applied="Base" style="width:160px;height:22px;display:block"/>
+</form>"##;
+
+/// A form with no action at all (no `hx-post`, nothing declared, nothing
+/// registered with `RequiresChange`): editing its opted-in control must
+/// still toggle `hx-changed`, and reverting must still clear it.
+#[test]
+fn a27_hx_changed_applies_in_form_with_no_action() {
+    let mut eng = boot(NO_ACTION_FORM, &[]);
+    assert!(!eng.has_class("plan-qty", "hx-changed"), "must start clean");
+
+    set_field_text(&mut eng, "plan-qty", "Edited");
+    assert!(
+        eng.has_class("plan-qty", "hx-changed"),
+        "data-hx-applied alone must opt this control into hx-changed, \
+         even with no RequiresChange action anywhere"
+    );
+
+    set_field_text(&mut eng, "plan-qty", "Base");
+    assert!(
+        !eng.has_class("plan-qty", "hx-changed"),
+        "reverting to the applied value must clear hx-changed"
+    );
+}
+
+const STANDALONE_APPLIED_CONTROL: &str = r##"<input id="row-qty" type="text" name="qty" value="Base" data-hx-applied="Base" style="width:160px;height:22px;display:block"/>"##;
+
+/// A control with `data-hx-applied` outside any `<form>` at all (the "plan
+/// row with no button of its own" case the Designer lock calls out).
+#[test]
+fn a27_hx_changed_applies_to_standalone_control_outside_any_form() {
+    let mut eng = boot(STANDALONE_APPLIED_CONTROL, &[]);
+    assert!(!eng.has_class("row-qty", "hx-changed"), "must start clean");
+
+    set_field_text(&mut eng, "row-qty", "Edited");
+    assert!(
+        eng.has_class("row-qty", "hx-changed"),
+        "data-hx-applied alone must opt a formless control into hx-changed"
+    );
+
+    set_field_text(&mut eng, "row-qty", "Base");
+    assert!(
+        !eng.has_class("row-qty", "hx-changed"),
+        "reverting to the applied value must clear hx-changed"
+    );
+}
+
+/// Damage from the opt-in-by-attribute path (no `RequiresChange` form in
+/// play at all) must stay scoped to the edited control, and a partial
+/// repaint of that edit must be byte-identical to a forced full repaint —
+/// same discipline as the `RequiresChange`-scoped path (group F).
+#[test]
+fn a27_hx_changed_opt_in_damage_partial_eq_full() {
+    let html = format!("{NO_ACTION_FORM}{STANDALONE_APPLIED_CONTROL}");
+    let mut eng = boot(&html, &[]);
+    let _ = eng.paint(vp());
+
+    set_field_text(&mut eng, "plan-qty", "Edited");
+    let partial = eng.paint(vp()).unwrap();
+    assert!(!partial.skipped && partial.rgba.is_some());
+    assert!(!eng.last_paint_stats().full_repaint);
+    let partial_px = partial.rgba.unwrap();
+
+    let full_area = 500.0 * 500.0;
+    let damaged_area: f64 = partial
+        .damage
+        .iter()
+        .map(|r| (r.width * r.height) as f64)
+        .sum();
+    assert!(
+        damaged_area < full_area * 0.5,
+        "opt-in-by-attribute hx-changed damage must not blow up to a full \
+         repaint: {:?}",
+        partial.damage
+    );
+
+    let mut eng_full = boot(&html, &[]);
+    let _ = eng_full.paint(vp());
+    set_field_text(&mut eng_full, "plan-qty", "Edited");
+    eng_full.mark_theme_or_stylesheet_changed();
+    let full = eng_full.paint(vp()).unwrap();
+    assert_partial_eq_full(
+        &partial_px,
+        full.rgba.as_ref().unwrap(),
+        "standalone hx-changed opt-in damage",
+    );
+}

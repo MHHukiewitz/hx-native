@@ -185,7 +185,13 @@ pub enum ActionState {
 
 /// Issue #15: an input-level dependency rule, keyed under the action that
 /// posts the form owning the dependent input (not its own reserved slice).
+///
+/// `#[non_exhaustive]` (Graph review, PR #24 follow-up): unlike `ActionState`,
+/// this enum is young enough that downstream exhaustive matches should not
+/// be allowed to silently become exhaustive again when a new rule kind is
+/// added later — every match needs a wildcard arm from the start.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InputRule {
     /// Grey the dependent input (same three attributes as `Disabled`) while
     /// the named checkbox in the same form has `checked != checked`.

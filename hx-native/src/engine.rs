@@ -20,8 +20,9 @@ use crate::error::EngineError;
 use crate::focus::{focusable_ids, ids_in_document_order, step_focus};
 use crate::fonts::bundled_font_context;
 use crate::form_args::{
-    capture_form_controls, closest_form, collect_action_args, is_number_input, is_numeric_input,
-    set_range_value_from_x, step_numeric_value,
+    capture_applied_controls, capture_form_controls, closest_form, collect_action_args,
+    collect_applied_control_nids, is_number_input, is_numeric_input, set_range_value_from_x,
+    step_numeric_value,
 };
 use crate::form_controls::{
     activate_checkable, checkbox_checked_by_name, control_is_disabled, form_control_at_point,
@@ -186,6 +187,12 @@ struct LiveSurface {
     /// form or its controls. A control carrying `data-hx-applied` overrides
     /// its own entry here at comparison time (Designer lock 2026-10-20).
     form_baselines: HashMap<String, Vec<(String, String)>>,
+    /// Issue #24 (Designer lock 2026-10-20): node ids of every control
+    /// carrying `data-hx-applied`, anywhere in the document (any form, or
+    /// none) — the attribute alone opts a control into `hx-changed`,
+    /// independent of `RequiresChange`. Refreshed on reindex (load / swap),
+    /// not per edit (cost rule: only opted-in controls are ever compared).
+    applied_control_nids: Vec<NodeId>,
     /// Issue #15: last `input_rules()` poll (cached; no Game round trip per edit).
     input_rules: Vec<(String, String, InputRule)>,
     /// Issue #15: dependent-input element id -> reason currently greyed by an
@@ -1315,6 +1322,7 @@ impl LiveSurface {
         doc.add_user_agent_stylesheet(select_ua_stylesheet());
         doc.resolve(0.0);
         let select_nids = collect_select_nids(&doc);
+        let applied_control_nids = collect_applied_control_nids(&doc);
         Ok(Self {
             doc,
             bindings,
@@ -1323,6 +1331,7 @@ impl LiveSurface {
             disabled_actions: HashMap::new(),
             last_action_states: Vec::new(),
             form_baselines: HashMap::new(),
+            applied_control_nids,
             input_rules: Vec::new(),
             rule_disabled: HashMap::new(),
             hx_changed_write_count: 0,
@@ -1391,6 +1400,9 @@ impl LiveSurface {
         }
         if !self.input_rules.is_empty() {
             self.apply_input_rules(false);
+        }
+        if !self.applied_control_nids.is_empty() {
+            self.apply_standalone_changed_classes();
         }
     }
 
@@ -1471,6 +1483,7 @@ impl LiveSurface {
         self.bindings = bindings;
         self.sections = sections;
         self.select_nids = collect_select_nids(&self.doc);
+        self.applied_control_nids = collect_applied_control_nids(&self.doc);
         self.reconcile_open_select();
         self.reconcile_text_edit();
         Ok(())
@@ -1677,6 +1690,7 @@ impl LiveSurface {
         self.apply_disabled_map(new_disabled, force_dom_pass);
         self.apply_input_rules(force_dom_pass);
         self.apply_all_changed_classes();
+        self.apply_standalone_changed_classes();
     }
 
     /// Fold `Disabled` reasons with any currently-dirty `RequiresChange`
@@ -2030,6 +2044,39 @@ impl LiveSurface {
                     .unwrap_or_else(|| current.clone())
             });
             let desired_changed = *current != baseline_value;
+            if self.node_has_class(*nid, HX_CHANGED_CLASS) != desired_changed {
+                updates.push((*nid, desired_changed));
+            }
+        }
+        if updates.is_empty() {
+            return;
+        }
+        for (nid, on) in updates {
+            self.toggle_class(nid, HX_CHANGED_CLASS, on);
+            self.hx_changed_write_count += 1;
+        }
+        self.mark_dom_dirty_raw();
+        self.mark_paint_dirty();
+    }
+
+    /// Issue #24 (Designer lock 2026-10-20): `hx-changed` for every control
+    /// carrying `data-hx-applied`, independent of any enclosing form or
+    /// `RequiresChange` action — the attribute alone opts a control in (a
+    /// plan row with no button of its own included). There is no fallback
+    /// baseline here: being in `self.applied_control_nids` means the
+    /// attribute is present, so it is always the comparison baseline (same
+    /// override rule as `apply_changed_classes`, just with nothing to fall
+    /// back to). A control also covered by a `RequiresChange` form's pass
+    /// computes the identical decision there, so the flip-check keeps this
+    /// idempotent — no double write.
+    fn apply_standalone_changed_classes(&mut self) {
+        let controls = capture_applied_controls(&self.doc, &self.applied_control_nids);
+        if controls.is_empty() {
+            return;
+        }
+        let mut updates: Vec<(NodeId, bool)> = Vec::new();
+        for (nid, current, applied) in &controls {
+            let desired_changed = current != applied;
             if self.node_has_class(*nid, HX_CHANGED_CLASS) != desired_changed {
                 updates.push((*nid, desired_changed));
             }

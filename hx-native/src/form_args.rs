@@ -128,15 +128,66 @@ fn applied_value(node: &Node) -> Option<String> {
 
 fn control_baseline_pair(doc: &HtmlDocument, node: &Node) -> Option<(String, String)> {
     let name = named_attr(node, "name")?;
+    let current = control_current_value(doc, node)?;
+    Some((name, current))
+}
+
+/// Current value for a supported control, same encoding used throughout this
+/// module (checkbox/radio as `"true"`/`"false"`, everything else the literal
+/// value). Unlike [`control_baseline_pair`], does not require a `name` —
+/// standalone `data-hx-applied` controls (Designer lock 2026-10-20) opt into
+/// `hx-changed` by the attribute alone, with or without a form or a name.
+fn control_current_value(doc: &HtmlDocument, node: &Node) -> Option<String> {
     match tag_name(node).as_str() {
         "input" => match input_type(node).as_str() {
-            "checkbox" | "radio" => Some((name, is_checked(node).to_string())),
-            "number" | "range" | "hidden" | "text" => Some((name, control_value(node))),
+            "checkbox" | "radio" => Some(is_checked(node).to_string()),
+            "number" | "range" | "hidden" | "text" => Some(control_value(node)),
             _ => None,
         },
-        "select" => Some((name, select_value(doc, node))),
+        "select" => Some(select_value(doc, node)),
         _ => None,
     }
+}
+
+/// Issue #24 (Designer lock 2026-10-20): node ids of every element anywhere
+/// in the document carrying `data-hx-applied` — the attribute alone opts a
+/// control into `hx-changed` tracking, independent of any enclosing form or
+/// `RequiresChange` action. Walked once per structural DOM change (reindex),
+/// not per sync/edit, so the per-edit recompute stays cheap (issue #15 cost
+/// rule: only opted-in controls are ever compared).
+pub(crate) fn collect_applied_control_nids(doc: &HtmlDocument) -> Vec<NodeId> {
+    let root = doc.root_node().id;
+    let mut stack = vec![root];
+    let mut out = Vec::new();
+    while let Some(nid) = stack.pop() {
+        let Some(node) = doc.get_node(nid) else {
+            continue;
+        };
+        stack.extend(node.children.iter().copied());
+        if node.is_element() && attr(node, ATTR_HX_APPLIED).is_some() {
+            out.push(nid);
+        }
+    }
+    out
+}
+
+/// Issue #24: `(node id, current value, applied value)` for each id in
+/// `nids` (from [`collect_applied_control_nids`]) still present and still a
+/// supported control. The applied value is always present by construction —
+/// that is what being in `nids` means — so there is no fallback baseline to
+/// track or invalidate on re-render (data-hx-applied always wins).
+pub(crate) fn capture_applied_controls(
+    doc: &HtmlDocument,
+    nids: &[NodeId],
+) -> Vec<(NodeId, String, String)> {
+    nids.iter()
+        .filter_map(|&nid| {
+            let node = doc.get_node(nid)?;
+            let current = control_current_value(doc, node)?;
+            let applied = applied_value(node)?;
+            Some((nid, current, applied))
+        })
+        .collect()
 }
 
 /// Value for a triggering element: real control value for form controls,
