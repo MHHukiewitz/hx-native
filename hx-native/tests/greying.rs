@@ -1864,6 +1864,49 @@ fn g2_recheck_gate_checkbox_no_stale_partial_repaint() {
     );
 }
 
+/// R2-2 (Graph 18:55, blocker 2): the keyboard Space path for toggling a
+/// focused checkbox/radio (`on_key`) did not queue the same explicit commit
+/// damage `after_control_commit` queues on the pointer path, so unchecking
+/// then rechecking a gate *via keyboard* could leave its own tick mark
+/// stale in a partial repaint, same bug as G2 but on a different input path.
+#[test]
+fn r2_2_keyboard_recheck_gate_checkbox_no_stale_partial_repaint() {
+    let mut eng = boot(DEPENDENT_FORM, &["settings.g"]);
+    let mut slices = Slices::new();
+    let mut frags = Frags::default();
+    slices.rules = dependent_rules();
+    slices.bump("actions");
+    eng.sync(&slices, &mut frags).unwrap();
+    let _ = eng.paint(vp());
+
+    eng.test_set_focus("music2");
+    let _ = key(&mut eng, " "); // uncheck the gate via Space
+    let _ = eng.paint(vp());
+    let _ = key(&mut eng, " "); // recheck it via Space
+    let partial = eng.paint(vp()).unwrap();
+    assert!(!partial.skipped && partial.rgba.is_some());
+    let partial_px = partial.rgba.unwrap();
+
+    let mut eng_full = boot(DEPENDENT_FORM, &["settings.g"]);
+    let mut slices_full = Slices::new();
+    let mut frags_full = Frags::default();
+    slices_full.rules = dependent_rules();
+    slices_full.bump("actions");
+    eng_full.sync(&slices_full, &mut frags_full).unwrap();
+    let _ = eng_full.paint(vp());
+    eng_full.test_set_focus("music2");
+    let _ = key(&mut eng_full, " ");
+    let _ = eng_full.paint(vp());
+    let _ = key(&mut eng_full, " ");
+    eng_full.mark_theme_or_stylesheet_changed();
+    let full = eng_full.paint(vp()).unwrap();
+    assert_partial_eq_full(
+        &partial_px,
+        full.rgba.as_ref().unwrap(),
+        "R2-2: rechecking a gate checkbox via keyboard Space must not leave its own tick mark stale",
+    );
+}
+
 const OVERLAP_FORM: &str = r##"
 <form id="o">
   <input id="g" type="checkbox" name="g" checked style="display:block"/>

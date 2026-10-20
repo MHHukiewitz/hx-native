@@ -3647,6 +3647,10 @@ impl LiveSurface {
                             activate_checkable(&mut self.doc, nid)
                         };
                         if changed {
+                            // Same explicit commit damage as the pointer path
+                            // (`after_control_commit`): the tick mark is element
+                            // state, not guaranteed style damage.
+                            self.queue_text_field_damage(nid);
                             let _ = sync_outputs_for(&mut self.doc, fid);
                             self.mark_dom_dirty();
                             self.mark_paint_dirty();
