@@ -705,71 +705,142 @@ fn paint_worker_handle_is_send() {
     assert_send::<WorkerOutcome>();
 }
 
-/// Graph review (PR #24 follow-up): a packet carrying only an actions update
-/// (its `input_rules` left at the `Vec::new()` default because this call has
-/// nothing new to say about rules) must not wipe a still-queued, non-empty
-/// `input_rules` from an earlier coalesced packet — `actions` and
-/// `input_rules` merge independently, each only on a non-empty `newer`.
-#[test]
-fn sync_packet_merge_per_slice_actions_only_keeps_queued_input_rules() {
-    let rule = InputRule::EnabledWhen {
-        input: "gate".into(),
-        checked: true,
-        reason: "gate off".into(),
-    };
-    let mut acc = SyncPacket {
-        versions: HashMap::from([("actions".into(), 1)]),
-        actions: Vec::new(),
-        input_rules: vec![("act.save".into(), "dep".into(), rule.clone())],
-        fragments: HashMap::new(),
-    };
+// ---------------------------------------------------------------------------
+// R2-3 (Graph 18:55, blocker 3): `actions` + `input_rules` are one reserved
+// slice, replaced together as a unit. `merge_per_slice` must make a
+// coalesced worker end up in exactly the state sequential `Engine::sync`
+// calls would reach — `Engine::sync` unconditionally re-reads both fields
+// on every call, so an "empty" field in a later packet is a real clear, not
+// "no update this call".
+// ---------------------------------------------------------------------------
 
-    let actions_only = SyncPacket {
-        versions: HashMap::from([("actions".into(), 2)]),
-        actions: vec![(
-            "act.other".into(),
+const GP24B_GATE_HTML: &str = r##"<!DOCTYPE html><html><head>
+<style>button:disabled{background:#cc0000;color:#fff}input:disabled{background:#888}</style>
+</head><body style="margin:0;width:400px;height:300px;background:#fff">
+<form id="g">
+<input id="gate" type="checkbox" name="gate" style="position:absolute;left:10px;top:10px"/>
+<input id="dep" type="text" name="dep" value="x" style="position:absolute;left:10px;top:50px;width:120px;height:22px"/>
+<button id="save" hx-post="settings.save" hx-trigger="click" style="position:absolute;left:10px;top:90px;width:80px;height:30px">Save</button>
+</form></body></html>"##;
+
+fn gp24b_rule() -> Vec<(String, String, InputRule)> {
+    vec![(
+        "settings.save".into(),
+        "dep".into(),
+        InputRule::EnabledWhen {
+            input: "gate".into(),
+            checked: true,
+            reason: "gate off".into(),
+        },
+    )]
+}
+
+fn gp24b_pkt(
+    ver: u64,
+    actions: Vec<(String, ActionState)>,
+    rules: Vec<(String, String, InputRule)>,
+) -> SyncPacket {
+    SyncPacket {
+        versions: HashMap::from([("actions".into(), ver)]),
+        actions,
+        input_rules: rules,
+        fragments: HashMap::new(),
+    }
+}
+
+/// Apply `pkts` to a fresh sync `Engine`, one `sync` + `paint` per packet
+/// (the "sequential" ground truth `merge_per_slice` must match once the
+/// coalesced packets are delivered as one combined `sync`), returning the
+/// final frame plus `dep`/`save`'s `disabled` state.
+fn gp24b_sync_engine_state(pkts: &[SyncPacket]) -> (RgbaImage, Option<String>, Option<String>) {
+    let mut e = Engine::new(cfg());
+    e.declare_actions(&["settings.save"]);
+    e.load_html(GP24B_GATE_HTML).unwrap();
+    let _ = e.paint(Viewport::new(400, 300));
+    for p in pkts {
+        let mut slices = p.clone();
+        let mut frags = p.clone();
+        e.sync(&slices, &mut frags).unwrap();
+        let _ = &mut slices;
+        let _ = e.paint(Viewport::new(400, 300));
+    }
+    let out = e.paint(Viewport::new(400, 300)).unwrap();
+    let frame = out.rgba.unwrap_or_else(|| e.last_frame().unwrap().clone());
+    (frame, e.attr("dep", "disabled"), e.attr("save", "disabled"))
+}
+
+fn gp24b_frame_diff(a: &RgbaImage, b: &RgbaImage) -> usize {
+    a.pixels
+        .iter()
+        .zip(b.pixels.iter())
+        .filter(|(p, q)| p != q)
+        .count()
+}
+
+/// R2-3: `SyncPacket::merge_per_slice` must put the coalesced accumulator in
+/// exactly the state sequential `Engine::sync(P1)` then `Engine::sync(P2)`
+/// ends with, for every combination of "which field is empty in which
+/// packet" — including blocker 3's own regression case (an actions-only
+/// packet arriving after an earlier rules-only one).
+#[test]
+fn gp24b_merge_vs_sync_semantics() {
+    let busy = || {
+        vec![(
+            "settings.save".to_string(),
             ActionState::Disabled {
                 reason: "busy".into(),
             },
-        )],
-        input_rules: Vec::new(),
-        fragments: HashMap::new(),
+        )]
     };
-    acc.merge_per_slice(actions_only);
+    let cases: Vec<(&str, Vec<SyncPacket>)> = vec![
+        (
+            "rules_then_actions_only",
+            vec![
+                gp24b_pkt(1, vec![], gp24b_rule()),
+                gp24b_pkt(2, busy(), vec![]),
+            ],
+        ),
+        (
+            "actions_then_actions_cleared",
+            vec![gp24b_pkt(1, busy(), vec![]), gp24b_pkt(2, vec![], vec![])],
+        ),
+        (
+            "rules_then_rules_cleared",
+            vec![
+                gp24b_pkt(1, vec![], gp24b_rule()),
+                gp24b_pkt(2, vec![], vec![]),
+            ],
+        ),
+        (
+            "actions_only_then_rules_only",
+            vec![
+                gp24b_pkt(1, busy(), vec![]),
+                gp24b_pkt(2, vec![], gp24b_rule()),
+            ],
+        ),
+    ];
 
-    assert_eq!(
-        acc.actions,
-        vec![(
-            "act.other".to_string(),
-            ActionState::Disabled {
-                reason: "busy".into()
-            }
-        )],
-        "the actions-only packet's actions must still land"
-    );
-    assert_eq!(
-        acc.input_rules,
-        vec![("act.save".to_string(), "dep".to_string(), rule)],
-        "an actions-only packet must not wipe already-queued input_rules"
-    );
+    let mut bad: Vec<&str> = Vec::new();
+    for (name, pkts) in &cases {
+        let (seq_frame, seq_dep, seq_save) = gp24b_sync_engine_state(pkts);
 
-    // A packet that genuinely carries new (possibly different) rules still
-    // replaces the accumulated ones.
-    let new_rule = InputRule::EnabledWhen {
-        input: "gate2".into(),
-        checked: false,
-        reason: "gate2 on".into(),
-    };
-    let rules_update = SyncPacket {
-        versions: HashMap::from([("actions".into(), 3)]),
-        actions: Vec::new(),
-        input_rules: vec![("act.save".into(), "dep2".into(), new_rule.clone())],
-        fragments: HashMap::new(),
-    };
-    acc.merge_per_slice(rules_update);
-    assert_eq!(
-        acc.input_rules,
-        vec![("act.save".to_string(), "dep2".to_string(), new_rule)],
-        "a non-empty input_rules in the newer packet must still replace the accumulated one"
+        // What merge_per_slice produces when the two packets are coalesced
+        // into one, then delivered as a single Engine::sync.
+        let mut merged = pkts[0].clone();
+        merged.merge_per_slice(pkts[1].clone());
+        let (merged_frame, merged_dep, merged_save) = gp24b_sync_engine_state(&[merged]);
+
+        let pixel_diff = gp24b_frame_diff(&seq_frame, &merged_frame);
+        if pixel_diff != 0 || merged_dep != seq_dep || merged_save != seq_save {
+            bad.push(name);
+        }
+        eprintln!(
+            "gp24b_merge_vs_sync_semantics {name}: sequential(dep={seq_dep:?} save={seq_save:?}) \
+             merged(dep={merged_dep:?} save={merged_save:?}) pixel_diff={pixel_diff}"
+        );
+    }
+    assert!(
+        bad.is_empty(),
+        "merge_per_slice diverged from sequential Engine::sync for: {bad:?}"
     );
 }

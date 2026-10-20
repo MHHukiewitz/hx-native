@@ -139,38 +139,35 @@ impl SyncPacket {
     /// Merge `newer` per slice / section (latest key wins). Used when
     /// coalescing queued `sync` calls before the worker drains them.
     ///
-    /// `versions` and `fragments` already merge per **key**: a key missing
-    /// from `newer` leaves the accumulated entry alone, it does not delete
-    /// it. `actions` and `input_rules` (Graph review, PR #24 follow-up) now
-    /// follow the same per-slice rule, independently of each other: each is
-    /// replaced only when `newer` actually carries a non-empty `Vec` for
-    /// that field. A caller that builds one packet with only an actions
-    /// update (leaving `input_rules` at its `Vec::new()` default because
-    /// this call has nothing new to say about rules) must not have that
-    /// coalesce into wiping a still-queued, not-yet-delivered packet's
-    /// non-empty `input_rules` — before this fix, a single shared
-    /// `replace_actions` flag governed both fields together, so a
-    /// non-empty `actions` in `newer` also replaced `self.input_rules`
-    /// with `newer`'s empty one.
-    ///
-    /// Tradeoff: this cannot distinguish "no update to this field this
-    /// call" from "explicitly clear it to empty" within one coalesced
-    /// merge window — an empty `Vec` always means the former. A caller
-    /// that truly wants to clear `actions` or `input_rules` sees that take
-    /// effect on the next packet that is not coalesced away before the
-    /// worker drains the mailbox (the common case: `flush()` between
-    /// calls, or no other `sync` queued at the same time).
+    /// `versions` and `fragments` merge per **key**: a key missing from
+    /// `newer` leaves the accumulated entry alone, it does not delete it.
+    /// `actions` and `input_rules` are **one** reserved slice (Graph review,
+    /// PR #24 round 2, reverting an earlier per-field split that diverged
+    /// from `Engine::sync`) and are replaced **together, as a unit**:
+    /// `Engine::sync` unconditionally re-reads both on every call
+    /// (`self.input_rules = slices.input_rules()`; `apply_action_states`),
+    /// so a coalesced worker must reproduce exactly what sequential
+    /// `Engine::sync(P1)` then `Engine::sync(P2)` ends with — including
+    /// `P2` *clearing* a field by sending it empty. The pair is replaced
+    /// whenever `newer` is reporting on the slice at all: it carries the
+    /// `"actions"` version key, or either field is non-empty (the latter a
+    /// defensive fallback for a caller that forgot the version bump but
+    /// still has content to deliver). Verified equal to sequential
+    /// `Engine::sync` application, including the "actions update after an
+    /// earlier rules-only packet" case, by `gp24b_merge_vs_sync_semantics`
+    /// (`tests/paint_worker.rs`).
     pub fn merge_per_slice(&mut self, newer: SyncPacket) {
+        let replace_actions = newer.versions.contains_key("actions")
+            || !newer.actions.is_empty()
+            || !newer.input_rules.is_empty();
         for (k, v) in newer.versions {
             self.versions.insert(k, v);
         }
         for (k, v) in newer.fragments {
             self.fragments.insert(k, v);
         }
-        if !newer.actions.is_empty() {
+        if replace_actions {
             self.actions = newer.actions;
-        }
-        if !newer.input_rules.is_empty() {
             self.input_rules = newer.input_rules;
         }
     }
