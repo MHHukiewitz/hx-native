@@ -1177,6 +1177,7 @@ impl PaintWorker {
     /// [`crate::Engine::test_force_caret_blink`]. Fire-and-forget like other
     /// setup/test commands; pair with [`Self::flush`] or
     /// [`Self::test_caret_visible`] to wait for it to apply.
+    #[doc(hidden)]
     pub fn force_caret_blink_for_test(&self) -> Result<(), WorkerError> {
         self.check_stall_after_enqueue(self.mailbox.push_discrete(Command::TestForceCaretBlink))
     }
@@ -1196,6 +1197,7 @@ impl PaintWorker {
     /// answer. Only a genuine `Panic` — the thread is actually gone — stays
     /// fatal, the same distinction [`Self::check_stall_after_enqueue`]
     /// already draws for every fire-and-forget command.
+    #[doc(hidden)]
     pub fn test_caret_visible(&self) -> Result<Option<bool>, WorkerError> {
         if let Some(err @ WorkerError::Panic(_)) = self.poll_error() {
             return Err(err);

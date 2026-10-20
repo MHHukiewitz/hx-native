@@ -209,7 +209,15 @@ struct LiveSurface {
     /// a pointer move) consumes the restyle-damage flags a prior greying /
     /// `hx-changed` write set, before the host's next real `paint()` ever
     /// gets to read them via its own `resolve_stylist` probe.
-    carried_style_damage: Vec<NodeId>,
+    ///
+    /// A `HashSet`, not a `Vec` (Graph re-review, PR #24 round 2): a host
+    /// that drives many input-time resolves on the same handful of nodes
+    /// without ever painting (e.g. rapid typing with no intervening frame)
+    /// would otherwise grow this without bound — one entry per resolve, not
+    /// per distinct node. Deduping by `NodeId` bounds it by the number of
+    /// distinct nodes that can ever carry style damage, i.e. document size,
+    /// not edit count.
+    carried_style_damage: HashSet<NodeId>,
     pending: PendingState,
     released_outcomes: Vec<InputOutcome>,
     hover_id: Option<String>,
@@ -1227,6 +1235,19 @@ impl Engine {
             .unwrap_or(0)
     }
 
+    /// Test helper (Graph re-review, PR #24 round 2): number of distinct
+    /// nodes currently carried in `carried_style_damage` on the default
+    /// surface — the input-time restyle damage an `ensure_resolved` call
+    /// has stashed because no paint has drained it yet. Deduped by
+    /// `NodeId`, so this must stay bounded by document size no matter how
+    /// many edits land between paints.
+    #[doc(hidden)]
+    pub fn test_carried_style_damage_len(&self) -> usize {
+        self.live(SurfaceId::DEFAULT)
+            .map(|l| l.carried_style_damage.len())
+            .unwrap_or(0)
+    }
+
     /// Test helper: force one caret blink phase flip (damage + paint dirty).
     pub fn test_force_caret_blink(&mut self) {
         if let Some(live) = self
@@ -1343,7 +1364,7 @@ impl LiveSurface {
             input_rules: Vec::new(),
             rule_disabled: HashMap::new(),
             hx_changed_write_count: 0,
-            carried_style_damage: Vec::new(),
+            carried_style_damage: HashSet::new(),
             pending: PendingState::default(),
             released_outcomes: Vec::new(),
             hover_id: None,

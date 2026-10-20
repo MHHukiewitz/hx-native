@@ -2197,6 +2197,79 @@ fn r2_4_action_disabled_survives_swap_without_host_disabled() {
     );
 }
 
+/// Gap 7 (Graph re-review, PR #24 round 2): `carried_style_damage` is a
+/// `HashSet<NodeId>`, not a `Vec`, specifically so a host that drives many
+/// input-time resolves without ever painting (e.g. rapid clicking) does not
+/// grow it without bound — only the *set* of distinct damaged nodes
+/// accumulates, bounded by document size, not by how many edits happened.
+/// This also checks correctness, not just the bound: the next real paint
+/// after all those un-painted edits must still match a fully-forced repaint
+/// of the same end state.
+#[test]
+fn r2_carried_style_damage_bounded_and_correct_after_many_resolves_without_paint() {
+    let mut eng = boot_visible_greying_form();
+    let mut slices = Slices::new();
+    let mut frags = Frags::default();
+    requires_change(
+        &mut eng,
+        &mut slices,
+        &mut frags,
+        "settings.gapply",
+        "gf",
+        REASON,
+    );
+    let _ = eng.paint(vp());
+    assert!(is_greyed(&eng, "gapply", REASON));
+
+    // 50 clicks toggling the same checkbox back and forth, each ungreying or
+    // regreying "gapply" in turn; each click's hit-test runs an input-time
+    // `ensure_resolved`, all without an intervening `paint()`. Only "gmusic"
+    // and "gapply" can ever carry style damage in this fixture.
+    for _ in 0..50 {
+        let _ = click(&mut eng, "gmusic");
+    }
+    assert!(
+        eng.test_carried_style_damage_len() <= 2,
+        "carried_style_damage must stay bounded by document size (<=2 damageable \
+         nodes in this fixture), not grow with the number of input-time resolves \
+         (50 clicks happened without a paint): got {}",
+        eng.test_carried_style_damage_len()
+    );
+    // 50 is even, so "gmusic" ends back at its baseline (unchecked) state —
+    // "gapply" is greyed again.
+    assert!(is_greyed(&eng, "gapply", REASON));
+
+    let partial = eng.paint(vp()).unwrap();
+    assert!(!partial.skipped && partial.rgba.is_some());
+    let partial_px = partial.rgba.unwrap();
+
+    let mut eng_full = boot_visible_greying_form();
+    let mut slices_full = Slices::new();
+    let mut frags_full = Frags::default();
+    requires_change(
+        &mut eng_full,
+        &mut slices_full,
+        &mut frags_full,
+        "settings.gapply",
+        "gf",
+        REASON,
+    );
+    let _ = eng_full.paint(vp());
+    for _ in 0..50 {
+        let _ = click(&mut eng_full, "gmusic");
+        eng_full.mark_theme_or_stylesheet_changed();
+        let _ = eng_full.paint(vp());
+    }
+    eng_full.mark_theme_or_stylesheet_changed();
+    let full = eng_full.paint(vp()).unwrap();
+    assert_partial_eq_full(
+        &partial_px,
+        full.rgba.as_ref().unwrap(),
+        "Gap 7: after many input-time resolves with no intervening paint, the next \
+         real paint must still match a fully-forced repaint of the same end state",
+    );
+}
+
 const OVERLAP_FORM: &str = r##"
 <form id="o">
   <input id="g" type="checkbox" name="g" checked style="display:block"/>
