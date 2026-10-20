@@ -851,6 +851,41 @@ fn limits_packet(actions_ver: u64, max: f64) -> SyncPacket {
     }
 }
 
+/// Deterministic (no thread timing involved): `merge_per_slice` must keep an
+/// older packet's non-empty `input_limits` when the newer packet carries none
+/// (Game's "hand them over once" design), and must adopt a newer non-empty
+/// `input_limits` over an older one.
+#[test]
+fn merge_per_slice_keeps_input_limits_across_coalesced_packets() {
+    let mut older = SyncPacket::default();
+    older.versions.insert("actions".into(), 1);
+    older.input_limits = vec![(
+        "settings.apply".into(),
+        "volume".into(),
+        InputLimits {
+            min: 0.0,
+            max: 3.0,
+            step: None,
+        },
+    )];
+
+    let mut newer_empty = SyncPacket::default();
+    newer_empty.versions.insert("ticker".into(), 2);
+    older.merge_per_slice(newer_empty.clone());
+    assert_eq!(
+        older.input_limits.len(),
+        1,
+        "a newer packet with empty input_limits must not drop the older ones"
+    );
+
+    let newer_with_limits = limits_packet(1, 9.0);
+    older.merge_per_slice(newer_with_limits.clone());
+    assert_eq!(
+        older.input_limits, newer_with_limits.input_limits,
+        "a newer non-empty input_limits must win"
+    );
+}
+
 #[test]
 fn paint_worker_matches_sync_engine_after_limits_apply_and_clamp() {
     let wrapped = worker_html();
