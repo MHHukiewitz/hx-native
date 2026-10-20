@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use blitz_dom::NodeId;
 use blitz_html::HtmlDocument;
+use kurbo::{Affine, Rect as KurboRect, Vec2};
 
 use crate::types::{Rect, FULL_REPAINT_AREA_FRACTION, MAX_DAMAGE_RECTS};
 
@@ -94,6 +95,11 @@ impl IntRect {
             w: width as i32,
             h: height as i32,
         }
+    }
+
+    /// True when this rect covers the whole surface (pending fold / full damage).
+    pub fn is_full_surface(self, width: u32, height: u32) -> bool {
+        self == Self::full_surface(width, height)
     }
 }
 
@@ -218,37 +224,121 @@ pub(crate) fn merge_damage_rects(
     }
 }
 
-/// Compute the element's own border box in device pixels: (x, y, w, h).
-fn own_box_device(doc: &HtmlDocument, nid: NodeId, scale: f64) -> Option<(f64, f64, f64, f64)> {
+/// Local CSS transform for `node` as a device-space [`Affine`].
+///
+/// Uses the Affine Blitz stores from stylo computed styles during
+/// `resolve_transforms` (translations already × viewport scale). When the
+/// caller's `scale` differs from the document viewport scale, translation
+/// components are re-based so origin and size stay in one space.
+fn local_transform_device(node: &blitz_dom::Node, scale: f64, doc_scale: f64) -> Option<Affine> {
+    let t = *node.transform().as_deref()?;
+    let doc_scale = doc_scale.max(1e-6);
+    if (scale - doc_scale).abs() < f64::EPSILON {
+        return Some(t);
+    }
+    // Cached transform is at doc_scale; re-scale translations for `scale`.
+    let [a, b, c, d, e, f] = t.as_coeffs();
+    let factor = scale / doc_scale;
+    Some(Affine::new([a, b, c, d, e * factor, f * factor]))
+}
+
+/// Document-space affine that maps this element's border-box local coordinates
+/// (origin at the border-box top-left, before its own transform) to device
+/// pixels. Walks the containing-block chain (same as `absolute_position`) and
+/// multiplies each ancestor's layout translation by its CSS transform.
+fn document_affine_device(doc: &HtmlDocument, nid: NodeId, scale: f64) -> Option<Affine> {
+    let mut chain = Vec::new();
+    let mut cur = Some(nid);
+    while let Some(id) = cur {
+        chain.push(id);
+        cur = doc.get_node(id).and_then(|n| n.containing_block());
+    }
+    chain.reverse();
+
+    let doc_scale = doc.viewport().scale_f64();
+    let mut xf = Affine::IDENTITY;
+    for id in chain {
+        let node = doc.get_node(id)?;
+        let loc = node.final_layout().location;
+        let scroll = node.scroll_offset();
+        xf *= Affine::translate(Vec2::new(
+            (loc.x as f64 - scroll.x) * scale,
+            (loc.y as f64 - scroll.y) * scale,
+        ));
+        if let Some(t) = local_transform_device(node, scale, doc_scale) {
+            xf *= t;
+        }
+    }
+    Some(xf)
+}
+
+/// Axis-aligned border box in CSS document pixels, with CSS `transform` of the
+/// element and its containing-block ancestors applied.
+///
+/// Shared by damage, range geometry, and (for PR #18) select control rects.
+/// `absolute_position` alone ignores transforms — Pause's
+/// `transform: translate(-50%, -50%)` needs this.
+pub fn element_border_box_css(doc: &HtmlDocument, nid: NodeId) -> Option<(f32, f32, f32, f32)> {
+    let (x, y, w, h) = element_border_box_device(doc, nid, 1.0)?;
+    Some((x as f32, y as f32, w as f32, h as f32))
+}
+
+/// Axis-aligned border box in device pixels (CSS × `scale`), transforms applied.
+pub fn element_border_box_device(
+    doc: &HtmlDocument,
+    nid: NodeId,
+    scale: f64,
+) -> Option<(f64, f64, f64, f64)> {
     let node = doc.get_node(nid)?;
     if !node.is_element() {
         return None;
     }
-    let pos = node.absolute_position(0.0, 0.0);
     let layout = node.final_layout();
-    let x = pos.x as f64 * scale;
-    let y = pos.y as f64 * scale;
     let w = layout.size.width as f64 * scale;
     let h = layout.size.height as f64 * scale;
-    Some((x, y, w, h))
+    let xf = document_affine_device(doc, nid, scale)?;
+    let bbox = xf.transform_rect_bbox(KurboRect::new(0.0, 0.0, w, h));
+    Some((bbox.x0, bbox.y0, bbox.width(), bbox.height()))
+}
+
+/// Compute the element's own border box in device pixels: (x, y, w, h).
+fn own_box_device(doc: &HtmlDocument, nid: NodeId, scale: f64) -> Option<(f64, f64, f64, f64)> {
+    element_border_box_device(doc, nid, scale)
 }
 
 /// Inflate own box by outline, box-shadow, and scrollable overflow → ink rect.
-fn ink_box_device(doc: &HtmlDocument, nid: NodeId, scale: f64) -> Option<(f64, f64, f64, f64)> {
-    let (ox, oy, ow, oh) = own_box_device(doc, nid, scale)?;
+///
+/// Overflow / outline / shadow are expanded in the element's local border-box
+/// space, then the document affine (with transforms) maps that local ink to
+/// device pixels.
+pub(crate) fn ink_box_device(
+    doc: &HtmlDocument,
+    nid: NodeId,
+    scale: f64,
+) -> Option<(f64, f64, f64, f64)> {
     let node = doc.get_node(nid)?;
+    if !node.is_element() {
+        return None;
+    }
+    let layout = node.final_layout();
+    let ow = layout.size.width as f64 * scale;
+    let oh = layout.size.height as f64 * scale;
 
-    let mut x0 = ox;
-    let mut y0 = oy;
-    let mut x1 = ox + ow;
-    let mut y1 = oy + oh;
+    let mut x0: f64 = 0.0;
+    let mut y0: f64 = 0.0;
+    let mut x1: f64 = ow;
+    let mut y1: f64 = oh;
 
-    // scrollable_overflow is already scaled (device px), node-local.
+    // `scrollable_overflow` is node-local device px at the document viewport
+    // scale. Convert through CSS when `scale` differs (harmless when equal;
+    // unproven in a real host flow — see issue #20 / Graph review).
     let overflow = node.scrollable_overflow();
-    x0 = x0.min(ox + overflow.x0);
-    y0 = y0.min(oy + overflow.y0);
-    x1 = x1.max(ox + overflow.x1);
-    y1 = y1.max(oy + overflow.y1);
+    let doc_scale = doc.viewport().scale_f64().max(1e-6);
+    let to_scale = scale / doc_scale;
+    x0 = x0.min(overflow.x0 * to_scale);
+    y0 = y0.min(overflow.y0 * to_scale);
+    x1 = x1.max(overflow.x1 * to_scale);
+    y1 = y1.max(overflow.y1 * to_scale);
 
     if let Some(style) = node.primary_styles() {
         let outline_w = style.get_outline().outline_width.0.to_f64_px() * scale;
@@ -269,14 +359,16 @@ fn ink_box_device(doc: &HtmlDocument, nid: NodeId, scale: f64) -> Option<(f64, f
             let blur = shadow.base.blur.px() as f64 * scale;
             let spread = shadow.spread.px() as f64 * scale;
             let pad = spread + blur * 1.5;
-            x0 = x0.min(ox + sx - pad);
-            y0 = y0.min(oy + sy - pad);
-            x1 = x1.max(ox + ow + sx + pad);
-            y1 = y1.max(oy + oh + sy + pad);
+            x0 = x0.min(sx - pad);
+            y0 = y0.min(sy - pad);
+            x1 = x1.max(ow + sx + pad);
+            y1 = y1.max(oh + sy + pad);
         }
     }
 
-    Some((x0, y0, x1 - x0, y1 - y0))
+    let xf = document_affine_device(doc, nid, scale)?;
+    let bbox = xf.transform_rect_bbox(KurboRect::new(x0, y0, x1, y1));
+    Some((bbox.x0, bbox.y0, bbox.width(), bbox.height()))
 }
 
 /// Snapshot every element's own + ink bounds after a successful paint resolve.
@@ -389,4 +481,106 @@ pub(crate) fn compute_raw_damage(
     }
 
     rects
+}
+
+#[cfg(test)]
+mod scale_space_tests {
+    use super::*;
+    use blitz_dom::{DocumentConfig, StyleThreading};
+    use blitz_html::{HtmlDocument, HtmlProvider};
+    use blitz_traits::shell::{ColorScheme, Viewport as BlitzViewport};
+    use std::sync::Arc;
+
+    fn doc_at(html: &str, w: u32, h: u32, scale: f64) -> HtmlDocument {
+        HtmlDocument::from_html(
+            html,
+            DocumentConfig {
+                viewport: Some(BlitzViewport::new(w, h, scale as f32, ColorScheme::Light)),
+                html_parser_provider: Some(Arc::new(HtmlProvider)),
+                style_threading: StyleThreading::Sequential,
+                incremental: Some(true),
+                net_provider: None,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn own_and_ink_scale_consistently() {
+        let html = r#"<!DOCTYPE html><html><body style="margin:0">
+<div id="box" style="position:absolute;left:100px;top:50px;width:80px;height:40px;background:#f00"></div>
+</body></html>"#;
+        for scale in [1.0_f64, 2.0, 1.25] {
+            let phys_w = (400.0 * scale).round() as u32;
+            let phys_h = (300.0 * scale).round() as u32;
+            let mut doc = doc_at(html, phys_w, phys_h, scale);
+            doc.resolve(0.0);
+            let nid = doc.get_element_by_id("box").expect("box");
+            let own = own_box_device(&doc, nid, scale).unwrap();
+            let ink = ink_box_device(&doc, nid, scale).unwrap();
+            let node = doc.get_node(nid).unwrap();
+            let pos = node.absolute_position(0.0, 0.0);
+            let layout = node.final_layout();
+            let overflow = *node.scrollable_overflow();
+            eprintln!(
+                "scale={scale} pos={:?} layout_size={:?} overflow={:?} own={:?} ink={:?}",
+                (pos.x, pos.y),
+                (layout.size.width, layout.size.height),
+                (overflow.x0, overflow.y0, overflow.x1, overflow.y1),
+                own,
+                ink
+            );
+            assert!(
+                (own.0 - 100.0 * scale).abs() < 1.0,
+                "own.x scale={scale} own={own:?}"
+            );
+            assert!(
+                (own.1 - 50.0 * scale).abs() < 1.0,
+                "own.y scale={scale} own={own:?}"
+            );
+            assert!(
+                (own.2 - 80.0 * scale).abs() < 1.0,
+                "own.w scale={scale} own={own:?}"
+            );
+            assert!(
+                (own.3 - 40.0 * scale).abs() < 1.0,
+                "own.h scale={scale} own={own:?}"
+            );
+        }
+    }
+
+    /// Regression for issue #20: if the ink `scale` argument and the document
+    /// viewport scale diverge, overflow must be converted so origin and size
+    /// stay in one space (not size-only scaled).
+    #[test]
+    fn ink_overflow_matches_own_scale_when_doc_scale_diverges() {
+        let html = r#"<!DOCTYPE html><html><body style="margin:0">
+<div id="box" style="position:absolute;left:100px;top:50px;width:80px;height:40px;background:#f00">
+  <div style="position:absolute;left:0;top:0;width:120px;height:60px;background:#0f0"></div>
+</div>
+</body></html>"#;
+        let mut doc = doc_at(html, 800, 600, 2.0);
+        doc.resolve(0.0);
+        let nid = doc.get_element_by_id("box").expect("box");
+        // Ask for ink at scale 1 while the document viewport is still scale 2.
+        let ink = ink_box_device(&doc, nid, 1.0).unwrap();
+        // Child extends to 120×60 CSS → ink at scale 1 must be ~120×60 (plus a
+        // few px of outline/AA pad), not ~240×120 from raw device overflow.
+        assert!(
+            ink.2 > 110.0 && ink.2 < 140.0,
+            "ink width must follow requested scale (~120), got {ink:?}"
+        );
+        assert!(
+            ink.3 > 50.0 && ink.3 < 80.0,
+            "ink height must follow requested scale (~60), got {ink:?}"
+        );
+        assert!(
+            ink.0 > 90.0 && ink.0 < 110.0,
+            "ink origin x must follow requested scale (~100), got {ink:?}"
+        );
+        assert!(
+            ink.1 > 40.0 && ink.1 < 60.0,
+            "ink origin y must follow requested scale (~50), got {ink:?}"
+        );
+    }
 }

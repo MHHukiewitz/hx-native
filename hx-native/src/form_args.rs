@@ -77,21 +77,25 @@ pub fn set_range_value_from_x(doc: &mut HtmlDocument, id: &str, x: f32) -> bool 
     let Some(nid) = doc.get_element_by_id(id) else {
         return false;
     };
-    let Some(node) = doc.get_node(nid) else {
-        return false;
+    let limits = {
+        let Some(node) = doc.get_node(nid) else {
+            return false;
+        };
+        if !is_range_input(node) {
+            return false;
+        }
+        numeric_limits(node)
     };
-    if !is_range_input(node) {
-        return false;
-    }
-    let limits = numeric_limits(node);
     let min = limits.min.unwrap_or(0.0);
     let max = limits.max.unwrap_or(100.0);
-    let pos = node.absolute_position(0.0, 0.0);
-    let width = node.final_layout().size.width;
+    // Transform-aware box (Pause / centered panels use CSS transform).
+    let Some((box_x, _box_y, width, _h)) = crate::damage::element_border_box_css(doc, nid) else {
+        return false;
+    };
     let ratio = if width <= 0.0 {
         0.0
     } else {
-        ((x - pos.x) / width).clamp(0.0, 1.0) as f64
+        ((x - box_x) / width).clamp(0.0, 1.0) as f64
     };
     let raw = min + ratio * (max - min);
     let snapped = clamp_snap(raw, &limits);

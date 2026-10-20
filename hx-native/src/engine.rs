@@ -11,8 +11,8 @@ use blitz_html::{HtmlDocument, HtmlProvider};
 use blitz_traits::shell::{ColorScheme, Viewport as BlitzViewport};
 
 use crate::damage::{
-    collect_style_damaged, compute_raw_damage, merge_damage_rects, snapshot_bounds, BoundsSnapshot,
-    DamagePlan, IntRect,
+    collect_style_damaged, compute_raw_damage, merge_damage_rects, snap_outward, snapshot_bounds,
+    BoundsSnapshot, DamagePlan, IntRect,
 };
 use crate::dialect::{validate_loaded_attrs, ElementBinding, SwapMode, SyncMode};
 use crate::ellipsis::{prepare_ellipsis_for_paint, EllipsisCache, EllipsisShaper};
@@ -173,6 +173,10 @@ struct LiveSurface {
     cached_rgba: Option<RgbaImage>,
     /// Per-node own/ink bounds from the last painted frame (device pixels).
     last_bounds: BoundsSnapshot,
+    /// Damage rects that must be merged into the next paint plan (device pixels).
+    /// Overlay close, fold, and similar paths push here so `compute_plan` cannot
+    /// drop them. A full-surface pending rect forces `full_repaint`.
+    pending_damage: Vec<IntRect>,
     /// Primary-button drag on an `<input type="range">`.
     range_drag_id: Option<String>,
     /// Cached truncated paint layouts for `text-overflow: ellipsis` (issue #12).
@@ -522,6 +526,7 @@ impl Engine {
                 }
                 let dirty = live.paint_dirty
                     || live.force_full_repaint
+                    || !live.pending_damage.is_empty()
                     || live.cached_rgba.is_none()
                     || live.layout_viewport != (s.size.width, s.size.height)
                     || (live.layout_scale - s.size.scale).abs() > f64::EPSILON
@@ -1020,6 +1025,32 @@ impl Engine {
         }
     }
 
+    /// Test helper: push a device-pixel damage rect that must be merged into the
+    /// next paint plan (issue #20 pending-damage / fold full-surface case).
+    #[doc(hidden)]
+    pub fn test_push_pending_damage(&mut self, rect: Rect) {
+        if let Some(live) = self
+            .surfaces
+            .get_mut(&SurfaceId::DEFAULT)
+            .and_then(|s| s.live.as_mut())
+        {
+            live.push_pending_damage(IntRect {
+                x: rect.x.floor() as i32,
+                y: rect.y.floor() as i32,
+                w: rect.width.ceil() as i32,
+                h: rect.height.ceil() as i32,
+            });
+        }
+    }
+
+    /// Test helper: transform-aware border box in CSS pixels `(x, y, w, h)`.
+    #[doc(hidden)]
+    pub fn test_element_box(&self, id: &str) -> Option<(f32, f32, f32, f32)> {
+        let live = self.live(SurfaceId::DEFAULT)?;
+        let nid = live.doc.get_element_by_id(id)?;
+        crate::damage::element_border_box_css(&live.doc, nid)
+    }
+
     /// Test helper: subscribed slice names the engine will ask `version` for.
     pub fn subscribed_slices(&self) -> HashSet<String> {
         let mut s = HashSet::new();
@@ -1076,7 +1107,8 @@ impl LiveSurface {
         size: SurfaceSize,
     ) -> Result<Self, EngineError> {
         let layout_viewport = (size.width, size.height);
-        let mut doc = parse_html_document(html, layout_viewport);
+        let layout_scale = size.scale;
+        let mut doc = parse_html_document_scaled(html, layout_viewport, layout_scale);
 
         // HTML contract §2: strict dialect on loaded HTML, then index bindings.
         let known_ids = collect_element_ids(&doc);
@@ -1096,12 +1128,13 @@ impl LiveSurface {
             press: None,
             focus: FocusState::default(),
             layout_viewport,
-            layout_scale: 1.0,
+            layout_scale,
             needs_resolve: false,
             paint_dirty: true,
             force_full_repaint: true,
             cached_rgba: None,
             last_bounds: BoundsSnapshot::new(),
+            pending_damage: Vec::new(),
             range_drag_id: None,
             ellipsis_cache: EllipsisCache::default(),
             ellipsis_shaper: None,
@@ -1130,6 +1163,40 @@ impl LiveSurface {
 
     fn mark_paint_dirty(&mut self) {
         self.paint_dirty = true;
+    }
+
+    /// Single pending-damage list: clamp on push. Every source (swap old ink,
+    /// closed overlay, fold full-surface, …) goes through here.
+    fn push_pending_damage(&mut self, rect: IntRect) {
+        let (sw, sh) = self.layout_viewport;
+        let r = rect.clamp_to_surface(sw, sh);
+        if !r.is_empty() {
+            self.pending_damage.push(r);
+            self.paint_dirty = true;
+        }
+    }
+
+    /// Push last-painted ink for `root` and its current element descendants into
+    /// `pending_damage`. Safe during sync (reads `last_bounds` only).
+    fn queue_pending_subtree_damage(&mut self, root: NodeId) {
+        if self.last_bounds.is_empty() {
+            return;
+        }
+        let (sw, sh) = self.layout_viewport;
+        let mut stack = vec![root];
+        while let Some(nid) = stack.pop() {
+            if let Some(bounds) = self.last_bounds.get(&nid) {
+                let (x, y, w, h) = bounds.ink;
+                let r = snap_outward(x, y, w, h, sw, sh);
+                self.push_pending_damage(r);
+            }
+            let Some(node) = self.doc.get_node(nid) else {
+                continue;
+            };
+            for &c in &node.children {
+                stack.push(c);
+            }
+        }
     }
 
     /// Validate fragment HTML **before** applying a swap so a bad fragment is
@@ -1281,6 +1348,11 @@ impl LiveSurface {
         // Same dialect rules as load_html; failure returns EngineError from sync
         // and leaves the previous DOM in place for this section.
         self.validate_fragment_html(declared_actions, html, target_id, swap)?;
+
+        // Record old subtree ink from the last paint snapshot (no resolve here —
+        // sync must not run style/layout). compute_plan merges these so old
+        // boxes survive NodeId recycle after the swap.
+        self.queue_pending_subtree_damage(target_id);
 
         match swap {
             SwapMode::InnerHtml => {
@@ -2227,7 +2299,8 @@ impl LiveSurface {
         self.layout_scale = scale;
 
         // Spec: skip clean frames — no raster when nothing is damaged and size is unchanged.
-        if !self.paint_dirty && !force_full {
+        // Pending damage (swap old ink, closed overlay, fold full-surface) must not skip.
+        if !self.paint_dirty && !force_full && self.pending_damage.is_empty() {
             return Ok(RenderResult {
                 plan: None,
                 style_layout_passes: 0,
@@ -2235,7 +2308,17 @@ impl LiveSurface {
         }
 
         let (plan, passes) = self.resolve_and_plan_damage(width, height, scale, force_full);
-        let rgba = self.rasterize_plan(&plan, width, height, scale, paint_mode)?;
+        // resolve_and_plan_damage already drained pending_damage and replaced
+        // last_bounds. If raster fails, force a full repaint next time so those
+        // drained rects / bounds are not silently dropped.
+        let rgba = match self.rasterize_plan(&plan, width, height, scale, paint_mode) {
+            Ok(rgba) => rgba,
+            Err(e) => {
+                self.force_full_repaint = true;
+                self.paint_dirty = true;
+                return Err(e);
+            }
+        };
 
         self.paint_dirty = false;
         self.force_full_repaint = false;
@@ -2257,6 +2340,7 @@ impl LiveSurface {
     ) -> (DamagePlan, u64) {
         let had_previous = !self.last_bounds.is_empty() && self.cached_rgba.is_some();
         let previous = std::mem::take(&mut self.last_bounds);
+        let pending = std::mem::take(&mut self.pending_damage);
 
         self.doc.set_viewport(BlitzViewport::new(
             width,
@@ -2277,6 +2361,7 @@ impl LiveSurface {
         // Style + layout once. A second pass is allowed only when the hovered
         // node changes (Graph: at most 2 passes total per paint).
         let hover_before = self.doc.get_hover_node_id();
+        // #13: resolve_doc runs Blitz resolve + ellipsis cache bookkeeping.
         self.resolve_doc();
         let mut passes = 1;
         // resolve() ends with refresh_hover(); compare hover node to decide follow-up.
@@ -2287,22 +2372,50 @@ impl LiveSurface {
         }
         self.needs_resolve = false;
 
-        let plan = if force_full || !had_previous {
-            DamagePlan::full(width, height)
-        } else {
-            let raw =
-                compute_raw_damage(&self.doc, scale, width, height, &previous, &style_damaged);
-            let merged = merge_damage_rects(raw, width, height);
-            // Dirty paint with no detected rects: fall back to full (safer than a no-op).
-            if merged.rects.is_empty() {
-                DamagePlan::full(width, height)
-            } else {
-                merged
-            }
-        };
+        let plan = self.compute_plan(
+            width,
+            height,
+            scale,
+            force_full,
+            had_previous,
+            &previous,
+            &style_damaged,
+            pending,
+        );
 
         self.last_bounds = snapshot_bounds(&self.doc, scale);
         (plan, passes)
+    }
+
+    /// Merge detected damage with any pending rects (swap old boxes, closed
+    /// overlays, fold full-surface, …). A pending full-surface rect forces
+    /// `full_repaint` — never dropped in favour of a local rect.
+    #[allow(clippy::too_many_arguments)]
+    fn compute_plan(
+        &self,
+        width: u32,
+        height: u32,
+        scale: f64,
+        force_full: bool,
+        had_previous: bool,
+        previous: &BoundsSnapshot,
+        style_damaged: &[blitz_dom::NodeId],
+        pending: Vec<IntRect>,
+    ) -> DamagePlan {
+        let pending_full = pending.iter().any(|r| r.is_full_surface(width, height));
+        if force_full || !had_previous || pending_full {
+            return DamagePlan::full(width, height);
+        }
+
+        let mut raw = compute_raw_damage(&self.doc, scale, width, height, previous, style_damaged);
+        raw.extend(pending);
+        let merged = merge_damage_rects(raw, width, height);
+        // Dirty paint with no detected rects: fall back to full (safer than a no-op).
+        if merged.rects.is_empty() {
+            DamagePlan::full(width, height)
+        } else {
+            merged
+        }
     }
 
     fn rasterize_plan(
