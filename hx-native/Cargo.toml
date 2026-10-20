@@ -40,6 +40,8 @@ parley = { version = "0.12", default-features = false, features = ["std"] }
 
 # Already pulled by Blitz 0.3.0-beta.4; direct so we can build parley TextStyle from
 # computed values the same way Blitz's pub(crate) stylo_to_parley::style does.
+# Bump this pin together with any Blitz bump that moves stylo — see the pin-
+# sensitivity list in `src/ellipsis.rs`.
 style = { package = "stylo", version = "=0.22.0" }
 
 [dev-dependencies]

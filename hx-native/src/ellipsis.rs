@@ -100,6 +100,9 @@ struct TruncationKey {
     original: String,
     /// Content-box width in CSS px, quantized to 1/64 px (`to_bits` of the rounded value).
     content_w_bits: u32,
+    /// Exact bits of the viewport scale used for shaping (`f32::to_bits`).
+    scale_bits: u32,
+    /// Fingerprint of the full parley [`TextStyle`] plus [`AlignParams`].
     style_fp: u64,
 }
 
@@ -165,6 +168,23 @@ impl<'a> EllipsisPaintSession<'a> {
     pub(crate) fn doc_mut(&mut self) -> &mut HtmlDocument {
         self.doc
     }
+
+    /// Install a truncated layout and record the original for Drop restore.
+    /// Called as each candidate is prepared so a later panic still restores.
+    fn apply_prepared(&mut self, nid: NodeId, prep: Prepared) {
+        if prep.reshaped {
+            self.reshaped = true;
+        }
+        self.backups.push((nid, prep.original_layout));
+        if let Some(el) = self
+            .doc
+            .get_node_mut(nid)
+            .and_then(|n| n.element_data_mut())
+        {
+            el.inline_layout_data = Some(prep.truncated_layout);
+        }
+        self.applied = true;
+    }
 }
 
 impl Drop for EllipsisPaintSession<'_> {
@@ -193,43 +213,24 @@ pub(crate) fn prepare_ellipsis_for_paint<'a>(
 ) -> EllipsisPaintSession<'a> {
     let scale = doc.viewport().scale().max(0.000_1);
     let candidates = find_ellipsis_candidates(doc, scale);
+    let mut session = EllipsisPaintSession {
+        doc,
+        backups: Vec::new(),
+        applied: false,
+        reshaped: false,
+    };
     if candidates.is_empty() {
-        return EllipsisPaintSession {
-            doc,
-            backups: Vec::new(),
-            applied: false,
-            reshaped: false,
-        };
+        return session;
     }
 
     let shaper = shaper.get_or_insert_with(EllipsisShaper::new);
-    let mut backups = Vec::new();
-    let mut applied = false;
-    let mut reshaped = false;
-
     for cand in candidates {
-        let Some(prep) = prepare_one(doc, cache, shaper, &cand, scale) else {
+        let Some(prep) = prepare_one(session.doc, cache, shaper, &cand, scale) else {
             continue;
         };
-        if prep.reshaped {
-            reshaped = true;
-        }
-        backups.push((cand.element_id, prep.original_layout));
-        if let Some(el) = doc
-            .get_node_mut(cand.element_id)
-            .and_then(|n| n.element_data_mut())
-        {
-            el.inline_layout_data = Some(prep.truncated_layout);
-        }
-        applied = true;
+        session.apply_prepared(cand.element_id, prep);
     }
-
-    EllipsisPaintSession {
-        doc,
-        backups,
-        applied,
-        reshaped,
-    }
+    session
 }
 
 struct Candidate {
@@ -343,19 +344,10 @@ fn read_combined_text(doc: &HtmlDocument, text_nodes: &[NodeId]) -> String {
     s
 }
 
-fn style_fingerprint(node: &blitz_dom::Node) -> u64 {
-    let Some(styles) = node.primary_styles() else {
-        return 0;
-    };
-    // Stable-enough fingerprint of metrics that affect shaping width.
-    // Pin sensitivity: Debug of stylo computed values — see module rustdoc.
-    let raw = format!(
-        "{:?}|{:?}|{:?}|{:?}",
-        styles.clone_font_size(),
-        styles.clone_font_weight(),
-        styles.clone_font_family(),
-        styles.clone_letter_spacing(),
-    );
+/// Fingerprint the full parley [`TextStyle`] plus [`AlignParams`] used for reshape.
+/// Must include every field that affects cut point or paint (scale is keyed separately).
+fn shaping_fingerprint(style: &TextStyle<'static, 'static, TextBrush>, align: &AlignParams) -> u64 {
+    let raw = format!("{style:?}|{align:?}");
     let mut h: u64 = 0xcbf29ce484222325;
     for b in raw.as_bytes() {
         h ^= u64::from(*b);
@@ -422,6 +414,7 @@ fn text_style_for_element(
 
 /// Blitz applies base direction / text-align outside `TextStyle`
 /// (`construct.rs:1061`, `inline.rs:827`).
+#[derive(Debug)]
 struct AlignParams {
     base_direction: BaseDirection,
     alignment: Alignment,
@@ -543,12 +536,13 @@ fn prepare_one(
         return None;
     }
 
-    let node = doc.get_node(cand.element_id)?;
-    let style_fp = style_fingerprint(node);
+    let style = text_style_for_element(doc, cand.element_id)?;
+    let align = align_params_for_element(doc, cand.element_id)?;
     let key = TruncationKey {
         original: original_text.clone(),
         content_w_bits: width_key_bits(cand.content_w_css),
-        style_fp,
+        scale_bits: scale.to_bits(),
+        style_fp: shaping_fingerprint(&style, &align),
     };
 
     if let Some(entry) = cache.by_node.get(&cand.element_id) {
@@ -572,8 +566,6 @@ fn prepare_one(
     };
 
     let budget = cand.content_w_css * scale;
-    let style = text_style_for_element(doc, cand.element_id)?;
-    let align = align_params_for_element(doc, cand.element_id)?;
     let ellipsis_adv = measure_ellipsis_advance(shaper, &style, scale, &align);
     let truncated = truncate_by_clusters(
         &original_text,

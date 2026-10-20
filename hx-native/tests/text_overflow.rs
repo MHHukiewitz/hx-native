@@ -663,3 +663,110 @@ body {{ width: 320px; height: 80px; background: #1a1f2a; color: #9aa3b5;
         );
     }
 }
+
+fn pixel_diff(a: &RgbaImage, b: &RgbaImage) -> usize {
+    a.pixels
+        .chunks_exact(4)
+        .zip(b.pixels.chunks_exact(4))
+        .filter(|(p, q)| p != q)
+        .count()
+}
+
+fn gmode_why_hover_page(hover_css: &str) -> String {
+    format!(
+        r##"<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/>
+<style>
+* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+body {{ width: 320px; height: 80px; background: #1a1f2a; color: #9aa3b5;
+  font-family: "DejaVu Sans", sans-serif; font-size: 13px; }}
+#gmode-why {{
+  position: absolute; left: 8px; top: 24px;
+  width: 200px; height: 20px; line-height: 20px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}}
+#gmode-why:hover {{ {hover_css} }}
+</style></head><body>
+<div id="gmode-why">{reason}</div>
+</body></html>"##,
+        reason = long_reason(),
+        hover_css = hover_css
+    )
+}
+
+/// Warm-cache paint (after a prior paint) must match a fresh engine in the same
+/// state. Catches cache keys that omit scale or hover-driven shaping styles.
+fn assert_warm_vs_fresh(name: &str, warm: RgbaImage, fresh: RgbaImage) {
+    let diff = pixel_diff(&warm, &fresh);
+    assert_eq!(
+        diff, 0,
+        "{name}: warm-cache paint must be byte-identical to fresh \
+         (diff_pixels={diff})"
+    );
+}
+
+#[test]
+fn warm_cache_matches_fresh_after_scale_change() {
+    let html = gmode_why_page(long_reason());
+    let mut warm = boot(&html);
+    let _ = warm
+        .paint(Viewport::with_scale(320, 80, 1.0))
+        .unwrap()
+        .rgba
+        .unwrap();
+    let warm_hi = warm
+        .paint(Viewport::with_scale(320, 80, 2.0))
+        .unwrap()
+        .rgba
+        .unwrap();
+
+    let mut fresh = boot(&html);
+    let fresh_hi = fresh
+        .paint(Viewport::with_scale(320, 80, 2.0))
+        .unwrap()
+        .rgba
+        .unwrap();
+    assert_warm_vs_fresh("scale 1.0→2.0", warm_hi, fresh_hi);
+}
+
+fn warm_vs_fresh_hover(name: &str, hover_css: &str) {
+    let html = gmode_why_hover_page(hover_css);
+    let mut warm = boot(&html);
+    let _ = warm.paint(vp()).unwrap();
+    let _ = warm.input(InputEvent::PointerMove {
+        x: 100.0,
+        y: 34.0,
+        mods: Modifiers::default(),
+    });
+    let warm_img = warm.paint(vp()).unwrap().rgba.unwrap();
+
+    let mut fresh = boot(&html);
+    let _ = fresh.input(InputEvent::PointerMove {
+        x: 100.0,
+        y: 34.0,
+        mods: Modifiers::default(),
+    });
+    let fresh_img = fresh.paint(vp()).unwrap().rgba.unwrap();
+    assert_warm_vs_fresh(name, warm_img, fresh_img);
+}
+
+#[test]
+fn warm_cache_matches_fresh_on_hover_text_align_right() {
+    warm_vs_fresh_hover("hover text-align:right", "text-align: right;");
+}
+
+#[test]
+fn warm_cache_matches_fresh_on_hover_font_style_italic() {
+    warm_vs_fresh_hover("hover font-style:italic", "font-style: italic;");
+}
+
+#[test]
+fn warm_cache_matches_fresh_on_hover_word_spacing() {
+    warm_vs_fresh_hover("hover word-spacing:6px", "word-spacing: 6px;");
+}
+
+#[test]
+fn warm_cache_matches_fresh_on_hover_color_only_control() {
+    // Color is paint-only; even an incomplete cache key must stay byte-identical.
+    warm_vs_fresh_hover("hover color:#fff (control)", "color: #fff;");
+}
