@@ -11,8 +11,8 @@ use blitz_html::{HtmlDocument, HtmlProvider};
 use blitz_traits::shell::{ColorScheme, Viewport as BlitzViewport};
 
 use crate::damage::{
-    collect_style_damaged, compute_raw_damage, merge_damage_rects, snap_outward, snapshot_bounds,
-    BoundsSnapshot, DamagePlan, IntRect,
+    collect_style_damaged, compute_raw_damage, ink_box_device, merge_damage_rects, snap_outward,
+    snapshot_bounds, BoundsSnapshot, DamagePlan, IntRect,
 };
 use crate::dialect::{validate_loaded_attrs, ElementBinding, SwapMode, SyncMode};
 use crate::ellipsis::{prepare_ellipsis_for_paint, EllipsisCache, EllipsisShaper};
@@ -37,7 +37,7 @@ use crate::select_ui::{
 };
 use crate::text_edit::{
     apply_unfocused_display, backspace, caret_device_rect, commit_field, delete_forward,
-    delete_selection, editor_text, filter_number_insert, insert_text, is_disabled,
+    delete_selection, editor_text, filter_number_insert, has_selection, insert_text, is_disabled,
     is_editable_input, move_end, move_home, move_left, move_right, place_caret_at,
     prepare_focus_display, resolve_step_target, select_all, selected_text, step_and_regroup,
     step_direction, sync_value_from_editor, TextEditSession, CARET_BLINK_HALF_PERIOD,
@@ -1076,6 +1076,7 @@ impl Engine {
                         caret_visible: true,
                         last_blink: Instant::now(),
                         last_caret_rect: None,
+                        needs_prepare: false,
                     });
                 } else {
                     live.text_edit = None;
@@ -1377,6 +1378,7 @@ impl LiveSurface {
         self.sections = sections;
         self.select_nids = collect_select_nids(&self.doc);
         self.reconcile_open_select();
+        self.reconcile_text_edit();
         Ok(())
     }
 
@@ -1645,6 +1647,7 @@ impl LiveSurface {
         self.mark_dom_dirty();
         self.mark_paint_dirty();
         self.reconcile_open_select();
+        self.reconcile_text_edit();
     }
 
     fn count_damage(&self) -> (usize, usize) {
@@ -1841,7 +1844,7 @@ impl LiveSurface {
                 .is_some_and(|n| is_editable_input(n) && is_disabled(n));
 
             if disabled_edit {
-                let _ = self.blur_text_edit(ctx);
+                self.blur_text_edit_queued(ctx);
                 self.doc.clear_focus();
                 self.focus.focused_id = None;
                 self.press = Some(PressState {
@@ -1849,6 +1852,7 @@ impl LiveSurface {
                     button,
                     mods,
                 });
+                self.reconcile_open_select_after_focus();
                 return InputOutcome::Press { id };
             }
 
@@ -1865,6 +1869,9 @@ impl LiveSurface {
                     button,
                     mods,
                 });
+                // Same class as #18 HOLD #3: close an open select when focus
+                // moves to a text field (incl. Secondary / right-click).
+                self.reconcile_open_select_after_focus();
                 return focus_out.unwrap_or(InputOutcome::Press { id });
             }
 
@@ -1872,7 +1879,7 @@ impl LiveSurface {
             if self.text_edit.is_some()
                 && self.text_edit.as_ref().map(|s| s.id.as_str()) != Some(eid.as_str())
             {
-                let _ = self.blur_text_edit(ctx);
+                self.blur_text_edit_queued(ctx);
             }
 
             if let Some(nid) = self.doc.get_element_by_id(eid) {
@@ -1881,12 +1888,12 @@ impl LiveSurface {
             }
         } else if let Some(ref c) = ctrl {
             if self.text_edit.is_some() {
-                let _ = self.blur_text_edit(ctx);
+                self.blur_text_edit_queued(ctx);
             }
             self.doc.set_focus_to(c.node_id);
             self.focus.focused_id = c.element_id.clone();
         } else if self.text_edit.is_some() {
-            let _ = self.blur_text_edit(ctx);
+            self.blur_text_edit_queued(ctx);
         }
         self.reconcile_open_select_after_focus();
 
@@ -2146,6 +2153,73 @@ impl LiveSurface {
         self.mark_paint_dirty();
     }
 
+    fn reconcile_text_edit(&mut self) {
+        let Some(session) = self.text_edit.clone() else {
+            return;
+        };
+        let Some(nid) = self.doc.get_element_by_id(&session.id) else {
+            self.text_edit = None;
+            if self.focus.focused_id.as_deref() == Some(session.id.as_str()) {
+                self.focus.focused_id = None;
+            }
+            self.doc.clear_focus();
+            return;
+        };
+        let ok = self
+            .doc
+            .get_node(nid)
+            .is_some_and(|n| is_editable_input(n) && !is_disabled(n));
+        if !ok {
+            self.text_edit = None;
+            if self.focus.focused_id.as_deref() == Some(session.id.as_str()) {
+                self.focus.focused_id = None;
+            }
+            self.doc.clear_focus();
+            return;
+        }
+        // Same-id replacement: rebind node_id; defer prepare_focus_display until
+        // style/layout (sync must not resolve). Typing before paint must not wipe value.
+        let value = self.attr(&session.id, "value").unwrap_or_default();
+        self.focus.focused_id = Some(session.id.clone());
+        if let Some(s) = self.text_edit.as_mut() {
+            s.node_id = nid;
+            s.value_at_focus = value;
+            s.caret_visible = true;
+            s.last_blink = Instant::now();
+            s.last_caret_rect = None;
+            s.needs_prepare = true;
+        }
+        self.queue_text_field_damage(nid);
+        self.mark_paint_dirty();
+    }
+
+    /// After swap/rebind: resolve if needed, seed PlainEditor from `value`,
+    /// restore Blitz focus, caret at end.
+    fn ensure_text_edit_prepared(&mut self) {
+        let Some(session) = self.text_edit.clone() else {
+            return;
+        };
+        if !session.needs_prepare {
+            return;
+        }
+        self.ensure_resolved();
+        let nid = session.node_id;
+        if self.doc.get_node(nid).is_none() {
+            self.text_edit = None;
+            return;
+        }
+        prepare_focus_display(&mut self.doc, nid);
+        self.doc.set_focus_to(nid);
+        if let Some(s) = self.text_edit.as_mut() {
+            s.needs_prepare = false;
+            s.caret_visible = true;
+            s.last_blink = Instant::now();
+            s.last_caret_rect = None;
+        }
+        self.queue_text_field_damage(nid);
+        self.mark_paint_dirty();
+    }
+
     /// Close the open list when its node is gone, replaced, or disabled.
     fn reconcile_open_select(&mut self) {
         let Some(open) = self.open_select.clone() else {
@@ -2206,7 +2280,7 @@ impl LiveSurface {
         }
         // Commit previous field if switching.
         if self.text_edit.as_ref().map(|s| s.id.as_str()) != Some(id) {
-            let _ = self.blur_text_edit(ctx);
+            self.blur_text_edit_queued(ctx);
         }
         let value_at_focus = self.attr(id, "value").unwrap_or_default();
         prepare_focus_display(&mut self.doc, nid);
@@ -2219,6 +2293,7 @@ impl LiveSurface {
             caret_visible: true,
             last_blink: Instant::now(),
             last_caret_rect: None,
+            needs_prepare: false,
         });
         self.reset_caret_blink();
         self.mark_dom_dirty();
@@ -2230,17 +2305,42 @@ impl LiveSurface {
         self.commit_text_edit(ctx, true)
     }
 
+    /// Commit/blur and, when the outcome is Action/Blocked, push it onto
+    /// `released_outcomes` so hosts that only see the click/Tab return value
+    /// still receive Change via `take_outcomes` (blocker 1).
+    fn blur_text_edit_queued(&mut self, ctx: &mut ActionCtx<'_>) {
+        if let Some(out) = self.blur_text_edit(ctx) {
+            self.enqueue_deferred_outcome(out);
+        }
+    }
+
+    fn enqueue_deferred_outcome(&mut self, out: InputOutcome) {
+        match out {
+            InputOutcome::Action { .. } | InputOutcome::Blocked { .. } => {
+                self.released_outcomes.push(out);
+            }
+            _ => {}
+        }
+    }
+
     /// Commit the focused text/number field. If `clear_focus`, also clear focus.
+    /// Fires `change` only when the committed value differs from `value_at_focus`.
     fn commit_text_edit(
         &mut self,
         ctx: &mut ActionCtx<'_>,
         clear_focus: bool,
     ) -> Option<InputOutcome> {
+        self.ensure_text_edit_prepared();
         let session = self.text_edit.take()?;
         let _ = commit_field(&mut self.doc, session.node_id);
         self.mark_dom_dirty();
         self.queue_text_field_damage(session.node_id);
-        let change = self.fire_change(ctx, &session.id);
+        let value_now = self.attr(&session.id, "value").unwrap_or_default();
+        let change = if value_now != session.value_at_focus {
+            self.fire_change(ctx, &session.id)
+        } else {
+            InputOutcome::None
+        };
         if clear_focus {
             self.doc.clear_focus();
             if self.focus.focused_id.as_deref() == Some(session.id.as_str()) {
@@ -2250,15 +2350,15 @@ impl LiveSurface {
             apply_unfocused_display(&mut self.doc, session.node_id);
         } else {
             // Keep editing session after Enter commit.
-            let value = self.attr(&session.id, "value").unwrap_or_default();
             prepare_focus_display(&mut self.doc, session.node_id);
             self.text_edit = Some(TextEditSession {
                 id: session.id.clone(),
                 node_id: session.node_id,
-                value_at_focus: value,
+                value_at_focus: value_now,
                 caret_visible: true,
                 last_blink: Instant::now(),
                 last_caret_rect: session.last_caret_rect,
+                needs_prepare: false,
             });
             self.reset_caret_blink();
         }
@@ -2282,6 +2382,7 @@ impl LiveSurface {
     }
 
     fn on_text(&mut self, s: String) -> InputOutcome {
+        self.ensure_text_edit_prepared();
         let Some(session) = self.text_edit.clone() else {
             return InputOutcome::Unhandled(KeyEvent {
                 key: s,
@@ -2292,6 +2393,10 @@ impl LiveSurface {
             });
         };
         let nid = session.node_id;
+        // PlainEditor missing (pre-layout): do not sync empty → wipe value.
+        if editor_text(&mut self.doc, nid).is_none() {
+            return InputOutcome::None;
+        }
         let is_number = self.doc.get_node(nid).is_some_and(is_number_input);
         let filtered = crate::text_edit::sanitize_text_insert(&s);
         if filtered.is_empty() {
@@ -2354,6 +2459,7 @@ impl LiveSurface {
     }
 
     fn try_text_edit_key(&mut self, key: &KeyEvent) -> Option<InputOutcome> {
+        self.ensure_text_edit_prepared();
         let session = self.text_edit.clone()?;
         let nid = session.node_id;
         let action_mod = key.mods.ctrl || key.mods.meta;
@@ -2414,20 +2520,38 @@ impl LiveSurface {
         }
     }
 
-    /// Queue transform-aware border-box damage for a text/number field.
-    /// All text-edit / caret / selection damage goes through [`Self::push_pending_damage`].
+    /// Queue transform-aware ink-box damage for a text/number field (outline +
+    /// outline-offset + box-shadow). All text-edit / caret / selection damage
+    /// goes through [`Self::push_pending_damage`].
     fn queue_text_field_damage(&mut self, nid: NodeId) {
         let scale = self.layout_scale;
-        let Some((x, y, w, h)) = crate::damage::element_border_box_device(&self.doc, nid, scale)
-        else {
-            return;
-        };
         let (sw, sh) = self.layout_viewport;
-        self.push_pending_damage(snap_outward(x, y, w, h, sw, sh));
+        // Old ink (last paint) covers the previous :focus outline / caret.
+        if let Some(bounds) = self.last_bounds.get(&nid) {
+            let (x, y, w, h) = bounds.ink;
+            self.push_pending_damage(snap_outward(x, y, w, h, sw, sh));
+        }
+        // Current ink includes outline width + outward outline-offset + box-shadow.
+        if let Some((x, y, w, h)) = ink_box_device(&self.doc, nid, scale) {
+            self.push_pending_damage(snap_outward(x, y, w, h, sw, sh));
+        }
     }
 
     /// Advance caret blink; when the phase flips, queue a small damage rect.
+    /// Selection present → keep caret visible (no blink) so Blitz keeps the
+    /// selection highlight without a clear_focus dance (blocker 5).
     fn advance_caret_blink(&mut self) {
+        let Some(session) = self.text_edit.clone() else {
+            return;
+        };
+        let nid = session.node_id;
+        if has_selection(&mut self.doc, nid) {
+            if let Some(s) = self.text_edit.as_mut() {
+                s.caret_visible = true;
+                s.last_blink = Instant::now();
+            }
+            return;
+        }
         let Some(session) = self.text_edit.as_mut() else {
             return;
         };
@@ -2436,7 +2560,6 @@ impl LiveSurface {
         }
         session.last_blink = Instant::now();
         session.caret_visible = !session.caret_visible;
-        let nid = session.node_id;
         let scale = self.layout_scale;
         let (sw, sh) = self.layout_viewport;
         let prev = session.last_caret_rect;
@@ -3051,10 +3174,11 @@ impl LiveSurface {
         // (b) Tab / Shift+Tab focus order (engine-owned document-order walk).
         if key.pressed && key.key == "Tab" {
             self.ensure_resolved();
-            // Commit the current text field before leaving it.
-            let _ = self.blur_text_edit(ctx);
+            // Save focused id before blur clears it, then step from that id.
+            let from_id = self.focus.focused_id.clone();
+            self.blur_text_edit_queued(ctx);
             let order = focusable_ids(&self.doc);
-            let next = step_focus(&order, self.focus.focused_id.as_deref(), key.mods.shift);
+            let next = step_focus(&order, from_id.as_deref(), key.mods.shift);
             if let Some(ref nid_str) = next {
                 let editable = self
                     .doc
@@ -3373,6 +3497,12 @@ impl LiveSurface {
         }
         self.needs_resolve = false;
 
+        // Same-id swap: PlainEditor now exists — seed from value + caret at end
+        // before damage planning so partial frames match a full repaint.
+        if self.text_edit.as_ref().is_some_and(|s| s.needs_prepare) {
+            self.ensure_text_edit_prepared();
+        }
+
         let plan = self.compute_plan(
             width,
             height,
@@ -3427,17 +3557,6 @@ impl LiveSurface {
         scale: f64,
         paint_mode: PaintMode,
     ) -> Result<RgbaImage, EngineError> {
-        // Blink-off: clear Blitz focus for this paint only so the caret is not
-        // drawn; :focus ring outside the caret damage rect stays in the cached
-        // buffer. Blink-on keeps focus so Blitz draws the caret.
-        let restore_focus = if self.text_edit.as_ref().is_some_and(|s| !s.caret_visible) {
-            let id = self.text_edit.as_ref().map(|s| s.id.clone());
-            self.doc.clear_focus();
-            id
-        } else {
-            None
-        };
-
         // Issue #12: swap cached truncated TextLayouts for paint only. DOM text
         // stays full; EllipsisPaintSession restores layouts on Drop (also on
         // `?` / panic) — no document needs_resolve and no truncated geometry.
@@ -3501,9 +3620,15 @@ impl LiveSurface {
             &self.select_nids,
         );
 
-        if let Some(id) = restore_focus {
-            if let Some(nid) = self.doc.get_element_by_id(&id) {
-                self.doc.set_focus_to(nid);
+        // Blink-off overlay: hide Blitz caret without touching focus (blocker 5).
+        if self.text_edit.as_ref().is_some_and(|s| !s.caret_visible) {
+            let nid = self.text_edit.as_ref().map(|s| s.node_id);
+            if let Some(nid) = nid {
+                if !has_selection(&mut self.doc, nid) {
+                    if let Some(r) = caret_device_rect(&mut self.doc, nid, scale, width, height) {
+                        erase_caret_rect(&mut frame, r);
+                    }
+                }
             }
         }
         Ok(frame)
@@ -3519,6 +3644,37 @@ impl LiveSurface {
                 .find(|a| &*a.name.local == name)
                 .map(|a| a.value.to_string())
         })
+    }
+}
+
+/// Hide Blitz's caret by filling its device-pixel rect with a neighbour sample
+/// (left of the caret, falling back to white). Keeps focus / selection / IME.
+fn erase_caret_rect(frame: &mut RgbaImage, r: IntRect) {
+    let x0 = r.x.max(0) as u32;
+    let y0 = r.y.max(0) as u32;
+    let x1 = ((r.x + r.w).max(0) as u32).min(frame.width);
+    let y1 = ((r.y + r.h).max(0) as u32).min(frame.height);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let sample_x = x0.saturating_sub(1);
+    let sample_y = y0.min(frame.height.saturating_sub(1));
+    let si = ((sample_y * frame.width + sample_x) * 4) as usize;
+    let color = if si + 4 <= frame.pixels.len() {
+        [
+            frame.pixels[si],
+            frame.pixels[si + 1],
+            frame.pixels[si + 2],
+            frame.pixels[si + 3],
+        ]
+    } else {
+        [255, 255, 255, 255]
+    };
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let i = ((y * frame.width + x) * 4) as usize;
+            frame.pixels[i..i + 4].copy_from_slice(&color);
+        }
     }
 }
 

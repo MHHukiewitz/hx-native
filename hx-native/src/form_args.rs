@@ -17,6 +17,10 @@ use blitz_dom::node::Node;
 use blitz_dom::{qual_name, NodeId};
 use blitz_html::HtmlDocument;
 
+/// IEEE-754 safe integer limit (±2^53). Beyond this, number fields clamp at commit
+/// and step math refuses to proceed with wrapping/`as i64` casts.
+pub(crate) const MAX_SAFE_NUMBER: f64 = 9_007_199_254_740_992.0; // 2^53
+
 /// First value for `name`, if any (htmx / HTML single-value accessor).
 pub fn args_get<'a>(args: &'a [(String, String)], name: &str) -> Option<&'a str> {
     args.iter()
@@ -133,29 +137,58 @@ pub fn step_numeric_value(doc: &mut HtmlDocument, id: &str, dir: i32) -> bool {
     write_value_attr(doc, nid, &format_numeric_for_step(next, &limits))
 }
 
+fn clamp_safe_number(v: f64) -> f64 {
+    if !v.is_finite() {
+        return 0.0;
+    }
+    v.clamp(-MAX_SAFE_NUMBER, MAX_SAFE_NUMBER)
+}
+
+fn scale_to_i64(v: f64, scale: i64) -> Option<i64> {
+    let scaled = clamp_safe_number(v) * scale as f64;
+    if !scaled.is_finite() || scaled.abs() > i64::MAX as f64 {
+        return None;
+    }
+    Some(scaled.round() as i64)
+}
+
 /// Step with integer-scaled math; clamp to min/max; snap to step grid from min.
+/// Uses checked scale conversions — values beyond ±2^53 clamp; overflow yields
+/// the clamped current value (never panics or wraps).
 pub(crate) fn step_precise(current: f64, dir: i32, limits: &NumericLimits) -> f64 {
+    let current = clamp_safe_number(current);
     let decimals = step_decimal_places(limits.step);
     let scale = 10i64.pow(decimals as u32);
-    let cur_i = (current * scale as f64).round() as i64;
-    let step_i = (limits.step * scale as f64).round() as i64;
-    let mut next_i = cur_i + (dir as i64) * step_i;
+    let Some(cur_i) = scale_to_i64(current, scale) else {
+        return current;
+    };
+    let Some(step_i) = scale_to_i64(limits.step, scale) else {
+        return current;
+    };
+    let Some(mut next_i) = cur_i.checked_add((dir as i64).checked_mul(step_i).unwrap_or(0)) else {
+        return if dir > 0 {
+            MAX_SAFE_NUMBER
+        } else {
+            -MAX_SAFE_NUMBER
+        };
+    };
     if let Some(min) = limits.min {
-        let min_i = (min * scale as f64).round() as i64;
-        if next_i < min_i {
-            next_i = min_i;
+        if let Some(min_i) = scale_to_i64(min, scale) {
+            if next_i < min_i {
+                next_i = min_i;
+            }
         }
     }
     if let Some(max) = limits.max {
-        let max_i = (max * scale as f64).round() as i64;
-        if next_i > max_i {
-            next_i = max_i;
+        if let Some(max_i) = scale_to_i64(max, scale) {
+            if next_i > max_i {
+                next_i = max_i;
+            }
         }
     }
     // Snap to step grid from min (or 0) in integer space.
     let base = limits.min.unwrap_or(0.0);
-    let base_i = (base * scale as f64).round() as i64;
-    if step_i > 0 {
+    if let (Some(base_i), true) = (scale_to_i64(base, scale), step_i > 0) {
         let delta = next_i - base_i;
         let n = if delta >= 0 {
             (delta + step_i / 2) / step_i
@@ -164,19 +197,21 @@ pub(crate) fn step_precise(current: f64, dir: i32, limits: &NumericLimits) -> f6
         };
         next_i = base_i + n * step_i;
         if let Some(min) = limits.min {
-            let min_i = (min * scale as f64).round() as i64;
-            if next_i < min_i {
-                next_i = min_i;
+            if let Some(min_i) = scale_to_i64(min, scale) {
+                if next_i < min_i {
+                    next_i = min_i;
+                }
             }
         }
         if let Some(max) = limits.max {
-            let max_i = (max * scale as f64).round() as i64;
-            if next_i > max_i {
-                next_i = max_i;
+            if let Some(max_i) = scale_to_i64(max, scale) {
+                if next_i > max_i {
+                    next_i = max_i;
+                }
             }
         }
     }
-    next_i as f64 / scale as f64
+    clamp_safe_number(next_i as f64 / scale as f64)
 }
 
 pub(crate) fn step_decimal_places(step: f64) -> usize {
@@ -256,15 +291,16 @@ pub(crate) fn numeric_limits(node: &Node) -> NumericLimits {
 }
 
 fn clamp_snap(value: f64, limits: &NumericLimits) -> f64 {
-    let min = limits.min.unwrap_or(f64::NEG_INFINITY);
-    let max = limits.max.unwrap_or(f64::INFINITY);
+    let value = clamp_safe_number(value);
+    let min = limits.min.unwrap_or(-MAX_SAFE_NUMBER);
+    let max = limits.max.unwrap_or(MAX_SAFE_NUMBER);
     let base = limits.min.unwrap_or(0.0);
     let stepped = if limits.step > 0.0 {
         base + ((value - base) / limits.step).round() * limits.step
     } else {
         value
     };
-    stepped.clamp(min, max)
+    clamp_safe_number(stepped.clamp(min, max))
 }
 
 /// Public clamp+snap for text-edit commit.

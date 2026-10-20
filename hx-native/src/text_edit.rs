@@ -67,6 +67,9 @@ pub struct TextEditSession {
     pub last_blink: Instant,
     /// Last known caret ink in device pixels (for blink damage).
     pub last_caret_rect: Option<IntRect>,
+    /// After a same-id swap, PlainEditor exists only once style/layout has run.
+    /// Set by reconcile; cleared after prepare_focus_display.
+    pub needs_prepare: bool,
 }
 
 /// True when grouping separators should be shown for an unfocused number input.
@@ -313,6 +316,11 @@ pub fn selected_text(doc: &mut HtmlDocument, nid: NodeId) -> Option<String> {
         out = driver.editor.selected_text().map(str::to_string);
     });
     out
+}
+
+/// True when the editor has a non-empty selection (caret blink stays on).
+pub fn has_selection(doc: &mut HtmlDocument, nid: NodeId) -> bool {
+    selected_text(doc, nid).is_some_and(|s| !s.is_empty())
 }
 
 pub fn delete_selection(doc: &mut HtmlDocument, nid: NodeId) {
