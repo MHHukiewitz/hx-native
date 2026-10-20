@@ -30,7 +30,7 @@ fn wait_for_frame_after(
 ) -> FrameView {
     let deadline = Instant::now() + budget;
     loop {
-        let _ = worker.flush();
+        let _ = worker.flush_timeout(Duration::from_secs(10));
         if let Some(v) = worker.latest_frame(SurfaceId::DEFAULT, since_generation) {
             if v.generation > since_generation {
                 return v;
@@ -159,7 +159,7 @@ fn key_event(k: &str) -> InputEvent {
 fn best_effort_wait(worker: &PaintWorker, since_generation: u64, budget: Duration) -> u64 {
     let deadline = Instant::now() + budget;
     loop {
-        let _ = worker.flush();
+        let _ = worker.flush_timeout(Duration::from_secs(10));
         if let Some(v) = worker.latest_frame(SurfaceId::DEFAULT, 0) {
             if v.generation > since_generation {
                 return v.generation;

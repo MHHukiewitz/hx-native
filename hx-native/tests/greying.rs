@@ -8,6 +8,7 @@
 #![allow(clippy::type_complexity)]
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use hx_native::*;
 
@@ -1047,12 +1048,16 @@ fn run_parity_script(
     worker.load_html(html).unwrap();
     worker.resize_surface(SurfaceId::DEFAULT, vp()).unwrap();
     worker.sync(pkt).unwrap();
-    worker.flush().unwrap();
+    // 10s, not flush()'s default 100ms: this fixture's first paint can run
+    // past WORKER_STALL_TIMEOUT_NS on a loaded/debug-build CI runner, and
+    // flush()'s Stalled latches permanently once tripped (CI gate, PR #24
+    // round 2).
+    worker.flush_timeout(Duration::from_secs(10)).unwrap();
     let _ = worker.poll_outcomes();
     for ev in script {
         worker.input(ev.clone()).unwrap();
     }
-    worker.flush().unwrap();
+    worker.flush_timeout(Duration::from_secs(10)).unwrap();
     let worker_outs: Vec<InputOutcome> = worker
         .poll_outcomes()
         .into_iter()

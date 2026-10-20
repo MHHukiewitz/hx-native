@@ -9,6 +9,7 @@
 //! side also matches a forced full repaint of the same end state.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use hx_native::*;
 
@@ -103,7 +104,9 @@ fn run_pixel_checkpoints(
     worker.load_html(html).unwrap();
     worker.resize_surface(SurfaceId::DEFAULT, vp()).unwrap();
     worker.sync(pkt).unwrap();
-    worker.flush().unwrap();
+    // 10s, not flush()'s default 100ms — see the comment on the analogous
+    // call in greying.rs's run_parity_script (PR #24 round 2 CI gate fix).
+    worker.flush_timeout(Duration::from_secs(10)).unwrap();
 
     let mut sync_frames = Vec::new();
     let mut worker_frames = Vec::new();
@@ -113,7 +116,7 @@ fn run_pixel_checkpoints(
             worker.input(ev.clone()).unwrap();
         }
         let sync_out = sync_eng.paint(vp()).unwrap();
-        worker.flush().unwrap();
+        worker.flush_timeout(Duration::from_secs(10)).unwrap();
         let worker_frame = worker
             .latest_frame(SurfaceId::DEFAULT, 0)
             .expect("worker frame");

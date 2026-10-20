@@ -1068,13 +1068,24 @@ impl PaintWorker {
     /// Use once after setup (or any batch whose result you need) when you do
     /// not want to poll [`Self::poll_error`] yourself.
     pub fn flush(&self) -> Result<(), WorkerError> {
+        self.flush_timeout(Duration::from_nanos(WORKER_STALL_TIMEOUT_NS))
+    }
+
+    /// [`Self::flush`] with a caller-chosen stall timeout. [`Self::flush`]
+    /// itself stays at [`WORKER_STALL_TIMEOUT_NS`] (100 ms) — that bound is
+    /// deliberately tight for production hosts deciding whether to fall back
+    /// to the sync `Engine`. Tests with an expensive first paint (debug
+    /// builds, loaded CI runners) need a longer bound; a timeout here still
+    /// records `Stalled` the same way.
+    #[doc(hidden)]
+    pub fn flush_timeout(&self, timeout: Duration) -> Result<(), WorkerError> {
         if let Some(err) = self.poll_error() {
             return Err(err);
         }
         let (tx, rx) = mpsc::sync_channel(1);
         self.mailbox
             .push_discrete(Command::Flush { reply: Reply(tx) })?;
-        match rx.recv_timeout(Duration::from_nanos(WORKER_STALL_TIMEOUT_NS)) {
+        match rx.recv_timeout(timeout) {
             Ok(r) => r,
             Err(RecvTimeoutError::Timeout) => {
                 let err = WorkerError::Stalled;
