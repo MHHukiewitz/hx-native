@@ -318,57 +318,254 @@ fn idle_frames_do_no_resolve_with_or_without_ellipsis() {
 
 #[test]
 fn cluster_boundaries_keep_combining_mark_and_zwj() {
-    // Force truncation near a combining mark (e + U+0301) and a ZWJ family emoji.
-    // Padding ASCII so the cut falls inside the interesting sequences if we
-    // wrongly split on Unicode scalars.
+    // Place combining mark and ZWJ near where a 200px / 13px cut lands (~20–28 chars).
     let combining = "e\u{0301}"; // é as base + combining acute
     let zwj = "\u{1F468}\u{200D}\u{1F469}"; // man + ZWJ + woman
-    let reason =
-        format!("AAAAAAAAAA{combining}BBBBBBBBBB{zwj}CCCCCCCCCC more credit needed for settlement");
+    let reason = format!(
+        "{}{}{}{} more credit needed for settlement overflow overflow",
+        "A".repeat(18),
+        combining,
+        "B".repeat(4),
+        zwj,
+    );
     let mut eng = boot(&gmode_why_page(&reason));
     let _ = eng.paint(vp()).unwrap();
     let truncated = eng
         .test_ellipsis_truncated("gmode-why")
         .expect("should truncate");
-    assert!(truncated.ends_with('\u{2026}'));
+    assert!(
+        truncated.ends_with('\u{2026}'),
+        "expected ellipsis marker: {truncated:?}"
+    );
 
-    // Must not leave a dangling combining mark or a bare ZWJ at the cut.
     let body = truncated.trim_end_matches('\u{2026}');
     assert!(
-        !body.ends_with('\u{0301}'),
-        "must not cut before combining mark alone: {truncated:?}"
+        reason.starts_with(body),
+        "truncated body must be a prefix of the original:\nbody={body:?}\norig={reason:?}"
     );
+
+    // Cluster-safe: the next scalar after the cut must not be a combining mark or ZWJ
+    // (those continue a cluster that should have been kept wholly or dropped wholly).
+    if let Some(next) = reason[body.len()..].chars().next() {
+        assert_ne!(
+            next, '\u{0301}',
+            "cut before combining mark (scalar split): {truncated:?}"
+        );
+        assert_ne!(
+            next, '\u{200D}',
+            "cut before ZWJ (scalar split): {truncated:?}"
+        );
+    }
     assert!(
         !body.ends_with('\u{200D}'),
-        "must not cut after ZWJ: {truncated:?}"
+        "must not end on a bare ZWJ: {truncated:?}"
     );
-    // If the combining sequence is present, it must be complete.
-    if body.contains('e') {
-        let bytes = body.as_bytes();
-        for (i, w) in body.char_indices() {
-            if w == 'e' {
-                let next = body[i + w.len_utf8()..].chars().next();
-                if next == Some('\u{0301}') {
-                    // complete cluster — ok
-                } else if body[i..].starts_with(combining) {
-                    // ok
-                } else {
-                    // 'e' without following mark is fine when the mark cluster
-                    // was truncated away entirely.
-                    let _ = bytes;
-                }
-            }
-        }
+    // If the combining sequence appears, it must be complete (not `e` alone at the cut).
+    if body.ends_with('e') {
+        let next = reason[body.len()..].chars().next();
+        assert_ne!(
+            next,
+            Some('\u{0301}'),
+            "cut between base and combining mark: {truncated:?}"
+        );
     }
-    // ZWJ emoji, if started, must include the full sequence.
+    // If a ZWJ family was started, the full sequence must be present.
     if let Some(i) = body.find('\u{1F468}') {
         let rest = &body[i..];
         assert!(
-            rest.starts_with(zwj) || !rest.contains('\u{200D}'),
+            rest.starts_with(zwj),
             "ZWJ emoji must not be split: {truncated:?}"
         );
     }
 
     let html = eng.serialize_html().unwrap();
     assert!(html.contains(&reason), "DOM keeps full original text");
+}
+
+#[test]
+fn paint_error_restores_dom_and_layout() {
+    let reason = long_reason();
+    let mut eng = boot(&gmode_why_page(reason));
+    let first = eng.paint(vp()).unwrap();
+    assert!(!first.skipped);
+    assert!(eng.test_ellipsis_truncated("gmode-why").is_some());
+    assert_eq!(eng.test_element_text("gmode-why").as_deref(), Some(reason));
+    assert!(eng.test_has_inline_layout("gmode-why"));
+
+    eng.mark_theme_or_stylesheet_changed();
+    eng.test_fail_next_paint();
+    let err = eng.paint(vp());
+    assert!(err.is_err(), "expected forced paint error, got {err:?}");
+
+    assert_eq!(
+        eng.test_element_text("gmode-why").as_deref(),
+        Some(reason),
+        "DOM text must be restored after paint error"
+    );
+    assert!(
+        eng.test_has_inline_layout("gmode-why"),
+        "inline layout must be restored after paint error"
+    );
+    // Next paint must still detect overflow and apply ellipsis.
+    eng.mark_theme_or_stylesheet_changed();
+    let out = eng.paint(vp()).unwrap();
+    assert!(!out.skipped);
+    let truncated = eng
+        .test_ellipsis_truncated("gmode-why")
+        .expect("ellipsis still applied after error recovery");
+    assert!(truncated.ends_with('\u{2026}'));
+    assert_eq!(eng.test_element_text("gmode-why").as_deref(), Some(reason));
+}
+
+#[test]
+fn paint_panic_restores_dom_and_layout() {
+    let reason = long_reason();
+    let mut eng = boot(&gmode_why_page(reason));
+    let _ = eng.paint(vp()).unwrap();
+    assert!(eng.test_ellipsis_truncated("gmode-why").is_some());
+
+    eng.mark_theme_or_stylesheet_changed();
+    eng.test_panic_next_paint();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = eng.paint(vp());
+    }));
+    assert!(panicked.is_err(), "expected panic inside paint");
+
+    assert_eq!(
+        eng.test_element_text("gmode-why").as_deref(),
+        Some(reason),
+        "DOM text must be restored after panic"
+    );
+    assert!(
+        eng.test_has_inline_layout("gmode-why"),
+        "inline layout must be restored after panic"
+    );
+    eng.mark_theme_or_stylesheet_changed();
+    let out = eng.paint(vp()).unwrap();
+    assert!(!out.skipped);
+    assert!(
+        eng.test_ellipsis_truncated("gmode-why")
+            .is_some_and(|t| t.ends_with('\u{2026}')),
+        "ellipsis still applied after panic recovery"
+    );
+}
+
+#[test]
+fn flex_ellipsis_hover_matches_without_ellipsis() {
+    // Content-sized flex item (min-width:0) with ellipsis next to a hover target.
+    // Hit-test / hover must match the same page with ellipsis disabled — proves
+    // we do not leave truncated geometry behind after a cache-miss reshape.
+    fn page(ellipsis: bool) -> String {
+        let overflow = if ellipsis {
+            "white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"
+        } else {
+            "white-space: nowrap; overflow: hidden;"
+        };
+        format!(
+            r##"<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/>
+<style>
+* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+body {{ width: 320px; height: 80px; background: #1a1f2a; color: #9aa3b5;
+  font-family: "DejaVu Sans", sans-serif; font-size: 13px; }}
+#row {{
+  display: flex; flex-direction: row; align-items: center;
+  position: absolute; left: 8px; top: 20px; width: 300px; height: 28px;
+}}
+#title {{
+  flex: 1 1 auto; min-width: 0; height: 20px; line-height: 20px;
+  {overflow}
+}}
+#act {{
+  flex: 0 0 auto; width: 72px; height: 28px;
+  background: #2d3648; color: #e8ecf4; border: 1px solid #556;
+}}
+#act:hover {{ background: #3d7ea6; }}
+</style></head><body>
+<div id="row">
+  <div id="title">Disabled: not enough credit on the active settlement rail for this order size</div>
+  <button id="act" hx-post="act.do" hx-trigger="click">Do</button>
+</div>
+</body></html>"##
+        )
+    }
+
+    let mut with_e = boot(&page(true));
+    let mut without = boot(&page(false));
+    let _ = with_e.paint(vp()).unwrap();
+    let _ = without.paint(vp()).unwrap();
+    assert!(
+        with_e.test_ellipsis_truncated("title").is_some(),
+        "flex title should truncate"
+    );
+
+    // Hover the button (right side of the row).
+    let hx = with_e.input(InputEvent::PointerMove {
+        x: 280.0,
+        y: 34.0,
+        mods: Modifiers::default(),
+    });
+    let ho = without.input(InputEvent::PointerMove {
+        x: 280.0,
+        y: 34.0,
+        mods: Modifiers::default(),
+    });
+    assert!(
+        matches!(hx, InputOutcome::Hover { id: Some(ref id) } if id == "act"),
+        "ellipsis page hover: {hx:?}"
+    );
+    assert!(
+        matches!(ho, InputOutcome::Hover { id: Some(ref id) } if id == "act"),
+        "plain page hover: {ho:?}"
+    );
+
+    // Hover over the title text band — both should report #title (full geometry).
+    let tx = with_e.input(InputEvent::PointerMove {
+        x: 40.0,
+        y: 34.0,
+        mods: Modifiers::default(),
+    });
+    let to = without.input(InputEvent::PointerMove {
+        x: 40.0,
+        y: 34.0,
+        mods: Modifiers::default(),
+    });
+    assert!(
+        matches!(tx, InputOutcome::Hover { id: Some(ref id) } if id == "title"),
+        "ellipsis title hit: {tx:?}"
+    );
+    assert!(
+        matches!(to, InputOutcome::Hover { id: Some(ref id) } if id == "title"),
+        "plain title hit: {to:?}"
+    );
+}
+
+#[test]
+fn ellipsis_cache_miss_does_not_exceed_style_layout_budget() {
+    // Direct parley reshape must not spend a document style/layout pass.
+    // Budget remains at most 2 passes per paint (resolve + optional hover follow-up).
+    let mut eng = boot(&gmode_why_page(long_reason()));
+    let before = eng.style_layout_pass_count();
+    let out = eng.paint(vp()).unwrap();
+    assert!(!out.skipped);
+    let after_miss = eng.style_layout_pass_count();
+    let delta_miss = after_miss - before;
+    assert!(
+        (1..=2).contains(&delta_miss),
+        "cache-miss paint must use 1–2 document passes, got {delta_miss}"
+    );
+    assert!(
+        eng.test_ellipsis_truncated("gmode-why").is_some(),
+        "miss must still truncate"
+    );
+
+    eng.mark_theme_or_stylesheet_changed();
+    let before_hit = eng.style_layout_pass_count();
+    let out2 = eng.paint(vp()).unwrap();
+    assert!(!out2.skipped);
+    let delta_hit = eng.style_layout_pass_count() - before_hit;
+    assert!(
+        (1..=2).contains(&delta_hit),
+        "cache-hit paint must use 1–2 document passes, got {delta_hit}"
+    );
 }

@@ -852,6 +852,33 @@ fn bench_text_overflow_ellipsis() {
         }
     }
     print_row("2000-char dirty paint (cache hit)", &mut long_idle_dirty);
+
+    // --- String that changes every frame (always cache miss) ---
+    let mut every_frame = Vec::with_capacity(N);
+    let mut eng_chg = Engine::new(ellipsis_cfg());
+    eng_chg.declare_actions(&["act.do"]);
+    eng_chg.load_html(&gmode_why_html(reason, true)).unwrap();
+    let mut slices = WhySlices { v: 1 };
+    let mut frags = WhyFrags {
+        body: reason.to_string(),
+    };
+    let _ = eng_chg.sync(&slices, &mut frags).unwrap();
+    let _ = eng_chg.paint(view.clone()).unwrap();
+    for i in 0..(W + N) {
+        slices.v += 1;
+        frags.body = format!(
+            "tick {i}: Disabled: not enough credit on the active settlement rail for this order size"
+        );
+        let _ = eng_chg.sync(&slices, &mut frags).unwrap();
+        let t0 = std::time::Instant::now();
+        let out = eng_chg.paint(view.clone()).unwrap();
+        let ns = t0.elapsed().as_nanos() as u64;
+        assert!(!out.skipped);
+        if i >= W {
+            every_frame.push(ns);
+        }
+    }
+    print_row("text changes every frame (always miss)", &mut every_frame);
 }
 
 fn main() {

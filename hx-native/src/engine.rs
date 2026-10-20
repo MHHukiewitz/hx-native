@@ -15,7 +15,7 @@ use crate::damage::{
     DamagePlan, IntRect,
 };
 use crate::dialect::{validate_loaded_attrs, ElementBinding, SwapMode, SyncMode};
-use crate::ellipsis::{prepare_ellipsis_for_paint, EllipsisCache};
+use crate::ellipsis::{prepare_ellipsis_for_paint, EllipsisCache, EllipsisShaper};
 use crate::error::EngineError;
 use crate::focus::{focusable_ids, ids_in_document_order, step_focus};
 use crate::fonts::bundled_font_context;
@@ -177,8 +177,14 @@ struct LiveSurface {
     range_drag_id: Option<String>,
     /// Cached truncated paint layouts for `text-overflow: ellipsis` (issue #12).
     ellipsis_cache: EllipsisCache,
+    /// Parley contexts for shaping truncated text without a document resolve.
+    ellipsis_shaper: EllipsisShaper,
     /// Total `doc.resolve` calls on this surface (tests: idle frames must not grow).
     resolve_count: u64,
+    /// Test hook: next paint returns `EngineError::Paint` after ellipsis swap.
+    fail_next_paint: bool,
+    /// Test hook: panic after ellipsis swap (Drop must still restore).
+    panic_next_paint: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -685,6 +691,10 @@ impl Engine {
         self.surfaces.get(&id)?.live.as_ref()
     }
 
+    fn live_mut(&mut self, id: SurfaceId) -> Option<&mut LiveSurface> {
+        self.surfaces.get_mut(&id)?.live.as_mut()
+    }
+
     fn hidden_unpinned_bytes(&self) -> u64 {
         self.surfaces
             .values()
@@ -896,6 +906,45 @@ impl Engine {
         live.ellipsis_cache.truncated_for(nid).map(str::to_string)
     }
 
+    /// Test harness: force the next paint to error after the ellipsis swap
+    /// (Drop must restore DOM text + inline layouts).
+    pub fn test_fail_next_paint(&mut self) {
+        if let Some(live) = self.live_mut(SurfaceId::DEFAULT) {
+            live.fail_next_paint = true;
+            live.paint_dirty = true;
+        }
+    }
+
+    /// Test harness: panic on the next paint after the ellipsis swap.
+    pub fn test_panic_next_paint(&mut self) {
+        if let Some(live) = self.live_mut(SurfaceId::DEFAULT) {
+            live.panic_next_paint = true;
+            live.paint_dirty = true;
+        }
+    }
+
+    /// Test harness: read text content of `#id` from the live DOM.
+    pub fn test_element_text(&self, elem_id: &str) -> Option<String> {
+        let live = self.live(SurfaceId::DEFAULT)?;
+        let nid = live.doc.get_element_by_id(elem_id)?;
+        let node = live.doc.get_node(nid)?;
+        Some(node.text_content())
+    }
+
+    /// Test harness: whether `#id` currently has inline_layout_data.
+    pub fn test_has_inline_layout(&self, elem_id: &str) -> bool {
+        let Some(live) = self.live(SurfaceId::DEFAULT) else {
+            return false;
+        };
+        let Some(nid) = live.doc.get_element_by_id(elem_id) else {
+            return false;
+        };
+        live.doc
+            .get_node(nid)
+            .and_then(|n| n.element_data())
+            .is_some_and(|el| el.inline_layout_data.is_some())
+    }
+
     pub fn config(&self) -> &EngineConfig {
         &self.config
     }
@@ -1042,7 +1091,10 @@ impl LiveSurface {
             last_bounds: BoundsSnapshot::new(),
             range_drag_id: None,
             ellipsis_cache: EllipsisCache::default(),
+            ellipsis_shaper: EllipsisShaper::new(),
             resolve_count: 1,
+            fail_next_paint: false,
+            panic_next_paint: false,
         })
     }
 
@@ -2249,20 +2301,30 @@ impl LiveSurface {
         paint_mode: PaintMode,
     ) -> Result<RgbaImage, EngineError> {
         // Issue #12: swap cached truncated TextLayouts for paint only. DOM text
-        // stays full; layouts are restored afterward — no needs_resolve.
-        let guard = {
-            let cache = &mut self.ellipsis_cache;
-            let resolve_count = &mut self.resolve_count;
-            prepare_ellipsis_for_paint(&mut self.doc, cache, |doc| {
-                doc.resolve(0.0);
-                *resolve_count = resolve_count.saturating_add(1);
-            })
-        };
+        // stays full; EllipsisPaintSession restores layouts on Drop (also on
+        // `?` / panic) — no document needs_resolve and no truncated geometry.
+        let mut session = prepare_ellipsis_for_paint(
+            &mut self.doc,
+            &mut self.ellipsis_cache,
+            &mut self.ellipsis_shaper,
+        );
 
-        let rgba = if plan.full_repaint
-            || plan.rects.len() == 1 && plan.rects[0] == IntRect::full_surface(width, height)
-        {
-            paint_rgba(&mut self.doc, width, height, scale)
+        if self.panic_next_paint {
+            self.panic_next_paint = false;
+            panic!("hx_native test: panic after ellipsis swap");
+        }
+
+        if self.fail_next_paint {
+            self.fail_next_paint = false;
+            // Session Drop restores layouts before this error propagates.
+            return Err(EngineError::Paint("test forced paint error".into()));
+        }
+
+        let full = plan.full_repaint
+            || plan.rects.len() == 1 && plan.rects[0] == IntRect::full_surface(width, height);
+
+        let rgba = if full {
+            paint_rgba(session.doc_mut(), width, height, scale)
         } else {
             let mut frame = self.cached_rgba.take().unwrap_or_else(|| RgbaImage {
                 width,
@@ -2276,11 +2338,19 @@ impl LiveSurface {
                     pixels: vec![0u8; (width as usize) * (height as usize) * 4],
                 };
             }
-            paint_damage_into(&mut self.doc, &mut frame, scale, &plan.rects, paint_mode)?;
+            paint_damage_into(
+                session.doc_mut(),
+                &mut frame,
+                scale,
+                &plan.rects,
+                paint_mode,
+            )?;
             Ok(frame)
         };
 
-        guard.restore(&mut self.doc);
+        // Explicit drop before returning so restore order is obvious; also runs
+        // on `?` / panic via Drop.
+        drop(session);
         rgba
     }
 

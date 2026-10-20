@@ -13,32 +13,68 @@
 //!
 //! Truncation cuts at a **parley cluster** boundary (grapheme / ZWJ-safe) so
 //! `prefix + "…"` fits the content box. Fit is decided with a binary search
-//! over shaped cluster advances — no per-character re-layout.
+//! over shaped cluster advances — no per-character re-layout. The ellipsis
+//! glyph width is measured by shaping `"…"` with the same style.
 //!
 //! # Paint without dirtying layout for hit-testing
 //!
 //! The DOM text nodes always keep the full original string. For paint we swap
 //! the element's cached [`TextLayout`](blitz_dom::node::TextLayout) with a
-//! truncated shaped layout, then swap the original layout back. Hit-testing,
-//! tooltips, and slice diffs therefore see the full string and the original
-//! geometry without a post-paint `needs_resolve`.
+//! truncated shaped layout built **directly** via parley (same bundled
+//! [`FontContext`](blitz_dom::FontContext) as document construction). We never
+//! mutate DOM text and never run a document `resolve` for truncation, so
+//! content-sized boxes (inline-block, flex items with `min-width: 0`) and
+//! siblings keep their full-geometry layout for hit-testing and hover.
+//!
+//! [`EllipsisPaintSession`] restores the original `inline_layout_data` in
+//! [`Drop`], so early `?` returns and panics still undo the swap.
 //!
 //! Truncated layouts are cached under a key of
-//! `(original text, content-box width, font/style fingerprint)`. A cache miss
-//! does one reshape resolve; a hit does none. Clear the cache when the DOM
-//! mutates (`EllipsisCache::clear`).
+//! `(original text, content-box width rounded to 1/64 px, font/style fingerprint)`.
+//! A cache miss reshapes once via parley (not counted as a document style/layout
+//! pass). Clear the cache when the DOM mutates (`EllipsisCache::clear`).
+//!
+//! # Mixed inline styling
+//!
+//! Truncated paint uses a single style taken from the ellipsis element (first
+//! text node's brush id). Nested inline styling such as `<b>` / `<em>` is
+//! flattened to that style for the truncated string. Full mixed-run restyling
+//! is out of scope until needed.
+//!
+//! # Pin sensitivity (Blitz / stylo)
+//!
+//! This module relies on Blitz internals that are public but not a stable
+//! contract. A Blitz or stylo bump can break detection or paint **silently**
+//! (no compile error). Relied-on surfaces:
+//!
+//! - `ElementData::inline_layout_data` — swapped for paint, restored on Drop
+//! - `Node::final_layout()` — content-box width
+//! - `Node::primary_styles()` + `format!("{:?}", styles.clone_text_overflow())`
+//!   (and wrap / overflow-x / font fingerprint fields) — style detection
+//! - `TextLayout::{text, layout, block_offset, span_cb_flags}` — paint payload
+//! - `TextBrush { id }` — glyph brush for paint / hit attribution
+//!
+//! Detection tests in `tests/text_overflow.rs` run in CI's normal test job
+//! (not `#[ignore]`, not feature-gated) so a bump that breaks ellipsis fails CI.
 //!
 //! # Out of scope
 //!
 //! - RTL / bidirectional ellipsis sides
 //! - Multi-line clamp (`-webkit-line-clamp` / `line-clamp`)
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use blitz_dom::node::{TextBrush, TextLayout};
-use blitz_dom::NodeId;
+use blitz_dom::{FontContext, NodeId};
 use blitz_html::HtmlDocument;
 use parley::layout::Layout;
+use parley::style::{
+    FontFamily, FontFamilyName, GenericFamily, TextStyle, TextWrapMode, WhiteSpaceCollapse,
+};
+use parley::LayoutContext;
+
+use crate::fonts::bundled_font_context;
 
 /// U+2026 HORIZONTAL ELLIPSIS — CSS `text-overflow: ellipsis` marker.
 const ELLIPSIS: &str = "\u{2026}";
@@ -47,6 +83,7 @@ const ELLIPSIS: &str = "\u{2026}";
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct TruncationKey {
     original: String,
+    /// Content-box width in CSS px, quantized to 1/64 px (`to_bits` of the rounded value).
     content_w_bits: u32,
     style_fp: u64,
 }
@@ -75,9 +112,31 @@ impl EllipsisCache {
     }
 }
 
-/// Restores original inline layouts after paint. Does not touch DOM text and
-/// does not mark the document dirty.
-pub(crate) struct EllipsisPaintGuard {
+/// Font + layout contexts used to shape truncated text without touching the DOM.
+pub(crate) struct EllipsisShaper {
+    font_ctx: FontContext,
+    layout_ctx: LayoutContext<TextBrush>,
+}
+
+impl EllipsisShaper {
+    pub(crate) fn new() -> Self {
+        Self {
+            font_ctx: bundled_font_context(),
+            layout_ctx: LayoutContext::new(),
+        }
+    }
+}
+
+impl Default for EllipsisShaper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Holds original inline layouts while truncated ones are installed for paint.
+/// Restores on [`Drop`] (covers `?` early returns and panics).
+pub(crate) struct EllipsisPaintSession<'a> {
+    doc: &'a mut HtmlDocument,
     backups: Vec<(NodeId, Box<TextLayout>)>,
     /// True when at least one truncated layout was installed for this paint.
     #[allow(dead_code)]
@@ -87,10 +146,20 @@ pub(crate) struct EllipsisPaintGuard {
     pub(crate) reshaped: bool,
 }
 
-impl EllipsisPaintGuard {
-    pub(crate) fn restore(self, doc: &mut HtmlDocument) {
-        for (nid, layout) in self.backups {
-            if let Some(el) = doc.get_node_mut(nid).and_then(|n| n.element_data_mut()) {
+impl<'a> EllipsisPaintSession<'a> {
+    pub(crate) fn doc_mut(&mut self) -> &mut HtmlDocument {
+        self.doc
+    }
+}
+
+impl Drop for EllipsisPaintSession<'_> {
+    fn drop(&mut self) {
+        for (nid, layout) in self.backups.drain(..) {
+            if let Some(el) = self
+                .doc
+                .get_node_mut(nid)
+                .and_then(|n| n.element_data_mut())
+            {
                 el.inline_layout_data = Some(layout);
             }
         }
@@ -98,19 +167,18 @@ impl EllipsisPaintGuard {
 }
 
 /// Install truncated inline layouts for paint. Call after the document’s normal
-/// style+layout resolve (DOM still holds the full text).
-///
-/// `resolve_extra` is called once per cache miss to reshape truncated text
-/// (caller should count it separately from the main paint resolve).
-pub(crate) fn prepare_ellipsis_for_paint(
-    doc: &mut HtmlDocument,
+/// style+layout resolve (DOM still holds the full text). Does not mutate DOM
+/// text and does not call `HtmlDocument::resolve`.
+pub(crate) fn prepare_ellipsis_for_paint<'a>(
+    doc: &'a mut HtmlDocument,
     cache: &mut EllipsisCache,
-    mut resolve_extra: impl FnMut(&mut HtmlDocument),
-) -> EllipsisPaintGuard {
+    shaper: &mut EllipsisShaper,
+) -> EllipsisPaintSession<'a> {
     let scale = doc.viewport().scale().max(0.000_1);
     let candidates = find_ellipsis_candidates(doc, scale);
     if candidates.is_empty() {
-        return EllipsisPaintGuard {
+        return EllipsisPaintSession {
+            doc,
             backups: Vec::new(),
             applied: false,
             reshaped: false,
@@ -122,7 +190,7 @@ pub(crate) fn prepare_ellipsis_for_paint(
     let mut reshaped = false;
 
     for cand in candidates {
-        let Some(prep) = prepare_one(doc, cache, &cand, scale, &mut resolve_extra) else {
+        let Some(prep) = prepare_one(doc, cache, shaper, &cand, scale) else {
             continue;
         };
         if prep.reshaped {
@@ -138,7 +206,8 @@ pub(crate) fn prepare_ellipsis_for_paint(
         applied = true;
     }
 
-    EllipsisPaintGuard {
+    EllipsisPaintSession {
+        doc,
         backups,
         applied,
         reshaped,
@@ -199,6 +268,7 @@ fn is_ellipsis_candidate(node: &blitz_dom::Node) -> bool {
         return false;
     };
     // Avoid `resolved_style_value` (needs ThreadState::LAYOUT).
+    // Pin sensitivity: Debug string match — see module rustdoc.
     let text_overflow = format!("{:?}", styles.clone_text_overflow());
     if !text_overflow.contains("Ellipsis") {
         return false;
@@ -260,6 +330,7 @@ fn style_fingerprint(node: &blitz_dom::Node) -> u64 {
         return 0;
     };
     // Stable-enough fingerprint of metrics that affect shaping width.
+    // Pin sensitivity: Debug of stylo computed values — see module rustdoc.
     let raw = format!(
         "{:?}|{:?}|{:?}|{:?}",
         styles.clone_font_size(),
@@ -273,6 +344,12 @@ fn style_fingerprint(node: &blitz_dom::Node) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     h
+}
+
+/// Quantize CSS px width to 1/64 px for stable cache keys across float noise.
+fn width_key_bits(w_css: f32) -> u32 {
+    let rounded = (w_css * 64.0).round() / 64.0;
+    rounded.to_bits()
 }
 
 /// Cluster end byte offsets and cumulative advances (layout / scaled px).
@@ -299,34 +376,102 @@ fn cluster_cum_advances(layout: &Layout<TextBrush>) -> Vec<(usize, f32)> {
     out
 }
 
-fn estimate_ellipsis_advance(layout: &Layout<TextBrush>) -> f32 {
-    let mut font_size = None;
+fn first_run_font_size_css(layout: &Layout<TextBrush>, scale: f32) -> f32 {
     for line in layout.lines() {
         if let Some(run) = line.runs().next() {
-            font_size = Some(run.font_size());
-            break;
+            return (run.font_size() / scale.max(0.000_1)).max(1.0);
         }
     }
-    // U+2026 is typically ~0.6–0.75em in DejaVu-like faces.
-    font_size.unwrap_or(13.0) * 0.7
+    13.0
+}
+
+fn paint_brush_from_layout(layout: &Layout<TextBrush>, fallback: NodeId) -> TextBrush {
+    for line in layout.lines() {
+        for item in line.items() {
+            if let parley::PositionedLayoutItem::GlyphRun(run) = item {
+                return run.style().brush;
+            }
+        }
+    }
+    TextBrush { id: fallback }
+}
+
+fn text_style_for(font_size_css: f32, brush: TextBrush) -> TextStyle<'static, 'static, TextBrush> {
+    // Bundled DejaVu is registered for every generic family in `bundled_font_context`.
+    const FAMILIES: &[FontFamilyName<'static>] =
+        &[FontFamilyName::Generic(GenericFamily::SansSerif)];
+    TextStyle {
+        font_family: FontFamily::List(Cow::Borrowed(FAMILIES)),
+        font_size: font_size_css,
+        brush,
+        text_wrap_mode: TextWrapMode::NoWrap,
+        white_space_collapse: WhiteSpaceCollapse::Preserve,
+        ..Default::default()
+    }
+}
+
+/// Shape `text` with the ellipsis element's style; returns a ready-to-paint `TextLayout`.
+fn shape_text_layout(
+    shaper: &mut EllipsisShaper,
+    text: &str,
+    font_size_css: f32,
+    brush: TextBrush,
+    scale: f32,
+    max_advance: Option<f32>,
+    template: &TextLayout,
+) -> Box<TextLayout> {
+    let style = text_style_for(font_size_css, brush);
+    let mut builder = shaper
+        .layout_ctx
+        .tree_builder(&mut shaper.font_ctx, scale, true, &style);
+    builder.push_text(text);
+    let mut layout = Layout::new();
+    let shaped_text = builder.build_into(&mut layout);
+    layout.break_all_lines(max_advance);
+    Box::new(TextLayout {
+        text: shaped_text,
+        content_widths: None,
+        layout,
+        block_offset: template.block_offset,
+        span_cb_flags: template.span_cb_flags,
+    })
+}
+
+fn measure_ellipsis_advance(
+    shaper: &mut EllipsisShaper,
+    font_size_css: f32,
+    brush: TextBrush,
+    scale: f32,
+) -> f32 {
+    let style = text_style_for(font_size_css, brush);
+    let mut builder = shaper
+        .layout_ctx
+        .tree_builder(&mut shaper.font_ctx, scale, true, &style);
+    builder.push_text(ELLIPSIS);
+    let mut layout = Layout::new();
+    let _ = builder.build_into(&mut layout);
+    layout.break_all_lines(None);
+    layout.full_width()
 }
 
 /// Binary search cluster boundaries so prefix advance + ellipsis fits `budget`
 /// (same units as cluster advances — scaled px).
-fn truncate_by_clusters(original: &str, layout: &Layout<TextBrush>, budget: f32) -> String {
+fn truncate_by_clusters(
+    original: &str,
+    layout: &Layout<TextBrush>,
+    budget: f32,
+    ellipsis_adv: f32,
+) -> String {
     let clusters = cluster_cum_advances(layout);
     if clusters.len() <= 1 {
         return ELLIPSIS.to_string();
     }
     let full = clusters.last().map(|(_, a)| *a).unwrap_or(0.0);
-    let ellipsis_adv = estimate_ellipsis_advance(layout);
     if full + 0.5 <= budget {
         return original.to_string();
     }
     let target = (budget - ellipsis_adv).max(0.0);
 
-    // clusters[0] = (0,0); search largest i >= 1 with cum <= target, or 0 for
-    // empty prefix.
     let mut lo = 0usize;
     let mut hi = clusters.len() - 1;
     let mut best = 0usize;
@@ -342,28 +487,8 @@ fn truncate_by_clusters(original: &str, layout: &Layout<TextBrush>, budget: f32)
         }
     }
     let end = clusters[best].0;
-    // Never split a multi-byte scalar: cluster ends are already grapheme-safe.
     let prefix = original.get(..end).unwrap_or("");
     format!("{prefix}{ELLIPSIS}")
-}
-
-fn set_combined_text_damaging(doc: &mut HtmlDocument, text_nodes: &[NodeId], combined: &str) {
-    let mut mutr = doc.mutate();
-    if let Some((first, rest)) = text_nodes.split_first() {
-        mutr.set_node_text(*first, combined);
-        for &tid in rest {
-            mutr.set_node_text(tid, "");
-        }
-    }
-}
-
-fn write_text_no_damage(doc: &mut HtmlDocument, text_nodes: &[(NodeId, String)]) {
-    for (tid, text) in text_nodes {
-        if let Some(td) = doc.get_node_mut(*tid).and_then(|n| n.text_data_mut()) {
-            td.content.clear();
-            td.content.push_str(text);
-        }
-    }
 }
 
 fn take_inline_layout(doc: &mut HtmlDocument, nid: NodeId) -> Option<Box<TextLayout>> {
@@ -375,9 +500,9 @@ fn take_inline_layout(doc: &mut HtmlDocument, nid: NodeId) -> Option<Box<TextLay
 fn prepare_one(
     doc: &mut HtmlDocument,
     cache: &mut EllipsisCache,
+    shaper: &mut EllipsisShaper,
     cand: &Candidate,
     scale: f32,
-    resolve_extra: &mut impl FnMut(&mut HtmlDocument),
 ) -> Option<Prepared> {
     let original_text = read_combined_text(doc, &cand.text_nodes);
     if original_text.is_empty() {
@@ -388,7 +513,7 @@ fn prepare_one(
     let style_fp = style_fingerprint(node);
     let key = TruncationKey {
         original: original_text.clone(),
-        content_w_bits: cand.content_w_css.to_bits(),
+        content_w_bits: width_key_bits(cand.content_w_css),
         style_fp,
     };
 
@@ -403,7 +528,8 @@ fn prepare_one(
         }
     }
 
-    // Cache miss: truncate from shaped advances, reshape once, cache, restore DOM.
+    // Cache miss: cut from shaped cluster advances, reshape truncated string
+    // directly (no DOM mutation, no document resolve).
     let original_layout = {
         let node = doc.get_node(cand.element_id)?;
         let el = node.element_data()?;
@@ -412,25 +538,28 @@ fn prepare_one(
     };
 
     let budget = cand.content_w_css * scale;
-    let truncated = truncate_by_clusters(&original_text, &original_layout.layout, budget);
+    let font_size_css = first_run_font_size_css(&original_layout.layout, scale);
+    let brush = paint_brush_from_layout(&original_layout.layout, cand.element_id);
+    let ellipsis_adv = measure_ellipsis_advance(shaper, font_size_css, brush, scale);
+    let truncated = truncate_by_clusters(
+        &original_text,
+        &original_layout.layout,
+        budget,
+        ellipsis_adv,
+    );
     if truncated == original_text {
         return None;
     }
 
-    let originals: Vec<(NodeId, String)> = cand
-        .text_nodes
-        .iter()
-        .filter_map(|&tid| {
-            let content = doc.get_node(tid)?.text_data()?.content.clone();
-            Some((tid, content))
-        })
-        .collect();
-
-    set_combined_text_damaging(doc, &cand.text_nodes, &truncated);
-    resolve_extra(doc);
-
-    let truncated_layout = take_inline_layout(doc, cand.element_id)?;
-    write_text_no_damage(doc, &originals);
+    let truncated_layout = shape_text_layout(
+        shaper,
+        &truncated,
+        font_size_css,
+        brush,
+        scale,
+        Some(budget),
+        &original_layout,
+    );
 
     cache.by_node.insert(
         cand.element_id,
@@ -441,8 +570,6 @@ fn prepare_one(
         },
     );
 
-    // Document has no inline layout on this node until the caller installs the
-    // truncated one for paint; originals stay in `original_layout` for restore.
     Some(Prepared {
         original_layout,
         truncated_layout,
