@@ -202,6 +202,14 @@ struct LiveSurface {
     /// (toggle-on-flip-only). Must not grow on an edit that keeps the same
     /// changed/unchanged state.
     hx_changed_write_count: u64,
+    /// Graph review (PR #24 follow-up): Blitz style damage observed by
+    /// input-time resolves (`ensure_resolved`), carried into the next
+    /// paint's damage plan so it is not silently dropped. Without this, an
+    /// `ensure_resolved` triggered by a later input event (e.g. hit-testing
+    /// a pointer move) consumes the restyle-damage flags a prior greying /
+    /// `hx-changed` write set, before the host's next real `paint()` ever
+    /// gets to read them via its own `resolve_stylist` probe.
+    carried_style_damage: Vec<NodeId>,
     pending: PendingState,
     released_outcomes: Vec<InputOutcome>,
     hover_id: Option<String>,
@@ -1335,6 +1343,7 @@ impl LiveSurface {
             input_rules: Vec::new(),
             rule_disabled: HashMap::new(),
             hx_changed_write_count: 0,
+            carried_style_damage: Vec::new(),
             pending: PendingState::default(),
             released_outcomes: Vec::new(),
             hover_id: None,
@@ -1827,6 +1836,10 @@ impl LiveSurface {
                         && currently_aria
                         && current_reason.as_deref() == Some(r.as_str())
                 }
+                // An element an InputRule currently greys stays greyed; the
+                // rule pass owns clearing it (Graph review, PR #24 follow-up:
+                // this pass must not undo greying it does not own).
+                None if self.rule_disabled.contains_key(&elem_id) => true,
                 None => !currently_disabled && !currently_aria && current_reason.is_none(),
             };
             if !already_matches {
@@ -1856,6 +1869,19 @@ impl LiveSurface {
     fn apply_input_rules(&mut self, force_dom_pass: bool) {
         // Desired: element id -> (node, reason).
         let mut desired: HashMap<String, (NodeId, String)> = HashMap::new();
+        // Elements currently greyed by the actions slice (Disabled / clean
+        // RequiresChange): element id -> action reason. Used both to skip a
+        // genuinely host-authored `disabled` below and to hand a clearing
+        // element back to the action's own greying instead of enabling it
+        // outright (Graph review, PR #24 follow-up).
+        let action_greyed: HashMap<String, String> = self
+            .bindings
+            .values()
+            .filter_map(|b| {
+                let r = self.disabled_actions.get(b.hx_post.as_ref()?)?;
+                Some((b.id.clone(), r.clone()))
+            })
+            .collect();
         for (action, input_name, rule) in self.input_rules.clone() {
             let InputRule::EnabledWhen {
                 input,
@@ -1873,6 +1899,16 @@ impl LiveSurface {
                 }
                 for nid in named_controls_in_form(&self.doc, form_nid, &input_name) {
                     if let Some(eid) = self.element_id_of(nid) {
+                        // Host-authored `disabled`: never touch it. An
+                        // element already greyed by this pass or by the
+                        // actions slice is not host-authored — only a
+                        // `disabled` this engine did not itself set is.
+                        let host_disabled = self.attr(&eid, "disabled").is_some()
+                            && !self.rule_disabled.contains_key(&eid)
+                            && !action_greyed.contains_key(&eid);
+                        if host_disabled {
+                            continue;
+                        }
                         desired.insert(eid, (nid, reason.clone()));
                     }
                 }
@@ -1884,18 +1920,26 @@ impl LiveSurface {
             .map(|(k, (_, r))| (k.clone(), r.clone()))
             .collect();
         let map_changed = desired_reasons != self.rule_disabled;
-        if !map_changed && !force_dom_pass {
+        // Keep going whenever anything is currently desired-greyed, even if
+        // the desired-reasons map itself did not change: an earlier pass in
+        // the same call (`apply_disabled_map`) may have wrongly cleared a
+        // rule-greyed element before this pass got a chance to re-verify it
+        // (Graph review, PR #24 follow-up) — the per-element `already_matches`
+        // check below is what actually decides whether anything is rewritten.
+        if !map_changed && !force_dom_pass && desired.is_empty() {
             return;
         }
 
         let mut node_updates: Vec<(NodeId, Option<String>)> = Vec::new();
-        // Clear ids we previously greyed that are no longer desired.
+        // Clear ids we previously greyed that are no longer desired. Hand
+        // back to the actions slice if it still greys this element instead
+        // of enabling it outright (Graph review, PR #24 follow-up).
         for elem_id in self.rule_disabled.keys() {
             if desired.contains_key(elem_id) {
                 continue;
             }
             if let Some(nid) = self.doc.get_element_by_id(elem_id) {
-                node_updates.push((nid, None));
+                node_updates.push((nid, action_greyed.get(elem_id).cloned()));
             }
         }
         // Set/refresh ids that are desired and not already matching.
@@ -2146,6 +2190,16 @@ impl LiveSurface {
 
     fn ensure_resolved(&mut self) {
         if self.needs_resolve {
+            // Graph review (PR #24 follow-up): read restyle damage before
+            // this input-time resolve clears it, so attribute/class writes
+            // (greying, hx-changed, checked) made before the next paint
+            // still reach that paint's damage plan. Without this, the full
+            // `resolve_doc` below consumes Blitz's one-shot restyle flags,
+            // and `resolve_and_plan_damage`'s own `resolve_stylist` probe at
+            // paint time finds nothing left to report.
+            self.doc.resolve_stylist(0.0);
+            let carried = collect_style_damaged(&self.doc);
+            self.carried_style_damage.extend(carried);
             self.resolve_doc();
             self.needs_resolve = false;
         }
@@ -2584,6 +2638,14 @@ impl LiveSurface {
         ctx: &mut ActionCtx<'_>,
         ctrl: &FormControlRef,
     ) -> Option<InputOutcome> {
+        // Graph review (PR #24 follow-up): explicit damage for the committed
+        // control itself. Checked/selected state is element state Blitz
+        // paints directly at paint time, not necessarily something a CSS
+        // restyle flags as damage — so style damage alone can miss a
+        // checkbox/radio's own tick-mark redraw (unchecking then rechecking
+        // a gate left a stale partial repaint). Despite the name, this ink-
+        // box helper is generic, not text-specific (see its doc comment).
+        self.queue_text_field_damage(ctrl.node_id);
         self.mark_dom_dirty();
         self.mark_paint_dirty();
         if let Some(ref sid) = ctrl.element_id {
@@ -3951,13 +4013,21 @@ impl LiveSurface {
             ColorScheme::Light,
         ));
 
+        // Graph review (PR #24 follow-up): drain damage an input-time
+        // `ensure_resolved` already carried (its one-shot restyle flags are
+        // long gone by now). Merged into the probe below; a force-full /
+        // first paint discards it since the whole surface repaints anyway.
+        let carried = std::mem::take(&mut self.carried_style_damage);
+
         // Probe: public resolve_stylist first so Node::damage() is readable,
         // then full resolve (stylist is a no-op; layout + paint-tree run).
         let style_damaged = if force_full || !had_previous {
             Vec::new()
         } else {
             self.doc.resolve_stylist(0.0);
-            collect_style_damaged(&self.doc)
+            let mut v = collect_style_damaged(&self.doc);
+            v.extend(carried);
+            v
         };
 
         // Style + layout once. A second pass is allowed only when the hovered
