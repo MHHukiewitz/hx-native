@@ -1907,6 +1907,148 @@ fn r2_2_keyboard_recheck_gate_checkbox_no_stale_partial_repaint() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// R2-4 (Graph 18:55, blocker 4): a swap must not leave `rule_disabled` stale
+// for a replaced element id, or the first `apply_input_rules` pass after
+// the swap mistakes a freshly host-authored `disabled` for a leftover
+// engine-owned grey, and a later rule-clear strips it.
+// ---------------------------------------------------------------------------
+
+const GATE_SWAP_FORM: &str = r##"
+<form id="gs">
+  <input id="gsgate" type="checkbox" name="gsgate" style="display:block"/>
+  <section id="sec-gsdep" hx-trigger="slice:panel" hx-target="#gsdep" hx-swap="outerHTML">
+    <input id="gsdep" type="text" name="gsdep" value="x" style="display:block"/>
+  </section>
+  <button id="gssave" name="gssave" hx-post="settings.gssave" hx-trigger="click" style="display:block">Save</button>
+</form>"##;
+
+fn boot_gate_swap_form() -> Engine {
+    boot(GATE_SWAP_FORM, &["settings.gssave"])
+}
+
+fn gate_swap_rules() -> Vec<(String, String, InputRule)> {
+    vec![(
+        "settings.gssave".into(),
+        "gsdep".into(),
+        InputRule::EnabledWhen {
+            input: "gsgate".into(),
+            checked: true,
+            reason: "gate off".into(),
+        },
+    )]
+}
+
+/// `sync()` does one full render of every section on the first call, so
+/// `sec-gsdep` needs a matching initial `FragmentSource` body.
+fn initial_gate_swap_frags() -> Frags {
+    let mut frags = Frags::default();
+    frags.set(
+        "sec-gsdep",
+        r#"<input id="gsdep" type="text" name="gsdep" value="x" style="display:block"/>"#,
+    );
+    frags
+}
+
+/// A control that is rule-greyed, then re-rendered by a swap that authors
+/// `disabled` itself (no `data-hx-reason`): the swap must not leave the
+/// pre-swap `rule_disabled` entry claiming ownership of the new element, so
+/// when the rule later clears, the host's own `disabled` survives instead
+/// of being stripped.
+#[test]
+fn r2_4_host_disabled_after_swap_survives_rule_clear() {
+    let mut eng = boot_gate_swap_form();
+    let mut slices = Slices::new();
+    let mut frags = initial_gate_swap_frags();
+    slices.rules = gate_swap_rules();
+    slices.bump("actions");
+    eng.sync(&slices, &mut frags).unwrap();
+    assert!(
+        is_greyed(&eng, "gsdep", "gate off"),
+        "gate unchecked must rule-grey gsdep from the start"
+    );
+
+    // Host re-renders gsdep's section with its own authored `disabled`
+    // (no `data-hx-reason`) — the gate is still unchecked at this point.
+    frags.set(
+        "sec-gsdep",
+        r#"<input id="gsdep" type="text" name="gsdep" value="x" disabled style="display:block"/>"#,
+    );
+    slices.bump("panel");
+    eng.sync(&slices, &mut frags).unwrap();
+    assert!(eng.attr("gsdep", "disabled").is_some());
+
+    // Gate re-checked: the rule clears. The host's own disabled must survive.
+    let _ = click(&mut eng, "gsgate");
+    assert!(
+        eng.attr("gsdep", "disabled").is_some(),
+        "host-authored disabled on a swapped-in element must survive the rule clearing"
+    );
+    assert!(
+        eng.attr("gsdep", "data-hx-reason").is_none(),
+        "the host never authored data-hx-reason; the rule clearing must not leave a stale one either"
+    );
+}
+
+/// Inverse case: a control re-rendered by a swap *without* `disabled`,
+/// while the rule is still active (gate still off) — it must still be
+/// rule-greyed by the very next `apply_input_rules` pass.
+#[test]
+fn r2_4_rule_still_greys_control_rerendered_without_disabled() {
+    let mut eng = boot_gate_swap_form();
+    let mut slices = Slices::new();
+    let mut frags = initial_gate_swap_frags();
+    slices.rules = gate_swap_rules();
+    slices.bump("actions");
+    eng.sync(&slices, &mut frags).unwrap();
+    assert!(is_greyed(&eng, "gsdep", "gate off"));
+
+    // Host re-renders gsdep without `disabled` — gate is still unchecked.
+    frags.set(
+        "sec-gsdep",
+        r#"<input id="gsdep" type="text" name="gsdep" value="y" style="display:block"/>"#,
+    );
+    slices.bump("panel");
+    eng.sync(&slices, &mut frags).unwrap();
+    assert!(
+        is_greyed(&eng, "gsdep", "gate off"),
+        "the rule must still grey the re-rendered control since the gate is still off"
+    );
+}
+
+/// Action-level greying (not rule-level) must survive a swap that
+/// re-renders without the `disabled` attribute too — `disabled_actions` is
+/// action-name keyed, not element-id keyed, and needs no swap-time
+/// invalidation of its own (see `invalidate_rule_disabled_in`'s doc
+/// comment), but this confirms the next `apply_disabled_map` pass still
+/// re-asserts it from live DOM state regardless.
+#[test]
+fn r2_4_action_disabled_survives_swap_without_host_disabled() {
+    let mut eng = boot_swappable_form();
+    let mut slices = Slices::new();
+    let mut frags = initial_swappable_frags();
+    slices.actions = vec![(
+        "settings.apply2b".into(),
+        ActionState::Disabled {
+            reason: "busy".into(),
+        },
+    )];
+    slices.bump("actions");
+    eng.sync(&slices, &mut frags).unwrap();
+    assert!(is_greyed(&eng, "apply2b", "busy"));
+
+    // Re-render the form's section with the same markup (never authors
+    // `disabled`) — the action is still Disabled.
+    frags.set("sec-f2", F2_BASE_HTML);
+    slices.bump("panel");
+    eng.sync(&slices, &mut frags).unwrap();
+    assert!(
+        is_greyed(&eng, "apply2b", "busy"),
+        "action-level Disabled greying must survive a swap that re-renders without the \
+         attribute, via the next apply_disabled_map pass"
+    );
+}
+
 const OVERLAP_FORM: &str = r##"
 <form id="o">
   <input id="g" type="checkbox" name="g" checked style="display:block"/>

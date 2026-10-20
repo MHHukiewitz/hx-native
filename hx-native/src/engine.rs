@@ -1624,6 +1624,11 @@ impl LiveSurface {
         // invalidate before mutating so the next evaluation recaptures it
         // from the post-swap values (unless `data-hx-applied` overrides it).
         self.invalidate_form_baselines_in(target_id);
+        // Blocker 4 (Graph re-review, PR #24 round 2): same invalidate-
+        // before-mutate treatment for rule-greyed element ids, so a
+        // re-authored host `disabled` on the swapped-in markup is never
+        // mistaken for a stale engine-owned grey.
+        self.invalidate_rule_disabled_in(target_id);
 
         // Record old subtree ink from the last paint snapshot (no resolve here —
         // sync must not run style/layout). compute_plan merges these so old
@@ -2034,6 +2039,45 @@ impl LiveSurface {
             .collect();
         for id in stale {
             self.form_baselines.remove(&id);
+        }
+    }
+
+    /// Blocker 4 (Graph re-review, PR #24 round 2): drop any `rule_disabled`
+    /// entry for an element id inside `target_id`'s pre-swap subtree (or
+    /// `target_id` itself), so the first `apply_input_rules` pass after the
+    /// swap reads the new markup's `disabled` (if any) as host-authored,
+    /// not as a stale engine-owned grey left over from that id's pre-swap
+    /// occupant. Mirrors `invalidate_form_baselines_in`'s pre-mutation
+    /// invalidation (same filter, same call site). Without this, `dep`'s
+    /// `host_disabled` check in `apply_input_rules`
+    /// (`attr(disabled) && !rule_disabled.contains_key && …`) sees the
+    /// stale `rule_disabled` entry for a freshly-swapped-in element that
+    /// now carries a genuinely host-authored `disabled`, concludes it is
+    /// *not* host-authored, takes ownership, and later strips it (along
+    /// with `data-hx-reason`) the next time the rule clears.
+    ///
+    /// `disabled_actions` needs no equivalent: it is keyed by **action
+    /// name**, not element id (`apply_disabled_map` always fully
+    /// reassigns it from a fresh recompute every pass), and the
+    /// action-name → element-id lookup it feeds goes through
+    /// `self.bindings`, which `reindex_bindings` already rebuilds from
+    /// scratch on every swap.
+    fn invalidate_rule_disabled_in(&mut self, target_id: NodeId) {
+        if self.rule_disabled.is_empty() {
+            return;
+        }
+        let stale: Vec<String> = self
+            .rule_disabled
+            .keys()
+            .filter(|elem_id| {
+                self.doc
+                    .get_element_by_id(elem_id)
+                    .is_some_and(|nid| nid == target_id || self.is_descendant(target_id, nid))
+            })
+            .cloned()
+            .collect();
+        for id in stale {
+            self.rule_disabled.remove(&id);
         }
     }
 
