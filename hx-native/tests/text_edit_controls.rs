@@ -413,8 +413,10 @@ fn right_click_text_field_closes_open_select() {
 
 #[test]
 fn number_step_clamps_beyond_safe_integer() {
+    // Twenty nines in the attribute (not pre-clamped): old `as i64` step math
+    // saturates then panics on add in debug / wraps in release.
     let html = r#"<!DOCTYPE html><html><body>
-<input id="big" type="number" name="big" value="9007199254740992" step="1"
+<input id="big" type="number" name="big" value="99999999999999999999" step="1"
        hx-post="set.big" hx-trigger="change"
        style="width:200px;height:22px"/>
 </body></html>"#;
@@ -526,6 +528,49 @@ fn type_focus_damage_overlaps_ink_all_scales() {
             );
         }
     }
+}
+
+/// Mutation: `absolute_position` in `caret_device_rect` → blink damage misses the
+/// transformed field box (parity alone can still pass — both paths use the bug).
+#[test]
+fn caret_blink_damage_overlaps_transformed_field() {
+    let scale = 2.0;
+    let mut e = boot(true, scale);
+    let _ = click(&mut e, "t");
+    let box_css = e.test_element_box("t").unwrap();
+    let _ = e.paint(vp(scale)).unwrap();
+    e.test_force_caret_blink();
+    let p = e.paint(vp(scale)).unwrap();
+    assert!(
+        !p.skipped && damage_overlaps_box(&p.damage, box_css, scale),
+        "blink damage must cover transform-aware field (not absolute_position); \
+         box={box_css:?} damage={:?}",
+        p.damage
+    );
+}
+
+/// Mutation: skip previous-caret `push_pending_damage` → seeded last_caret_rect
+/// is absent from the blink paint's damage list.
+#[test]
+fn caret_blink_damages_previous_caret_rect() {
+    let scale = 1.0;
+    let mut e = boot(false, scale);
+    let _ = click(&mut e, "t");
+    let _ = e.paint(vp(scale)).unwrap();
+    // Seed a previous caret far from the live caret but on-surface.
+    e.test_set_last_caret_rect(5, 5, 4, 14);
+    e.test_force_caret_blink();
+    let p = e.paint(vp(scale)).unwrap();
+    assert!(!p.skipped, "blink must paint");
+    let hit = p
+        .damage
+        .iter()
+        .any(|r| r.x < 9.0 && r.x + r.width > 5.0 && r.y < 19.0 && r.y + r.height > 5.0);
+    assert!(
+        hit,
+        "blink must damage the previous caret rect; damage={:?}",
+        p.damage
+    );
 }
 
 #[test]

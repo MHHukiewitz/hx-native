@@ -1182,6 +1182,21 @@ impl Engine {
         }
     }
 
+    /// Test helper: seed `last_caret_rect` so the next blink must damage it
+    /// (catches mutations that drop previous-caret damage).
+    #[doc(hidden)]
+    pub fn test_set_last_caret_rect(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        if let Some(live) = self
+            .surfaces
+            .get_mut(&SurfaceId::DEFAULT)
+            .and_then(|s| s.live.as_mut())
+        {
+            if let Some(session) = live.text_edit.as_mut() {
+                session.last_caret_rect = Some(IntRect { x, y, w, h });
+            }
+        }
+    }
+
     /// Test helper: whether the caret is in the visible blink phase.
     pub fn test_caret_visible(&self) -> Option<bool> {
         self.live(SurfaceId::DEFAULT)
