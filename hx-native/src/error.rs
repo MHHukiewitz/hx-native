@@ -4,6 +4,12 @@ use std::fmt;
 
 use crate::types::SurfaceId;
 
+/// `#[non_exhaustive]` (PR27 round 2, one-time breaking change): new
+/// variants (e.g. `UnknownLimitInput` / `InvalidInputLimits`, issue #16) must
+/// not break an exhaustive `match` in Mainnet or other downstream crates
+/// going forward. A `match` without a wildcard arm needs one added once, for
+/// this change.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EngineError {
     /// `hx-post` names an action not passed to `declare_actions`.

@@ -157,20 +157,12 @@ fn limits_from_slice_appear_on_range_and_number_inputs() {
             (
                 "settings.apply",
                 "volume",
-                InputLimits {
-                    min: 0.0,
-                    max: 10.0,
-                    step: None,
-                },
+                InputLimits::new(0.0, 10.0, None),
             ),
             (
                 "settings.apply",
                 "fee",
-                InputLimits {
-                    min: 0.0,
-                    max: 5.0,
-                    step: Some(0.01),
-                },
+                InputLimits::new(0.0, 5.0, Some(0.01)),
             ),
         ]),
         limits_calls: Arc::new(Mutex::new(0)),
@@ -211,11 +203,7 @@ fn changing_limits_reclamps_and_recalls_only_on_version_change() {
         limits: limits_for(vec![(
             "settings.apply",
             "volume",
-            InputLimits {
-                min: 0.0,
-                max: 10.0,
-                step: None,
-            },
+            InputLimits::new(0.0, 10.0, None),
         )]),
         limits_calls: calls.clone(),
     };
@@ -242,11 +230,7 @@ fn changing_limits_reclamps_and_recalls_only_on_version_change() {
         limits: limits_for(vec![(
             "settings.apply",
             "volume",
-            InputLimits {
-                min: 0.0,
-                max: 3.0,
-                step: None,
-            },
+            InputLimits::new(0.0, 3.0, None),
         )]),
         limits_calls: calls.clone(),
     };
@@ -282,11 +266,7 @@ fn swap_reapplies_cached_limits_without_new_input_limits_call() {
     let limits = limits_for(vec![(
         "settings.apply",
         "volume",
-        InputLimits {
-            min: 0.0,
-            max: 10.0,
-            step: None,
-        },
+        InputLimits::new(0.0, 10.0, None),
     )]);
     let slices = LimitsSlices {
         versions: HashMap::from([("actions".into(), 1), ("ui".into(), 1)]),
@@ -362,11 +342,7 @@ fn drag_past_max_clamps_posted_args_to_slice_limit() {
     let slices = one_limit(
         "settings.apply",
         "volume",
-        InputLimits {
-            min: 0.0,
-            max: 10.0,
-            step: None,
-        },
+        InputLimits::new(0.0, 10.0, None),
     );
     let mut frags = Frags::default();
     eng.sync(&slices, &mut frags).unwrap();
@@ -416,11 +392,7 @@ fn typed_out_of_range_commit_clamps_to_slice_limit() {
     let slices = one_limit(
         "settings.apply",
         "fee",
-        InputLimits {
-            min: 0.0,
-            max: 5.0,
-            step: Some(1.0),
-        },
+        InputLimits::new(0.0, 5.0, Some(1.0)),
     );
     let mut frags = Frags::default();
     eng.sync(&slices, &mut frags).unwrap();
@@ -448,11 +420,7 @@ fn arrow_step_stops_at_slice_bounds() {
     let slices = one_limit(
         "settings.apply",
         "fee",
-        InputLimits {
-            min: 0.0,
-            max: 5.0,
-            step: Some(1.0),
-        },
+        InputLimits::new(0.0, 5.0, Some(1.0)),
     );
     let mut frags = Frags::default();
     eng.sync(&slices, &mut frags).unwrap();
@@ -481,11 +449,7 @@ fn spin_step_clamps_to_slice_bounds() {
     let slices = one_limit(
         "settings.apply",
         "fee",
-        InputLimits {
-            min: 0.0,
-            max: 5.0,
-            step: Some(1.0),
-        },
+        InputLimits::new(0.0, 5.0, Some(1.0)),
     );
     let mut frags = Frags::default();
     eng.sync(&slices, &mut frags).unwrap();
@@ -510,15 +474,7 @@ fn unknown_input_name_fails_sync() {
 </form>
 "#;
     let mut eng = boot(html, &["settings.apply"]);
-    let slices = one_limit(
-        "settings.apply",
-        "nope",
-        InputLimits {
-            min: 0.0,
-            max: 10.0,
-            step: None,
-        },
-    );
+    let slices = one_limit("settings.apply", "nope", InputLimits::new(0.0, 10.0, None));
     let mut frags = Frags::default();
     let err = eng
         .sync(&slices, &mut frags)
@@ -547,11 +503,7 @@ fn limits_for_action_with_no_rendered_form_is_not_an_error() {
     let slices = one_limit(
         "other.action",
         "whatever",
-        InputLimits {
-            min: 0.0,
-            max: 10.0,
-            step: None,
-        },
+        InputLimits::new(0.0, 10.0, None),
     );
     let mut frags = Frags::default();
     eng.sync(&slices, &mut frags)
@@ -566,32 +518,21 @@ fn invalid_limits_fail_sync() {
   <button id="save" hx-post="settings.apply" hx-trigger="click">Save</button>
 </form>
 "#;
+    const MAX_SAFE: f64 = 9_007_199_254_740_992.0; // 2^53
     let bad = [
-        InputLimits {
-            min: 10.0,
-            max: 0.0,
-            step: None,
-        }, // min > max
-        InputLimits {
-            min: 0.0,
-            max: 10.0,
-            step: Some(0.0),
-        }, // step == 0
-        InputLimits {
-            min: 0.0,
-            max: 10.0,
-            step: Some(-1.0),
-        }, // step < 0
-        InputLimits {
-            min: f64::NAN,
-            max: 10.0,
-            step: None,
-        }, // non-finite min
-        InputLimits {
-            min: 0.0,
-            max: f64::INFINITY,
-            step: None,
-        }, // non-finite max
+        InputLimits::new(10.0, 0.0, None),          // min > max
+        InputLimits::new(0.0, 10.0, Some(0.0)),     // step == 0
+        InputLimits::new(0.0, 10.0, Some(-1.0)),    // step < 0
+        InputLimits::new(f64::NAN, 10.0, None),     // non-finite min
+        InputLimits::new(0.0, f64::INFINITY, None), // non-finite max
+        // Blocker 2 (PR27 round 2): beyond ±2^53 is rejected at validation.
+        // (`MAX_SAFE + 1.0` rounds right back to `MAX_SAFE` in f64 — not
+        // actually beyond the boundary — so use a value clearly distinct.)
+        InputLimits::new(0.0, MAX_SAFE * 2.0, None),
+        InputLimits::new(-(MAX_SAFE * 2.0), 0.0, None),
+        InputLimits::new(0.0, 1e300, None),
+        // Blocker 2: below the 1e-10 step floor is rejected at validation.
+        InputLimits::new(0.0, 10.0, Some(1e-11)),
     ];
     for limits in bad {
         let mut eng = boot(html, &["settings.apply"]);
@@ -605,6 +546,32 @@ fn invalid_limits_fail_sync() {
             "got {err:?} for {limits:?}"
         );
     }
+}
+
+/// Blocker 2 (PR27 round 2): values and steps right at the accepted
+/// boundaries (±2^53, step == 1e-10) must format correctly — no `i64`
+/// wraparound, no "rounds to 0" precision loss for a tiny-but-valid step.
+#[test]
+fn limits_at_safe_boundaries_format_correctly() {
+    const MAX_SAFE: f64 = 9_007_199_254_740_992.0; // 2^53
+    let html = r#"
+<form id="f">
+  <input id="vol" type="range" name="volume" value="5" />
+  <button id="save" hx-post="settings.apply" hx-trigger="click">Save</button>
+</form>
+"#;
+    let mut eng = boot(html, &["settings.apply"]);
+    let slices = one_limit(
+        "settings.apply",
+        "volume",
+        InputLimits::new(-MAX_SAFE, MAX_SAFE, Some(1e-10)),
+    );
+    let mut frags = Frags::default();
+    eng.sync(&slices, &mut frags)
+        .expect("boundary limits must be accepted");
+    assert_eq!(eng.attr("vol", "min").as_deref(), Some("-9007199254740992"));
+    assert_eq!(eng.attr("vol", "max").as_deref(), Some("9007199254740992"));
+    assert_eq!(eng.attr("vol", "step").as_deref(), Some("0.0000000001"));
 }
 
 // ---------------------------------------------------------------------------
@@ -623,11 +590,7 @@ fn slice_limits_overwrite_markup() {
     let slices = one_limit(
         "settings.apply",
         "volume",
-        InputLimits {
-            min: 0.0,
-            max: 200.0,
-            step: Some(5.0),
-        },
+        InputLimits::new(0.0, 200.0, Some(5.0)),
     );
     let mut frags = Frags::default();
     eng.sync(&slices, &mut frags).unwrap();
@@ -659,11 +622,7 @@ fn clamp_on_limit_change_emits_no_action_and_regroups_display() {
     let slices = one_limit(
         "settings.apply",
         "fee",
-        InputLimits {
-            min: 0.0,
-            max: 1_000_000.0,
-            step: None,
-        },
+        InputLimits::new(0.0, 1_000_000.0, None),
     );
     let mut frags = Frags::default();
     eng.sync(&slices, &mut frags).unwrap();
@@ -679,11 +638,7 @@ fn clamp_on_limit_change_emits_no_action_and_regroups_display() {
         limits: limits_for(vec![(
             "settings.apply",
             "fee",
-            InputLimits {
-                min: 0.0,
-                max: 50_000.0,
-                step: None,
-            },
+            InputLimits::new(0.0, 50_000.0, None),
         )]),
         limits_calls: Arc::new(Mutex::new(0)),
     };
@@ -744,11 +699,7 @@ fn run_limits_damage_partial_eq_full(scale: f64) {
     let limits = limits_for(vec![(
         "settings.apply",
         "volume",
-        InputLimits {
-            min: 0.0,
-            max: 3.0,
-            step: None,
-        },
+        InputLimits::new(0.0, 3.0, None),
     )]);
 
     let mut eng = Engine::new(cfg());
@@ -835,20 +786,14 @@ fn worker_html() -> String {
 fn limits_packet(actions_ver: u64, max: f64) -> SyncPacket {
     let mut versions = HashMap::new();
     versions.insert("actions".into(), actions_ver);
-    SyncPacket {
-        versions,
-        actions: Vec::new(),
-        fragments: HashMap::new(),
-        input_limits: vec![(
-            "settings.apply".into(),
-            "volume".into(),
-            InputLimits {
-                min: 0.0,
-                max,
-                step: None,
-            },
-        )],
-    }
+    let mut pkt = SyncPacket::default();
+    pkt.versions = versions;
+    pkt.input_limits = vec![(
+        "settings.apply".into(),
+        "volume".into(),
+        InputLimits::new(0.0, max, None),
+    )];
+    pkt
 }
 
 /// Deterministic (no thread timing involved): `merge_per_slice` must keep an
@@ -856,33 +801,134 @@ fn limits_packet(actions_ver: u64, max: f64) -> SyncPacket {
 /// (Game's "hand them over once" design), and must adopt a newer non-empty
 /// `input_limits` over an older one.
 #[test]
-fn merge_per_slice_keeps_input_limits_across_coalesced_packets() {
+fn merge_per_slice_replaces_actions_slice_as_a_whole() {
     let mut older = SyncPacket::default();
     older.versions.insert("actions".into(), 1);
+    older.actions = vec![(
+        "other.act".into(),
+        ActionState::Disabled { reason: "x".into() },
+    )];
     older.input_limits = vec![(
         "settings.apply".into(),
         "volume".into(),
-        InputLimits {
-            min: 0.0,
-            max: 3.0,
-            step: None,
-        },
+        InputLimits::new(0.0, 3.0, None),
     )];
 
-    let mut newer_empty = SyncPacket::default();
-    newer_empty.versions.insert("ticker".into(), 2);
-    older.merge_per_slice(newer_empty.clone());
+    // A newer packet that never touches the "actions" key (e.g. a
+    // ticker-only bump) leaves the reserved actions slice untouched.
+    let mut newer_ticker_only = SyncPacket::default();
+    newer_ticker_only.versions.insert("ticker".into(), 2);
+    older.merge_per_slice(newer_ticker_only);
     assert_eq!(
         older.input_limits.len(),
         1,
-        "a newer packet with empty input_limits must not drop the older ones"
+        "ticker-only bump must not touch input_limits"
+    );
+    assert_eq!(
+        older.actions.len(),
+        1,
+        "ticker-only bump must not touch actions"
     );
 
-    let newer_with_limits = limits_packet(1, 9.0);
+    // A newer packet that *does* bump "actions" but carries empty
+    // actions/input_limits is a deliberate clear (PR27 round 2 fix for the
+    // same keep-when-empty bug Graph found on #24) — both get wiped, not
+    // kept.
+    let mut newer_clear = SyncPacket::default();
+    newer_clear.versions.insert("actions".into(), 2);
+    older.merge_per_slice(newer_clear);
+    assert!(
+        older.input_limits.is_empty(),
+        "an actions-version bump with empty input_limits must clear it, not keep the old list"
+    );
+    assert!(
+        older.actions.is_empty(),
+        "an actions-version bump with empty actions must clear it, not keep the old list"
+    );
+
+    // A newer non-empty packet (also bumping "actions") replaces both.
+    let newer_with_limits = limits_packet(3, 9.0);
     older.merge_per_slice(newer_with_limits.clone());
     assert_eq!(
         older.input_limits, newer_with_limits.input_limits,
         "a newer non-empty input_limits must win"
+    );
+}
+
+/// The task's own equivalence requirement: coalescing two queued packets
+/// into one `merge_per_slice` call, then syncing once, must land the engine
+/// in the same observable state (greyed attrs + min/max/step) as applying
+/// the two packets one at a time through two separate `Engine::sync` calls.
+#[test]
+fn merge_per_slice_matches_sequential_engine_sync() {
+    let html = r#"
+<form id="f">
+  <input id="vol" type="range" name="volume" value="5" />
+  <button id="save" hx-post="settings.apply" hx-trigger="click">Save</button>
+</form>
+<button id="ob" hx-post="other.act" hx-trigger="click">Other</button>
+"#;
+    let wrapped = format!("<!DOCTYPE html><html><body>{html}</body></html>");
+
+    let mut p1 = SyncPacket::default();
+    p1.versions.insert("actions".into(), 1);
+    p1.actions = vec![(
+        "other.act".into(),
+        ActionState::Disabled {
+            reason: "busy".into(),
+        },
+    )];
+    p1.input_limits = vec![(
+        "settings.apply".into(),
+        "volume".into(),
+        InputLimits::new(0.0, 10.0, None),
+    )];
+
+    let mut p2 = SyncPacket::default();
+    p2.versions.insert("actions".into(), 2);
+    p2.actions = Vec::new(); // clears the greying
+    p2.input_limits = Vec::new(); // clears the limits too
+
+    // Sequential: two separate Engine::sync calls.
+    let mut seq_eng = Engine::new(cfg());
+    seq_eng.declare_actions(&["settings.apply", "other.act"]);
+    seq_eng.load_html(&wrapped).unwrap();
+    let mut sp1 = p1.clone();
+    let s1 = sp1.clone();
+    seq_eng.sync(&s1, &mut sp1).unwrap();
+    let mut sp2 = p2.clone();
+    let s2 = sp2.clone();
+    seq_eng.sync(&s2, &mut sp2).unwrap();
+
+    // Coalesced: merge into one packet, one Engine::sync call.
+    let mut merged = p1;
+    merged.merge_per_slice(p2);
+    let mut merge_eng = Engine::new(cfg());
+    merge_eng.declare_actions(&["settings.apply", "other.act"]);
+    merge_eng.load_html(&wrapped).unwrap();
+    let mut mp = merged.clone();
+    let ms = mp.clone();
+    merge_eng.sync(&ms, &mut mp).unwrap();
+
+    assert_eq!(
+        seq_eng.attr("ob", "disabled"),
+        merge_eng.attr("ob", "disabled"),
+        "disabled attr must match between sequential and coalesced sync"
+    );
+    assert_eq!(
+        seq_eng.attr("vol", "min"),
+        merge_eng.attr("vol", "min"),
+        "min attr must match between sequential and coalesced sync"
+    );
+    assert_eq!(
+        seq_eng.attr("vol", "max"),
+        merge_eng.attr("vol", "max"),
+        "max attr must match between sequential and coalesced sync"
+    );
+    assert_eq!(
+        seq_eng.attr("vol", "step"),
+        merge_eng.attr("vol", "step"),
+        "step attr must match between sequential and coalesced sync"
     );
 }
 
@@ -957,5 +1003,262 @@ fn worker_coalesced_syncs_keep_input_limits() {
     assert_eq!(
         worker_img.pixels, eng_img.pixels,
         "worker must keep coalesced input_limits (merge_per_slice must not drop them)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PR27 round 2: blockers and non-blocking items.
+// ---------------------------------------------------------------------------
+
+/// Blocker 1: `step: None` writes `step="any"`, and typed decimal commits
+/// must be accepted as typed, not snapped to an integer grid.
+#[test]
+fn step_none_accepts_typed_decimal_without_snapping() {
+    let html = r#"
+<form id="f">
+  <input id="fee" type="number" name="fee" value="4" />
+  <button id="save" hx-post="settings.apply" hx-trigger="click">Save</button>
+</form>
+"#;
+    let mut eng = boot(html, &["settings.apply"]);
+    let slices = one_limit("settings.apply", "fee", InputLimits::new(0.0, 10.0, None));
+    let mut frags = Frags::default();
+    eng.sync(&slices, &mut frags).unwrap();
+    assert_eq!(eng.attr("fee", "step").as_deref(), Some("any"));
+
+    eng.test_set_focus("fee");
+    let _ = key(&mut eng, "End");
+    let _ = eng.input(InputEvent::Text(".3".into()));
+    assert_eq!(
+        eng.test_editor_display("fee").as_deref(),
+        Some("4.3"),
+        "typed '.3' after 4 must be accepted as 4.3, the decimal point must not be rejected"
+    );
+    let _ = key(&mut eng, "Enter");
+    assert_eq!(
+        eng.attr("fee", "value").as_deref(),
+        Some("4.3"),
+        "committed value must stay 4.3, not snap to an integer grid"
+    );
+}
+
+/// Blocker 1: arrow stepping still moves by 1 even when `step` is `None`,
+/// and does not snap the result to any grid (preserves the fraction).
+#[test]
+fn step_none_arrow_still_steps_by_one_without_snapping() {
+    let html = r#"
+<form id="f">
+  <input id="fee" type="number" name="fee" value="4.3" />
+  <button id="save" hx-post="settings.apply" hx-trigger="click">Save</button>
+</form>
+"#;
+    let mut eng = boot(html, &["settings.apply"]);
+    let slices = one_limit("settings.apply", "fee", InputLimits::new(0.0, 10.0, None));
+    let mut frags = Frags::default();
+    eng.sync(&slices, &mut frags).unwrap();
+    eng.test_set_focus("fee");
+    let _ = key(&mut eng, "ArrowUp");
+    assert_eq!(
+        eng.attr("fee", "value").as_deref(),
+        Some("5.3"),
+        "arrow must step by 1 and keep the fractional part (no grid snap)"
+    );
+}
+
+/// Blocker 3: an unknown input alongside a valid one fails the whole sync
+/// without half-applying the valid entry; a later corrected sync applies.
+#[test]
+fn unknown_input_error_is_atomic_then_corrected_sync_applies() {
+    let html = r#"
+<form id="f">
+  <input id="vol" type="range" name="volume" value="5" />
+  <button id="save" hx-post="settings.apply" hx-trigger="click">Save</button>
+</form>
+"#;
+    let mut eng = boot(html, &["settings.apply"]);
+    let bad = LimitsSlices {
+        versions: HashMap::from([("actions".into(), 1)]),
+        actions: Vec::new(),
+        limits: limits_for(vec![
+            ("settings.apply", "volume", InputLimits::new(0.0, 3.0, None)),
+            ("settings.apply", "nosuch", InputLimits::new(0.0, 3.0, None)),
+        ]),
+        limits_calls: Arc::new(Mutex::new(0)),
+    };
+    let mut frags = Frags::default();
+    let err = eng
+        .sync(&bad, &mut frags)
+        .expect_err("unknown input must fail the whole sync");
+    assert!(matches!(err, EngineError::UnknownLimitInput { .. }));
+    assert_eq!(
+        eng.attr("vol", "min"),
+        None,
+        "the valid entry must not be half-applied"
+    );
+    assert_eq!(eng.attr("vol", "max"), None, "nor its max");
+    assert_eq!(
+        eng.attr("vol", "value").as_deref(),
+        Some("5"),
+        "value must stay untouched"
+    );
+
+    let good = one_limit("settings.apply", "volume", InputLimits::new(0.0, 3.0, None));
+    eng.sync(&good, &mut frags)
+        .expect("a later corrected sync must apply");
+    assert_eq!(eng.attr("vol", "min").as_deref(), Some("0"));
+    assert_eq!(eng.attr("vol", "max").as_deref(), Some("3"));
+    assert_eq!(
+        eng.attr("vol", "value").as_deref(),
+        Some("3"),
+        "5 must now clamp to the corrected max"
+    );
+}
+
+/// Blocker 3: a failed sync must not record the `actions` version, so a
+/// retry with the same (still-bad) packet re-calls `input_limits` again
+/// instead of silently skipping it.
+#[test]
+fn failed_sync_does_not_record_actions_version() {
+    let html = r#"
+<form id="f">
+  <input id="vol" type="range" name="volume" value="5" />
+  <button id="save" hx-post="settings.apply" hx-trigger="click">Save</button>
+</form>
+"#;
+    let mut eng = boot(html, &["settings.apply"]);
+    let calls = Arc::new(Mutex::new(0));
+    let bad = LimitsSlices {
+        versions: HashMap::from([("actions".into(), 1)]),
+        actions: Vec::new(),
+        limits: limits_for(vec![(
+            "settings.apply",
+            "nosuch",
+            InputLimits::new(0.0, 3.0, None),
+        )]),
+        limits_calls: calls.clone(),
+    };
+    let mut frags = Frags::default();
+    let _ = eng
+        .sync(&bad, &mut frags)
+        .expect_err("unknown input must fail sync");
+    assert_eq!(*calls.lock().unwrap(), 1);
+
+    let _ = eng
+        .sync(&bad, &mut frags)
+        .expect_err("still fails: the input is still unknown");
+    assert_eq!(
+        *calls.lock().unwrap(),
+        2,
+        "a failed sync must not record the actions version, so the retry recalls input_limits"
+    );
+}
+
+/// Blocker 4: an empty number field stays empty — applying limits must not
+/// write `min` into it. `min`/`max`/`step` still apply so a later typed
+/// value is validated against them.
+#[test]
+fn empty_number_field_stays_empty_after_limits_apply() {
+    let html = r#"
+<form id="f">
+  <input id="fee" type="number" name="fee" value="" />
+  <button id="save" hx-post="settings.apply" hx-trigger="click">Save</button>
+</form>
+"#;
+    let mut eng = boot(html, &["settings.apply"]);
+    let slices = one_limit(
+        "settings.apply",
+        "fee",
+        InputLimits::new(3.0, 10.0, Some(1.0)),
+    );
+    let mut frags = Frags::default();
+    eng.sync(&slices, &mut frags).unwrap();
+    assert_eq!(
+        eng.attr("fee", "value").as_deref(),
+        Some(""),
+        "an empty number field must stay empty, not get filled with min"
+    );
+    assert_eq!(eng.attr("fee", "min").as_deref(), Some("3"));
+    assert_eq!(eng.attr("fee", "max").as_deref(), Some("10"));
+}
+
+/// Non-blocking: when a later `input_limits()` no longer lists an input
+/// that earlier got limits, the engine removes them — restoring markup
+/// min/max/step if it recorded any, or clearing the attributes otherwise.
+#[test]
+fn removed_limits_restore_markup_or_clear_when_absent() {
+    let html_with_markup = r#"
+<form id="f">
+  <input id="vol" type="range" name="volume" value="5" min="1" max="9" step="2" />
+  <button id="save" hx-post="settings.apply" hx-trigger="click">Save</button>
+</form>
+"#;
+    let mut eng = boot(html_with_markup, &["settings.apply"]);
+    let slices = one_limit(
+        "settings.apply",
+        "volume",
+        InputLimits::new(0.0, 100.0, Some(10.0)),
+    );
+    let mut frags = Frags::default();
+    eng.sync(&slices, &mut frags).unwrap();
+    assert_eq!(eng.attr("vol", "max").as_deref(), Some("100"));
+
+    let slices2 = LimitsSlices {
+        versions: HashMap::from([("actions".into(), 2)]),
+        actions: Vec::new(),
+        limits: Vec::new(), // "volume" is no longer listed
+        limits_calls: Arc::new(Mutex::new(0)),
+    };
+    eng.sync(&slices2, &mut frags).unwrap();
+    assert_eq!(
+        eng.attr("vol", "min").as_deref(),
+        Some("1"),
+        "markup min must be restored"
+    );
+    assert_eq!(
+        eng.attr("vol", "max").as_deref(),
+        Some("9"),
+        "markup max must be restored"
+    );
+    assert_eq!(
+        eng.attr("vol", "step").as_deref(),
+        Some("2"),
+        "markup step must be restored"
+    );
+
+    let html_no_markup = r#"
+<form id="f">
+  <input id="vol" type="range" name="volume" value="5" />
+  <button id="save" hx-post="settings.apply" hx-trigger="click">Save</button>
+</form>
+"#;
+    let mut eng2 = boot(html_no_markup, &["settings.apply"]);
+    let slices3 = one_limit(
+        "settings.apply",
+        "volume",
+        InputLimits::new(0.0, 100.0, Some(10.0)),
+    );
+    eng2.sync(&slices3, &mut frags).unwrap();
+    assert_eq!(eng2.attr("vol", "max").as_deref(), Some("100"));
+    let slices4 = LimitsSlices {
+        versions: HashMap::from([("actions".into(), 2)]),
+        actions: Vec::new(),
+        limits: Vec::new(),
+        limits_calls: Arc::new(Mutex::new(0)),
+    };
+    eng2.sync(&slices4, &mut frags).unwrap();
+    assert_eq!(
+        eng2.attr("vol", "min"),
+        None,
+        "no markup to restore to: min must be cleared"
+    );
+    assert_eq!(
+        eng2.attr("vol", "max"),
+        None,
+        "no markup to restore to: max must be cleared"
+    );
+    assert_eq!(
+        eng2.attr("vol", "step"),
+        None,
+        "no markup to restore to: step must be cleared"
     );
 }

@@ -50,12 +50,10 @@ fn packet(ticker_ver: u64, cell: &str) -> SyncPacket {
     versions.insert("actions".into(), 1);
     let mut fragments = HashMap::new();
     fragments.insert("sec".into(), format!(r#"<div id="cell">{cell}</div>"#));
-    SyncPacket {
-        versions,
-        actions: Vec::new(),
-        fragments,
-        input_limits: Vec::new(),
-    }
+    let mut pkt = SyncPacket::default();
+    pkt.versions = versions;
+    pkt.fragments = fragments;
+    pkt
 }
 
 fn click_at(x: f32, y: f32) -> [InputEvent; 3] {

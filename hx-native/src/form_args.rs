@@ -118,7 +118,8 @@ pub fn is_range_input(node: &Node) -> bool {
 /// Step a number/range control by `dir` (±1) × `step`, clamp, snap, write `value`.
 /// Returns `true` when the attribute changed.
 ///
-/// Uses integer scaled arithmetic so `2.20 + 0.01` stays `2.21` (no float drift).
+/// Uses decimal-rounded math so `2.20 + 0.01` stays `2.21` (no float drift),
+/// without ever going through an integer-scaled (`i64`) intermediate.
 pub fn step_numeric_value(doc: &mut HtmlDocument, id: &str, dir: i32) -> bool {
     let Some(nid) = doc.get_element_by_id(id) else {
         return false;
@@ -144,74 +145,45 @@ fn clamp_safe_number(v: f64) -> f64 {
     v.clamp(-MAX_SAFE_NUMBER, MAX_SAFE_NUMBER)
 }
 
-fn scale_to_i64(v: f64, scale: i64) -> Option<i64> {
-    let scaled = clamp_safe_number(v) * scale as f64;
-    if !scaled.is_finite() || scaled.abs() > i64::MAX as f64 {
-        return None;
+/// Round `v` to `decimals` places via a decimal-string round-trip. No `i64`
+/// intermediate anywhere, so there is no overflow/wraparound boundary to hit
+/// for any finite `v` — `format!` on `f64` never panics or saturates.
+fn round_decimal(v: f64, decimals: usize) -> f64 {
+    if !v.is_finite() {
+        return 0.0;
     }
-    Some(scaled.round() as i64)
+    let d = decimals.min(10);
+    format!("{v:.d$}").parse::<f64>().unwrap_or(v)
 }
 
-/// Step with integer-scaled math; clamp to min/max; snap to step grid from min.
-/// Uses checked scale conversions — values beyond ±2^53 clamp; overflow yields
-/// the clamped current value (never panics or wraps).
+/// Step by `dir` × `step`, clamp to `[min, max]`, and (unless `unconstrained`)
+/// snap to the step grid from `min` (or 0) — all in decimal-rounded `f64`
+/// math (round-trip through a formatted string at the step's own decimal
+/// precision), never through an integer-scaled (`i64`) intermediate. Values
+/// stay within ±2^53 throughout (`clamp_safe_number`).
+///
+/// `unconstrained` (`step="any"`, i.e. `InputLimits.step: None`): no grid to
+/// snap to — just add `step` (a sane default of `1` even though it is
+/// otherwise unused) and clamp.
 pub(crate) fn step_precise(current: f64, dir: i32, limits: &NumericLimits) -> f64 {
     let current = clamp_safe_number(current);
+    let min = limits.min.unwrap_or(-MAX_SAFE_NUMBER);
+    let max = limits.max.unwrap_or(MAX_SAFE_NUMBER);
+
+    if limits.unconstrained {
+        let next = current + dir as f64 * limits.step;
+        return clamp_safe_number(next.clamp(min, max));
+    }
+
     let decimals = step_decimal_places(limits.step);
-    let scale = 10i64.pow(decimals as u32);
-    let Some(cur_i) = scale_to_i64(current, scale) else {
-        return current;
-    };
-    let Some(step_i) = scale_to_i64(limits.step, scale) else {
-        return current;
-    };
-    let Some(mut next_i) = cur_i.checked_add((dir as i64).checked_mul(step_i).unwrap_or(0)) else {
-        return if dir > 0 {
-            MAX_SAFE_NUMBER
-        } else {
-            -MAX_SAFE_NUMBER
-        };
-    };
-    if let Some(min) = limits.min {
-        if let Some(min_i) = scale_to_i64(min, scale) {
-            if next_i < min_i {
-                next_i = min_i;
-            }
-        }
+    let step = limits.step;
+    let mut next = round_decimal(current + dir as f64 * step, decimals).clamp(min, max);
+    if step > 0.0 {
+        let base = limits.min.unwrap_or(0.0);
+        let n = ((next - base) / step).round();
+        next = round_decimal(base + n * step, decimals).clamp(min, max);
     }
-    if let Some(max) = limits.max {
-        if let Some(max_i) = scale_to_i64(max, scale) {
-            if next_i > max_i {
-                next_i = max_i;
-            }
-        }
-    }
-    // Snap to step grid from min (or 0) in integer space.
-    let base = limits.min.unwrap_or(0.0);
-    if let (Some(base_i), true) = (scale_to_i64(base, scale), step_i > 0) {
-        let delta = next_i - base_i;
-        let n = if delta >= 0 {
-            (delta + step_i / 2) / step_i
-        } else {
-            (delta - step_i / 2) / step_i
-        };
-        next_i = base_i + n * step_i;
-        if let Some(min) = limits.min {
-            if let Some(min_i) = scale_to_i64(min, scale) {
-                if next_i < min_i {
-                    next_i = min_i;
-                }
-            }
-        }
-        if let Some(max) = limits.max {
-            if let Some(max_i) = scale_to_i64(max, scale) {
-                if next_i > max_i {
-                    next_i = max_i;
-                }
-            }
-        }
-    }
-    clamp_safe_number(next_i as f64 / scale as f64)
+    clamp_safe_number(next)
 }
 
 pub(crate) fn step_decimal_places(step: f64) -> usize {
@@ -272,7 +244,16 @@ pub fn set_range_value_from_x(doc: &mut HtmlDocument, id: &str, x: f32) -> bool 
 pub(crate) struct NumericLimits {
     pub min: Option<f64>,
     pub max: Option<f64>,
+    /// Arrow/spin step size. Defaults to `1` both when the markup `step` is
+    /// absent/invalid and when it is the literal `"any"` — `unconstrained`
+    /// is what actually marks the "any value" case; `step` just keeps a
+    /// sane default increment for arrow keys / spin boxes either way.
     pub step: f64,
+    /// `true` for the literal HTML5 `step="any"` (issue #16: written for
+    /// `InputLimits { step: None, .. }`): no grid to snap to on clamp/commit,
+    /// and the decimal point is allowed when typing, regardless of whether
+    /// `step` happens to look like a whole number.
+    pub unconstrained: bool,
 }
 
 pub(crate) fn numeric_limits(node: &Node) -> NumericLimits {
@@ -283,11 +264,18 @@ pub(crate) fn numeric_limits(node: &Node) -> NumericLimits {
     let max = attr(node, "max")
         .and_then(|s| parse_f64(&s))
         .or(if is_range { Some(100.0) } else { None });
-    let step = attr(node, "step")
+    let step_attr = attr(node, "step");
+    let unconstrained = step_attr.as_deref() == Some("any");
+    let step = step_attr
         .and_then(|s| parse_f64(&s))
         .filter(|s| *s > 0.0)
         .unwrap_or(1.0);
-    NumericLimits { min, max, step }
+    NumericLimits {
+        min,
+        max,
+        step,
+        unconstrained,
+    }
 }
 
 fn clamp_snap(value: f64, limits: &NumericLimits) -> f64 {
@@ -295,7 +283,7 @@ fn clamp_snap(value: f64, limits: &NumericLimits) -> f64 {
     let min = limits.min.unwrap_or(-MAX_SAFE_NUMBER);
     let max = limits.max.unwrap_or(MAX_SAFE_NUMBER);
     let base = limits.min.unwrap_or(0.0);
-    let stepped = if limits.step > 0.0 {
+    let stepped = if limits.step > 0.0 && !limits.unconstrained {
         base + ((value - base) / limits.step).round() * limits.step
     } else {
         value
@@ -458,9 +446,20 @@ pub(crate) fn parse_f64(s: &str) -> Option<f64> {
     s.trim().parse::<f64>().ok()
 }
 
+/// Never goes through `i64`: the integer fast path formats the rounded
+/// `f64` directly (`{:.0}`, exact for any magnitude up to `MAX_SAFE_NUMBER`,
+/// since every integer in that range has an exact `f64` representation), and
+/// the decimal path formats the `f64` directly too. The fuzz threshold for
+/// "this is basically an integer" is tight (`1e-12`) so a deliberately tiny
+/// accepted value (the validated step floor is `1e-10`) is never mistaken
+/// for `0`.
 pub(crate) fn format_numeric(v: f64) -> String {
-    if v.is_finite() && (v - v.round()).abs() < 1e-9 {
-        return (v.round() as i64).to_string();
+    if !v.is_finite() {
+        return "0".to_string();
+    }
+    let rounded = v.round();
+    if (v - rounded).abs() < 1e-12 && rounded.abs() <= MAX_SAFE_NUMBER {
+        return format!("{rounded:.0}");
     }
     // Deterministic trim of trailing zeros.
     let s = format!("{v:.10}");
@@ -473,6 +472,7 @@ mod tests {
     use super::clamp_snap;
     use super::format_numeric;
     use super::NumericLimits;
+    use super::MAX_SAFE_NUMBER;
 
     #[test]
     fn snaps_to_step_from_min() {
@@ -480,9 +480,34 @@ mod tests {
             min: Some(0.0),
             max: Some(10.0),
             step: 2.5,
+            unconstrained: false,
         };
         assert_eq!(format_numeric(clamp_snap(3.0, &lim)), "2.5");
         assert_eq!(format_numeric(clamp_snap(11.0, &lim)), "10");
         assert_eq!(format_numeric(clamp_snap(-1.0, &lim)), "0");
+    }
+
+    /// Blocker 1 (PR27 round 2): `unconstrained` (`step="any"`) skips the
+    /// grid-snap entirely — only `[min, max]` clamping applies.
+    #[test]
+    fn unconstrained_skips_grid_snap() {
+        let lim = NumericLimits {
+            min: Some(0.0),
+            max: Some(10.0),
+            step: 1.0,
+            unconstrained: true,
+        };
+        assert_eq!(format_numeric(clamp_snap(4.3, &lim)), "4.3");
+        assert_eq!(format_numeric(clamp_snap(11.0, &lim)), "10");
+        assert_eq!(format_numeric(clamp_snap(-1.0, &lim)), "0");
+    }
+
+    /// Blocker 2 (PR27 round 2): no `i64` cast, so values at/near the safe
+    /// integer boundary and tiny-but-nonzero values both format correctly.
+    #[test]
+    fn format_numeric_boundaries_no_i64() {
+        assert_eq!(format_numeric(MAX_SAFE_NUMBER), "9007199254740992");
+        assert_eq!(format_numeric(-MAX_SAFE_NUMBER), "-9007199254740992");
+        assert_eq!(format_numeric(1e-10), "0.0000000001");
     }
 }

@@ -125,6 +125,11 @@ fn engine_err(surface: Option<SurfaceId>, error: EngineError) -> WorkerError {
 }
 
 /// Owned slice + fragment snapshot the host sends to the worker.
+///
+/// `#[non_exhaustive]` (PR27 round 2): future fields (e.g. a prospective
+/// `input_rules`) must not break downstream struct literals. Build one with
+/// `SyncPacket { field: ..., ..Default::default() }` (it derives `Default`).
+#[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct SyncPacket {
     pub versions: HashMap<String, u64>,
@@ -138,21 +143,29 @@ pub struct SyncPacket {
 impl SyncPacket {
     /// Merge `newer` per slice / section (latest key wins). Used when coalescing.
     ///
-    /// `input_limits` is fixed per build (Game's design) and usually sent
-    /// once, so a later coalesced packet with an empty `input_limits` must
-    /// not drop limits a slightly older queued packet already carried.
+    /// PR27 round 2 (fixing the same "keep-when-empty" bug Graph found on
+    /// #24): the reserved `actions` slice — `actions` (greying) and
+    /// `input_limits` together — is replaced **as a whole** whenever
+    /// `newer` carries a fresh snapshot of it (signalled by
+    /// `newer.versions` touching the `"actions"` key), even if one or both
+    /// of those lists are empty. An empty list on a packet that *does* bump
+    /// the `actions` version is a deliberate "nothing greyed / no limits
+    /// now" state, not "no update" — matching `Engine::sync`, which
+    /// unconditionally re-reads `action_states()` and (when the version
+    /// changed) `input_limits()` every time, including to empty. A packet
+    /// that never touches `"actions"` in `versions` (e.g. a ticker-only
+    /// update) leaves both untouched, so coalescing several such packets
+    /// before `actions` changes keeps whatever the host last declared.
     pub fn merge_per_slice(&mut self, newer: SyncPacket) {
-        let replace_actions = newer.versions.contains_key("actions") || !newer.actions.is_empty();
+        let replace_reserved_actions_slice = newer.versions.contains_key("actions");
         for (k, v) in newer.versions {
             self.versions.insert(k, v);
         }
         for (k, v) in newer.fragments {
             self.fragments.insert(k, v);
         }
-        if replace_actions {
+        if replace_reserved_actions_slice {
             self.actions = newer.actions;
-        }
-        if !newer.input_limits.is_empty() {
             self.input_limits = newer.input_limits;
         }
     }

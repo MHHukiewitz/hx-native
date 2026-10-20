@@ -181,11 +181,21 @@ pub enum ActionState {
 /// `step: None` means any value (htmx `step="any"`); the engine still writes
 /// `step="any"` and falls back to a step of `1` for arrow/spin stepping,
 /// matching the existing missing-`step` default.
+///
+/// `#[non_exhaustive]` (PR27 round 2): a prospective future field must not
+/// break downstream struct literals. Build one with [`InputLimits::new`].
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq)]
 pub struct InputLimits {
     pub min: f64,
     pub max: f64,
     pub step: Option<f64>,
+}
+
+impl InputLimits {
+    pub fn new(min: f64, max: f64, step: Option<f64>) -> Self {
+        Self { min, max, step }
+    }
 }
 
 /// Host hook: renders HTML for one section. Called only for dirty sections

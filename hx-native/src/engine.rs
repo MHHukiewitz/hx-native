@@ -22,7 +22,7 @@ use crate::fonts::bundled_font_context;
 use crate::form_args::{
     clamp_snap_value, closest_form, collect_action_args, format_numeric, is_number_input,
     is_numeric_input, parse_f64, set_range_value_from_x, step_numeric_value, write_value_attr,
-    NumericLimits,
+    NumericLimits, MAX_SAFE_NUMBER,
 };
 use crate::form_controls::{
     activate_checkable, control_is_disabled, form_control_at_point, select_options, select_radio,
@@ -223,6 +223,21 @@ struct LiveSurface {
     /// `SliceSource::input_limits` call (issue #16). Re-applied to matching
     /// inputs after a swap without calling `input_limits` again.
     limits_cache: Vec<(String, String, InputLimits)>,
+    /// Markup `min`/`max`/`step` recorded the first time the engine
+    /// overwrote them for a given `(action, input name)` (PR27 round 2,
+    /// non-blocking item): restored when a later `input_limits()` no longer
+    /// lists that key.
+    limits_markup: HashMap<(String, String), MarkupSnapshot>,
+}
+
+/// Markup `min`/`max`/`step` attribute values an input had before the engine
+/// first overwrote them with slice-supplied `InputLimits` (issue #16).
+/// `None` for a field means the attribute was absent in markup.
+#[derive(Clone, Debug, Default)]
+struct MarkupSnapshot {
+    min: Option<String>,
+    max: Option<String>,
+    step: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1320,6 +1335,7 @@ impl LiveSurface {
             panic_next_paint: false,
             text_edit: None,
             limits_cache: Vec::new(),
+            limits_markup: HashMap::new(),
         })
     }
 
@@ -1481,7 +1497,6 @@ impl LiveSurface {
         }
 
         let actions_changed = current.get("actions").copied() != prev_actions_version;
-        self.slice_versions = current;
 
         // Issue #16: range/number limits from the `actions` slice. Cheap by
         // design (Game's request) — only re-pull `input_limits` on the
@@ -1489,9 +1504,20 @@ impl LiveSurface {
         // elsewhere in this same sync still needs cached limits re-applied,
         // since fragment HTML never carries them (Designer lock: samples
         // omit min/max/step).
+        //
+        // PR27 round 2, blocker 3: this runs — and must fully succeed —
+        // *before* `self.slice_versions = current` below. A failed
+        // `refresh_input_limits` (`UnknownLimitInput` / `InvalidInputLimits`)
+        // must not record the new `actions` version, so the next `sync`
+        // sees `actions_changed` (or `initial`) again and re-calls
+        // `input_limits` instead of silently skipping the retry.
         if initial || actions_changed {
             self.refresh_input_limits(slices)?;
-        } else if !dirty_sections.is_empty() {
+        }
+
+        self.slice_versions = current;
+
+        if !initial && !actions_changed && !dirty_sections.is_empty() {
             self.reapply_cached_limits();
         }
 
@@ -1702,15 +1728,23 @@ impl LiveSurface {
     // ------------------------------------------------------------------
 
     /// Pull `SliceSource::input_limits`, validate it, write it onto every
-    /// matching `<input type=range|number>`, clamp out-of-range values, and
-    /// cache it so later swaps can re-apply without calling `input_limits`
+    /// matching `<input type=range|number>`, clamp out-of-range values,
+    /// remove limits for any key the new list no longer carries, and cache
+    /// the result so later swaps can re-apply without calling `input_limits`
     /// again.
+    ///
+    /// PR27 round 2, blocker 3: every step here either fully applies or
+    /// fully fails — on any error, nothing in this method has mutated the
+    /// DOM, `limits_cache`, or `limits_markup` (the `?` on `validate_input_limits`
+    /// runs before any DOM access at all; `apply_limits_to_doc` resolves
+    /// every entry before writing any of them).
     fn refresh_input_limits(&mut self, slices: &dyn SliceSource) -> Result<(), EngineError> {
         let raw = slices.input_limits();
         for (action, input, limits) in &raw {
             validate_input_limits(action, input, limits)?;
         }
         self.apply_limits_to_doc(&raw, true)?;
+        self.remove_stale_limits(&raw);
         self.limits_cache = raw;
         Ok(())
     }
@@ -1731,12 +1765,17 @@ impl LiveSurface {
     /// that does exist for its action. Not an error when no form for the
     /// action is in the document at all (it may be on another surface, or
     /// not rendered yet).
+    ///
+    /// PR27 round 2, blocker 3: resolves **every** entry first, writing
+    /// nothing, so a later entry's `UnknownLimitInput` can never leave an
+    /// earlier entry half-applied (the old single-pass version wrote as it
+    /// went and could error out partway through the list).
     fn apply_limits_to_doc(
         &mut self,
         entries: &[(String, String, InputLimits)],
         validate: bool,
     ) -> Result<(), EngineError> {
-        let mut any_changed = false;
+        let mut resolved: Vec<((String, String), NodeId, InputLimits)> = Vec::new();
         for (action, input_name, limits) in entries {
             let forms = self.forms_for_action(action);
             if forms.is_empty() {
@@ -1746,9 +1785,11 @@ impl LiveSurface {
             for form_nid in forms {
                 for input_nid in self.range_or_number_inputs_named(form_nid, input_name) {
                     matched = true;
-                    if self.write_limits_onto(input_nid, limits) {
-                        any_changed = true;
-                    }
+                    resolved.push((
+                        (action.clone(), input_name.clone()),
+                        input_nid,
+                        limits.clone(),
+                    ));
                 }
             }
             if !matched && validate {
@@ -1758,11 +1799,100 @@ impl LiveSurface {
                 });
             }
         }
+
+        let mut any_changed = false;
+        for (key, input_nid, limits) in resolved {
+            if !self.limits_markup.contains_key(&key) {
+                let snap = MarkupSnapshot {
+                    min: node_attr(&self.doc, input_nid, "min"),
+                    max: node_attr(&self.doc, input_nid, "max"),
+                    step: node_attr(&self.doc, input_nid, "step"),
+                };
+                self.limits_markup.insert(key, snap);
+            }
+            if self.write_limits_onto(input_nid, &limits) {
+                any_changed = true;
+            }
+        }
         if any_changed {
             self.mark_dom_dirty();
             self.mark_paint_dirty();
         }
         Ok(())
+    }
+
+    /// Restore (or clear) `min`/`max`/`step` for every `(action, input name)`
+    /// key that `self.limits_cache` carried but `raw` no longer does (PR27
+    /// round 2, non-blocking item): the slice stopped declaring limits for
+    /// that input, so the engine's override must stop too. Restores the
+    /// markup snapshot taken the first time the engine wrote over it, or
+    /// clears the three attributes when there was nothing to restore.
+    fn remove_stale_limits(&mut self, raw: &[(String, String, InputLimits)]) {
+        let new_keys: HashSet<(String, String)> =
+            raw.iter().map(|(a, i, _)| (a.clone(), i.clone())).collect();
+        let removed: Vec<(String, String)> = self
+            .limits_cache
+            .iter()
+            .map(|(a, i, _)| (a.clone(), i.clone()))
+            .filter(|k| !new_keys.contains(k))
+            .collect();
+        if removed.is_empty() {
+            return;
+        }
+        let mut any_changed = false;
+        for key in removed {
+            let snap = self.limits_markup.remove(&key);
+            let (action, input_name) = key;
+            for form_nid in self.forms_for_action(&action) {
+                for input_nid in self.range_or_number_inputs_named(form_nid, &input_name) {
+                    if self.restore_markup_onto(input_nid, snap.as_ref()) {
+                        any_changed = true;
+                    }
+                }
+            }
+        }
+        if any_changed {
+            self.mark_dom_dirty();
+            self.mark_paint_dirty();
+        }
+    }
+
+    /// Set `min`/`max`/`step` back to `snap` (or clear them when `snap` is
+    /// `None` / a field was absent in markup). Returns `true` when any
+    /// attribute changed.
+    fn restore_markup_onto(&mut self, nid: NodeId, snap: Option<&MarkupSnapshot>) -> bool {
+        let want_min = snap.and_then(|s| s.min.clone());
+        let want_max = snap.and_then(|s| s.max.clone());
+        let want_step = snap.and_then(|s| s.step.clone());
+        let cur_min = node_attr(&self.doc, nid, "min");
+        let cur_max = node_attr(&self.doc, nid, "max");
+        let cur_step = node_attr(&self.doc, nid, "step");
+        let mut changed = false;
+        {
+            let mut mutr = self.doc.mutate();
+            if cur_min != want_min {
+                match &want_min {
+                    Some(v) => mutr.set_attribute(nid, qual_name!("min"), v),
+                    None => mutr.clear_attribute(nid, qual_name!("min")),
+                }
+                changed = true;
+            }
+            if cur_max != want_max {
+                match &want_max {
+                    Some(v) => mutr.set_attribute(nid, qual_name!("max"), v),
+                    None => mutr.clear_attribute(nid, qual_name!("max")),
+                }
+                changed = true;
+            }
+            if cur_step != want_step {
+                match &want_step {
+                    Some(v) => mutr.set_attribute(nid, qual_name!("step"), v),
+                    None => mutr.clear_attribute(nid, qual_name!("step")),
+                }
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Forms (by `NodeId`) that are, or contain, an element whose `hx-post`
@@ -1867,25 +1997,32 @@ impl LiveSurface {
         let clamp_limits = NumericLimits {
             min: Some(limits.min),
             max: Some(limits.max),
-            step: limits.step.unwrap_or(0.0),
+            step: limits.step.unwrap_or(1.0),
+            unconstrained: limits.step.is_none(),
         };
-        let current = node_attr(&self.doc, nid, "value")
-            .and_then(|s| parse_f64(&s))
-            .unwrap_or(limits.min);
-        let clamped_s = format_numeric(clamp_snap_value(current, &clamp_limits));
-        if write_value_attr(&mut self.doc, nid, &clamped_s) {
-            changed = true;
-            let focused_here = self.text_edit.as_ref().is_some_and(|s| s.node_id == nid);
-            if is_number && !focused_here {
-                apply_unfocused_display(&mut self.doc, nid);
-            }
-            if let Some(elem_id) = node_id_attr(&self.doc, nid) {
-                let _ = sync_outputs_for(&mut self.doc, &elem_id);
-            }
-            if is_number {
-                self.queue_text_field_damage(nid);
-            } else {
-                self.mark_paint_dirty();
+        let value_attr = node_attr(&self.doc, nid, "value");
+        // Blocker 4 (PR27 round 2): an empty number field stays empty —
+        // matches how HTML treats an empty `<input type=number>` (no value
+        // to clamp). Range inputs cannot be meaningfully empty, so they keep
+        // falling back to `limits.min` as before.
+        let is_empty_number = is_number && value_attr.as_deref().unwrap_or("").trim().is_empty();
+        if !is_empty_number {
+            let current = value_attr.and_then(|s| parse_f64(&s)).unwrap_or(limits.min);
+            let clamped_s = format_numeric(clamp_snap_value(current, &clamp_limits));
+            if write_value_attr(&mut self.doc, nid, &clamped_s) {
+                changed = true;
+                let focused_here = self.text_edit.as_ref().is_some_and(|s| s.node_id == nid);
+                if is_number && !focused_here {
+                    apply_unfocused_display(&mut self.doc, nid);
+                }
+                if let Some(elem_id) = node_id_attr(&self.doc, nid) {
+                    let _ = sync_outputs_for(&mut self.doc, &elem_id);
+                }
+                if is_number {
+                    self.queue_text_field_damage(nid);
+                } else {
+                    self.mark_paint_dirty();
+                }
             }
         }
         changed
@@ -2653,6 +2790,7 @@ impl LiveSurface {
                     min: None,
                     max: None,
                     step: 1.0,
+                    unconstrained: false,
                 });
             // Commas accepted and ignored (not inserted while focused).
             let filtered = filter_number_insert(&existing, &filtered, &limits);
@@ -4136,6 +4274,12 @@ fn ids_removed_by_swap(doc: &HtmlDocument, target: NodeId, swap: SwapMode) -> Ha
 
 /// Validate one `SliceSource::input_limits` entry (issue #16): finite
 /// bounds, `min <= max`, and `step` (when present) finite and `> 0`.
+/// Floor for `InputLimits.step` when `Some` (PR27 round 2, blocker 2). Below
+/// this, `step_decimal_places`'s capped decimal-digit count (10) can no
+/// longer represent the step precisely, and formatting/snapping would be
+/// guesswork rather than exact — so it is rejected at validation instead.
+const MIN_STEP: f64 = 1e-10;
+
 fn validate_input_limits(
     action: &str,
     input: &str,
@@ -4143,6 +4287,10 @@ fn validate_input_limits(
 ) -> Result<(), EngineError> {
     let reason = if !limits.min.is_finite() || !limits.max.is_finite() {
         Some("min/max must be finite numbers".to_string())
+    } else if limits.min.abs() > MAX_SAFE_NUMBER || limits.max.abs() > MAX_SAFE_NUMBER {
+        Some(format!(
+            "min/max must stay within ±{MAX_SAFE_NUMBER} (±2^53, the safe integer range)"
+        ))
     } else if limits.min > limits.max {
         Some(format!(
             "min ({}) must be <= max ({})",
@@ -4151,6 +4299,8 @@ fn validate_input_limits(
     } else if let Some(step) = limits.step {
         if !step.is_finite() || step <= 0.0 {
             Some(format!("step ({step}) must be > 0 when present"))
+        } else if step < MIN_STEP {
+            Some(format!("step ({step}) must be >= {MIN_STEP} when present"))
         } else {
             None
         }
