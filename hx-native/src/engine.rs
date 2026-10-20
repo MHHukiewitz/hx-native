@@ -526,6 +526,7 @@ impl Engine {
                 }
                 let dirty = live.paint_dirty
                     || live.force_full_repaint
+                    || !live.pending_damage.is_empty()
                     || live.cached_rgba.is_none()
                     || live.layout_viewport != (s.size.width, s.size.height)
                     || (live.layout_scale - s.size.scale).abs() > f64::EPSILON
@@ -1026,20 +1027,28 @@ impl Engine {
 
     /// Test helper: push a device-pixel damage rect that must be merged into the
     /// next paint plan (issue #20 pending-damage / fold full-surface case).
+    #[doc(hidden)]
     pub fn test_push_pending_damage(&mut self, rect: Rect) {
         if let Some(live) = self
             .surfaces
             .get_mut(&SurfaceId::DEFAULT)
             .and_then(|s| s.live.as_mut())
         {
-            live.pending_damage.push(IntRect {
+            live.push_pending_damage(IntRect {
                 x: rect.x.floor() as i32,
                 y: rect.y.floor() as i32,
                 w: rect.width.ceil() as i32,
                 h: rect.height.ceil() as i32,
             });
-            live.paint_dirty = true;
         }
+    }
+
+    /// Test helper: transform-aware border box in CSS pixels `(x, y, w, h)`.
+    #[doc(hidden)]
+    pub fn test_element_box(&self, id: &str) -> Option<(f32, f32, f32, f32)> {
+        let live = self.live(SurfaceId::DEFAULT)?;
+        let nid = live.doc.get_element_by_id(id)?;
+        crate::damage::element_border_box_css(&live.doc, nid)
     }
 
     /// Test helper: subscribed slice names the engine will ask `version` for.
@@ -1156,6 +1165,17 @@ impl LiveSurface {
         self.paint_dirty = true;
     }
 
+    /// Single pending-damage list: clamp on push. Every source (swap old ink,
+    /// closed overlay, fold full-surface, …) goes through here.
+    fn push_pending_damage(&mut self, rect: IntRect) {
+        let (sw, sh) = self.layout_viewport;
+        let r = rect.clamp_to_surface(sw, sh);
+        if !r.is_empty() {
+            self.pending_damage.push(r);
+            self.paint_dirty = true;
+        }
+    }
+
     /// Push last-painted ink for `root` and its current element descendants into
     /// `pending_damage`. Safe during sync (reads `last_bounds` only).
     fn queue_pending_subtree_damage(&mut self, root: NodeId) {
@@ -1168,9 +1188,7 @@ impl LiveSurface {
             if let Some(bounds) = self.last_bounds.get(&nid) {
                 let (x, y, w, h) = bounds.ink;
                 let r = snap_outward(x, y, w, h, sw, sh);
-                if !r.is_empty() {
-                    self.pending_damage.push(r);
-                }
+                self.push_pending_damage(r);
             }
             let Some(node) = self.doc.get_node(nid) else {
                 continue;
@@ -2281,7 +2299,8 @@ impl LiveSurface {
         self.layout_scale = scale;
 
         // Spec: skip clean frames — no raster when nothing is damaged and size is unchanged.
-        if !self.paint_dirty && !force_full {
+        // Pending damage (swap old ink, closed overlay, fold full-surface) must not skip.
+        if !self.paint_dirty && !force_full && self.pending_damage.is_empty() {
             return Ok(RenderResult {
                 plan: None,
                 style_layout_passes: 0,

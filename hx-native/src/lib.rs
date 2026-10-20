@@ -23,6 +23,7 @@ mod trigger;
 mod types;
 pub mod worker;
 
+pub use damage::{element_border_box_css, element_border_box_device};
 pub use dialect::{SwapMode, SyncMode};
 pub use engine::{DirtySet, Engine};
 pub use error::EngineError;

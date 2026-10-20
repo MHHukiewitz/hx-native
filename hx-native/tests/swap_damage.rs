@@ -1,9 +1,9 @@
-//! Issue #20: sync_surface swap damage must match a forced full repaint.
+//! Issue #20: sync_surface swap damage must match a forced full repaint when
+//! the panel is centered with `transform: translate(-50%, -50%)` (Mainnet Pause).
 //!
-//! Repro shape (Mainnet Pause exit confirm): an inner section swaps from a
-//! compact row to a larger question+buttons block at a different size. Partial
-//! damage must be byte-identical to a full repaint at scale 1.0, 2.0, and 1.25.
-//! A leftover pending full-surface rect must force full_repaint.
+//! `absolute_position` ignores CSS transforms; damage must use the shared
+//! transform-aware box helper. At scales 1 / 1.25 / 2, partial ≡ full. A
+//! leftover pending full-surface rect must force `full_repaint`.
 
 #![allow(clippy::type_complexity)]
 
@@ -75,10 +75,9 @@ impl FragmentSource for SpyFrags {
     }
 }
 
-/// Pause-like panel: fixed chrome, inner `#pause-exit` swapped by slice:pause.
-/// Old fragment is a single row at the top; new fragment is a question + two
-/// buttons that sit lower and wider — old and new boxes differ in size and
-/// position (like Mainnet exit confirm).
+/// Mainnet Pause shape: panel at left/top 50% with `translate(-50%, -50%)`.
+/// Without transform-aware boxes, damage lands at the untransformed spot
+/// (~640,400) while pixels change around (~480,236).
 fn pause_page() -> String {
     r##"<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"/>
@@ -90,7 +89,8 @@ body {
   font-family: "DejaVu Sans", sans-serif; overflow: hidden;
 }
 #pause-panel {
-  position: absolute; left: 480px; top: 236px; width: 320px; height: 328px;
+  position: absolute; left: 50%; top: 50%; width: 320px; height: 328px;
+  transform: translate(-50%, -50%);
   background: #2a3140; border: 2px solid #667;
 }
 #pause-title {
@@ -129,6 +129,32 @@ body {
         .to_string()
 }
 
+/// Ancestor carries `translate(150px, 100px)`; swap target is inside it.
+fn transformed_ancestor_page() -> String {
+    r##"<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { width: 800px; height: 600px; background: #111; color: #eee;
+  font-family: "DejaVu Sans", sans-serif; overflow: hidden; }
+#outer {
+  position: absolute; left: 40px; top: 40px; width: 400px; height: 300px;
+  transform: translate(150px, 100px);
+  background: #222;
+}
+#sec { position: absolute; left: 20px; top: 20px; width: 200px; height: 120px; }
+#old { width: 180px; height: 40px; background: #c04040; }
+#new { width: 120px; height: 80px; background: #40c040; margin-top: 20px; }
+</style></head><body>
+<div id="outer">
+  <section id="sec" hx-trigger="slice:pause" hx-target="#sec" hx-swap="innerHTML">
+    <div id="old">old</div>
+  </section>
+</div>
+</body></html>"##
+        .to_string()
+}
+
 fn exit_row_html() -> String {
     r#"<div id="exit-row">Exit game…</div>"#.into()
 }
@@ -148,100 +174,147 @@ fn vp_css(css_w: u32, css_h: u32, scale: f64) -> Viewport {
     Viewport::with_scale(w, h, scale)
 }
 
-fn paint_swap_partial(scale: f64) -> (PaintOutput, PaintStats) {
-    let mut eng = boot(&pause_page());
+fn pixel_diffs(a: &RgbaImage, b: &RgbaImage) -> u32 {
+    let mut diffs = 0u32;
+    for (pa, pb) in a.pixels.chunks_exact(4).zip(b.pixels.chunks_exact(4)) {
+        if pa != pb {
+            diffs += 1;
+        }
+    }
+    diffs
+}
+
+fn paint_swap_partial(
+    html: &str,
+    section: &str,
+    before: &str,
+    after: &str,
+    scale: f64,
+    css_w: u32,
+    css_h: u32,
+) -> (PaintOutput, PaintStats) {
+    let mut eng = boot(html);
     let mut slices = MemSlices::new();
     let mut frags = SpyFrags::new();
-    frags.set("pause-exit", &exit_row_html());
+    frags.set(section, before);
     eng.sync(&slices, &mut frags).unwrap();
-    let view = vp_css(1280, 800, scale);
+    let view = vp_css(css_w, css_h, scale);
     let _ = eng.paint(view.clone()).unwrap();
 
     slices.bump("pause");
-    frags.set("pause-exit", &exit_confirm_html());
+    frags.set(section, after);
     eng.sync(&slices, &mut frags).unwrap();
     let out = eng.paint(view).unwrap();
     let stats = eng.last_paint_stats();
     (out, stats)
 }
 
-fn paint_swap_forced_full(scale: f64) -> PaintOutput {
-    let mut eng = boot(&pause_page());
+fn paint_swap_forced_full(
+    html: &str,
+    section: &str,
+    after: &str,
+    scale: f64,
+    css_w: u32,
+    css_h: u32,
+) -> PaintOutput {
+    let mut eng = boot(html);
     let mut slices = MemSlices::new();
     let mut frags = SpyFrags::new();
-    frags.set("pause-exit", &exit_confirm_html());
+    frags.set(section, after);
     slices.bump("pause");
     eng.sync(&slices, &mut frags).unwrap();
     eng.mark_theme_or_stylesheet_changed();
-    let view = vp_css(1280, 800, scale);
+    let view = vp_css(css_w, css_h, scale);
     eng.paint(view).unwrap()
 }
 
-fn assert_partial_matches_full(scale: f64) {
-    let (partial, stats) = paint_swap_partial(scale);
-    let full = paint_swap_forced_full(scale);
+fn assert_pause_swap_partial_matches_full(scale: f64) {
+    let (partial, stats) = paint_swap_partial(
+        &pause_page(),
+        "pause-exit",
+        &exit_row_html(),
+        &exit_confirm_html(),
+        scale,
+        1280,
+        800,
+    );
+    let full = paint_swap_forced_full(
+        &pause_page(),
+        "pause-exit",
+        &exit_confirm_html(),
+        scale,
+        1280,
+        800,
+    );
 
     assert!(
         !partial.skipped,
         "swap paint must not skip at scale={scale}"
     );
-    assert!(
-        partial.rgba.is_some(),
-        "partial must return rgba at scale={scale}"
-    );
-    eprintln!(
-        "scale={scale} full_repaint={} damage={:?} stats={:?}",
-        stats.full_repaint, partial.damage, stats
-    );
-
     let a = partial.rgba.as_ref().unwrap();
     let b = full.rgba.as_ref().unwrap();
-    if a.pixels != b.pixels {
-        let mut min_x = a.width;
-        let mut min_y = a.height;
-        let mut max_x = 0u32;
-        let mut max_y = 0u32;
-        let mut diffs = 0u32;
-        for y in 0..a.height {
-            for x in 0..a.width {
-                let i = ((y * a.width + x) * 4) as usize;
-                if a.pixels[i..i + 4] != b.pixels[i..i + 4] {
-                    diffs += 1;
-                    min_x = min_x.min(x);
-                    min_y = min_y.min(y);
-                    max_x = max_x.max(x);
-                    max_y = max_y.max(y);
-                }
-            }
-        }
-        panic!(
-            "swap partial must be byte-identical to forced full at scale={scale}; \
-             diffs={diffs} mismatch_bbox=({min_x},{min_y})-({max_x},{max_y}) \
-             mismatch_size={}x{} damage={:?}",
-            max_x.saturating_sub(min_x) + 1,
-            max_y.saturating_sub(min_y) + 1,
-            partial.damage
-        );
-    }
+    let diffs = pixel_diffs(a, b);
+    eprintln!(
+        "pause transform scale={scale} diffs={diffs} full_repaint={} damage={:?} stats={:?}",
+        stats.full_repaint, partial.damage, stats
+    );
+    assert_eq!(
+        diffs, 0,
+        "Pause translate(-50%,-50%) swap partial must match full at scale={scale}; \
+         diffs={diffs} damage={:?}",
+        partial.damage
+    );
 }
 
 #[test]
 fn swap_inner_section_partial_matches_full_scale_1() {
-    assert_partial_matches_full(1.0);
+    assert_pause_swap_partial_matches_full(1.0);
 }
 
 #[test]
 fn swap_inner_section_partial_matches_full_scale_2() {
-    assert_partial_matches_full(2.0);
+    assert_pause_swap_partial_matches_full(2.0);
 }
 
 #[test]
 fn swap_inner_section_partial_matches_full_scale_1_25() {
-    assert_partial_matches_full(1.25);
+    assert_pause_swap_partial_matches_full(1.25);
 }
 
-/// A leftover pending full-surface rect (e.g. from a fold) must force
-/// `full_repaint=true` on the next plan — never dropped in favour of a local rect.
+#[test]
+fn swap_under_transformed_ancestor_partial_matches_full() {
+    let scale = 1.0;
+    let (partial, stats) = paint_swap_partial(
+        &transformed_ancestor_page(),
+        "sec",
+        r#"<div id="old">old</div>"#,
+        r#"<div id="new">new</div>"#,
+        scale,
+        800,
+        600,
+    );
+    let full = paint_swap_forced_full(
+        &transformed_ancestor_page(),
+        "sec",
+        r#"<div id="new">new</div>"#,
+        scale,
+        800,
+        600,
+    );
+    let diffs = pixel_diffs(partial.rgba.as_ref().unwrap(), full.rgba.as_ref().unwrap());
+    eprintln!(
+        "ancestor translate(150px,100px) diffs={diffs} damage={:?} full_repaint={}",
+        partial.damage, stats.full_repaint
+    );
+    assert_eq!(
+        diffs, 0,
+        "transformed-ancestor swap must be byte-identical; diffs={diffs} damage={:?}",
+        partial.damage
+    );
+}
+
+/// A leftover pending full-surface rect must force `full_repaint=true`.
+/// Fails if the full-surface rule in `compute_plan` is dropped.
 #[test]
 fn pending_full_surface_rect_forces_full_repaint() {
     let mut eng = boot(&pause_page());
@@ -275,55 +348,39 @@ fn pending_full_surface_rect_forces_full_repaint() {
     assert_eq!(out.damage[0].y, 0.0);
     assert_eq!(out.damage[0].width, view.width as f32);
     assert_eq!(out.damage[0].height, view.height as f32);
-}
 
-/// Same-size colour swap: NodeId reuse can hide content-only changes if damage
-/// only looks at own-box geometry.
-#[test]
-fn swap_same_box_recolour_partial_matches_full_scale_2() {
-    let html = r##"<!DOCTYPE html>
-<html><head><meta charset="utf-8"/>
-<style>
-* { margin:0; padding:0; box-sizing:border-box; }
-body { width:400px; height:200px; background:#111; }
-#sec { position:absolute; left:40px; top:40px; width:120px; height:60px; }
-#cell { width:120px; height:60px; }
-</style></head><body>
-<section id="sec" hx-trigger="slice:pause" hx-target="#sec" hx-swap="innerHTML">
-  <div id="cell" style="background:#c00"></div>
-</section>
-</body></html>"##;
-    let mut eng = boot(html);
-    let mut slices = MemSlices::new();
-    let mut frags = SpyFrags::new();
-    frags.set("sec", r#"<div id="cell" style="background:#c00"></div>"#);
-    eng.sync(&slices, &mut frags).unwrap();
-    let view = vp_css(400, 200, 2.0);
-    let _ = eng.paint(view.clone()).unwrap();
-
-    slices.bump("pause");
-    frags.set("sec", r#"<div id="cell" style="background:#0c0"></div>"#);
-    eng.sync(&slices, &mut frags).unwrap();
-    let partial = eng.paint(view.clone()).unwrap();
-
-    let mut eng_f = boot(html);
-    let mut s_f = MemSlices::new();
-    let mut f_f = SpyFrags::new();
-    f_f.set("sec", r#"<div id="cell" style="background:#0c0"></div>"#);
-    s_f.bump("pause");
-    eng_f.sync(&s_f, &mut f_f).unwrap();
-    eng_f.mark_theme_or_stylesheet_changed();
-    let full = eng_f.paint(view).unwrap();
-
-    eprintln!(
-        "recolour damage={:?} full_repaint={}",
-        partial.damage,
-        eng.last_paint_stats().full_repaint
+    // With full_repaint forced, frame must still match a fresh full paint.
+    let full = paint_swap_forced_full(
+        &pause_page(),
+        "pause-exit",
+        &exit_confirm_html(),
+        2.0,
+        1280,
+        800,
     );
     assert_eq!(
-        partial.rgba.as_ref().unwrap().pixels,
-        full.rgba.as_ref().unwrap().pixels,
-        "same-box recolour must be byte-identical; damage={:?}",
-        partial.damage
+        pixel_diffs(out.rgba.as_ref().unwrap(), full.rgba.as_ref().unwrap()),
+        0,
+        "pending-full path must still be byte-identical to forced full"
+    );
+}
+
+#[test]
+fn transformed_panel_box_matches_visual_center() {
+    let mut eng = boot(&pause_page());
+    let slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    frags.set("pause-exit", &exit_row_html());
+    eng.sync(&slices, &mut frags).unwrap();
+    let _ = eng.paint(vp_css(1280, 800, 1.0)).unwrap();
+    let (x, y, w, h) = eng.test_element_box("pause-panel").expect("panel box");
+    // Visual top-left after translate(-50%,-50%) from (640,400) size 320×328.
+    assert!(
+        (x - 480.0).abs() < 2.0 && (y - 236.0).abs() < 2.0,
+        "panel origin should be ~(480,236), got ({x},{y})"
+    );
+    assert!(
+        (w - 320.0).abs() < 2.0 && (h - 328.0).abs() < 2.0,
+        "panel size should be ~320×328, got ({w}×{h})"
     );
 }

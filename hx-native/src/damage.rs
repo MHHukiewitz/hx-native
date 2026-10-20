@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use blitz_dom::NodeId;
 use blitz_html::HtmlDocument;
+use kurbo::{Affine, Rect as KurboRect, Vec2};
 
 use crate::types::{Rect, FULL_REPAINT_AREA_FRACTION, MAX_DAMAGE_RECTS};
 
@@ -223,45 +224,121 @@ pub(crate) fn merge_damage_rects(
     }
 }
 
-/// Compute the element's own border box in device pixels: (x, y, w, h).
-fn own_box_device(doc: &HtmlDocument, nid: NodeId, scale: f64) -> Option<(f64, f64, f64, f64)> {
+/// Local CSS transform for `node` as a device-space [`Affine`].
+///
+/// Uses the Affine Blitz stores from stylo computed styles during
+/// `resolve_transforms` (translations already × viewport scale). When the
+/// caller's `scale` differs from the document viewport scale, translation
+/// components are re-based so origin and size stay in one space.
+fn local_transform_device(node: &blitz_dom::Node, scale: f64, doc_scale: f64) -> Option<Affine> {
+    let t = *node.transform().as_deref()?;
+    let doc_scale = doc_scale.max(1e-6);
+    if (scale - doc_scale).abs() < f64::EPSILON {
+        return Some(t);
+    }
+    // Cached transform is at doc_scale; re-scale translations for `scale`.
+    let [a, b, c, d, e, f] = t.as_coeffs();
+    let factor = scale / doc_scale;
+    Some(Affine::new([a, b, c, d, e * factor, f * factor]))
+}
+
+/// Document-space affine that maps this element's border-box local coordinates
+/// (origin at the border-box top-left, before its own transform) to device
+/// pixels. Walks the containing-block chain (same as `absolute_position`) and
+/// multiplies each ancestor's layout translation by its CSS transform.
+fn document_affine_device(doc: &HtmlDocument, nid: NodeId, scale: f64) -> Option<Affine> {
+    let mut chain = Vec::new();
+    let mut cur = Some(nid);
+    while let Some(id) = cur {
+        chain.push(id);
+        cur = doc.get_node(id).and_then(|n| n.containing_block());
+    }
+    chain.reverse();
+
+    let doc_scale = doc.viewport().scale_f64();
+    let mut xf = Affine::IDENTITY;
+    for id in chain {
+        let node = doc.get_node(id)?;
+        let loc = node.final_layout().location;
+        let scroll = node.scroll_offset();
+        xf *= Affine::translate(Vec2::new(
+            (loc.x as f64 - scroll.x) * scale,
+            (loc.y as f64 - scroll.y) * scale,
+        ));
+        if let Some(t) = local_transform_device(node, scale, doc_scale) {
+            xf *= t;
+        }
+    }
+    Some(xf)
+}
+
+/// Axis-aligned border box in CSS document pixels, with CSS `transform` of the
+/// element and its containing-block ancestors applied.
+///
+/// Shared by damage, range geometry, and (for PR #18) select control rects.
+/// `absolute_position` alone ignores transforms — Pause's
+/// `transform: translate(-50%, -50%)` needs this.
+pub fn element_border_box_css(doc: &HtmlDocument, nid: NodeId) -> Option<(f32, f32, f32, f32)> {
+    let (x, y, w, h) = element_border_box_device(doc, nid, 1.0)?;
+    Some((x as f32, y as f32, w as f32, h as f32))
+}
+
+/// Axis-aligned border box in device pixels (CSS × `scale`), transforms applied.
+pub fn element_border_box_device(
+    doc: &HtmlDocument,
+    nid: NodeId,
+    scale: f64,
+) -> Option<(f64, f64, f64, f64)> {
     let node = doc.get_node(nid)?;
     if !node.is_element() {
         return None;
     }
-    let pos = node.absolute_position(0.0, 0.0);
     let layout = node.final_layout();
-    let x = pos.x as f64 * scale;
-    let y = pos.y as f64 * scale;
     let w = layout.size.width as f64 * scale;
     let h = layout.size.height as f64 * scale;
-    Some((x, y, w, h))
+    let xf = document_affine_device(doc, nid, scale)?;
+    let bbox = xf.transform_rect_bbox(KurboRect::new(0.0, 0.0, w, h));
+    Some((bbox.x0, bbox.y0, bbox.width(), bbox.height()))
+}
+
+/// Compute the element's own border box in device pixels: (x, y, w, h).
+fn own_box_device(doc: &HtmlDocument, nid: NodeId, scale: f64) -> Option<(f64, f64, f64, f64)> {
+    element_border_box_device(doc, nid, scale)
 }
 
 /// Inflate own box by outline, box-shadow, and scrollable overflow → ink rect.
+///
+/// Overflow / outline / shadow are expanded in the element's local border-box
+/// space, then the document affine (with transforms) maps that local ink to
+/// device pixels.
 pub(crate) fn ink_box_device(
     doc: &HtmlDocument,
     nid: NodeId,
     scale: f64,
 ) -> Option<(f64, f64, f64, f64)> {
-    let (ox, oy, ow, oh) = own_box_device(doc, nid, scale)?;
     let node = doc.get_node(nid)?;
+    if !node.is_element() {
+        return None;
+    }
+    let layout = node.final_layout();
+    let ow = layout.size.width as f64 * scale;
+    let oh = layout.size.height as f64 * scale;
 
-    let mut x0 = ox;
-    let mut y0 = oy;
-    let mut x1 = ox + ow;
-    let mut y1 = oy + oh;
+    let mut x0: f64 = 0.0;
+    let mut y0: f64 = 0.0;
+    let mut x1: f64 = ow;
+    let mut y1: f64 = oh;
 
-    // `scrollable_overflow` is node-local device px at the document's current
-    // viewport scale. Convert through CSS so origin and size always use the
-    // same `scale` (avoids size-only double-scale when the two diverge).
+    // `scrollable_overflow` is node-local device px at the document viewport
+    // scale. Convert through CSS when `scale` differs (harmless when equal;
+    // unproven in a real host flow — see issue #20 / Graph review).
     let overflow = node.scrollable_overflow();
     let doc_scale = doc.viewport().scale_f64().max(1e-6);
     let to_scale = scale / doc_scale;
-    x0 = x0.min(ox + overflow.x0 * to_scale);
-    y0 = y0.min(oy + overflow.y0 * to_scale);
-    x1 = x1.max(ox + overflow.x1 * to_scale);
-    y1 = y1.max(oy + overflow.y1 * to_scale);
+    x0 = x0.min(overflow.x0 * to_scale);
+    y0 = y0.min(overflow.y0 * to_scale);
+    x1 = x1.max(overflow.x1 * to_scale);
+    y1 = y1.max(overflow.y1 * to_scale);
 
     if let Some(style) = node.primary_styles() {
         let outline_w = style.get_outline().outline_width.0.to_f64_px() * scale;
@@ -282,14 +359,16 @@ pub(crate) fn ink_box_device(
             let blur = shadow.base.blur.px() as f64 * scale;
             let spread = shadow.spread.px() as f64 * scale;
             let pad = spread + blur * 1.5;
-            x0 = x0.min(ox + sx - pad);
-            y0 = y0.min(oy + sy - pad);
-            x1 = x1.max(ox + ow + sx + pad);
-            y1 = y1.max(oy + oh + sy + pad);
+            x0 = x0.min(sx - pad);
+            y0 = y0.min(sy - pad);
+            x1 = x1.max(ow + sx + pad);
+            y1 = y1.max(oh + sy + pad);
         }
     }
 
-    Some((x0, y0, x1 - x0, y1 - y0))
+    let xf = document_affine_device(doc, nid, scale)?;
+    let bbox = xf.transform_rect_bbox(KurboRect::new(x0, y0, x1, y1));
+    Some((bbox.x0, bbox.y0, bbox.width(), bbox.height()))
 }
 
 /// Snapshot every element's own + ink bounds after a successful paint resolve.
