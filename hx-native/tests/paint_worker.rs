@@ -53,6 +53,7 @@ fn packet(ticker_ver: u64, cell: &str) -> SyncPacket {
     SyncPacket {
         versions,
         actions: Vec::new(),
+        input_rules: Vec::new(),
         fragments,
     }
 }

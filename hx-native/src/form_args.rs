@@ -85,29 +85,35 @@ pub fn collect_action_args(
     args
 }
 
-/// Issue #15: one value per named form control for `RequiresChange` baseline
-/// / dirty comparison (document order, under `form_id`). Always one entry
-/// per control regardless of `disabled` (an `EnabledWhen` toggle must not by
-/// itself change dirtiness) — checkbox/radio encode as `"true"`/`"false"`
-/// (matching `data-hx-applied`'s own encoding, Designer lock 2026-10-20);
-/// everything else uses the literal control value (canonical for numbers).
-/// Empty when `form_id` is not in the document.
-pub(crate) fn capture_form_controls(doc: &HtmlDocument, form_id: &str) -> Vec<(String, String)> {
+/// Issue #15: one entry per named form control (document order, under
+/// `form_id`): its node id, name, current value, and — when present —
+/// its `data-hx-applied` value (Designer lock 2026-10-20), decoded into the
+/// same encoding as the current value: checkbox/radio as `"true"`/`"false"`;
+/// everything else the literal control value (canonical for numbers). Always
+/// one entry per control regardless of `disabled` (an `EnabledWhen` toggle
+/// must not by itself change `RequiresChange` dirtiness). Empty when
+/// `form_id` is not in the document.
+pub(crate) fn capture_form_controls(
+    doc: &HtmlDocument,
+    form_id: &str,
+) -> Vec<(NodeId, String, String, Option<String>)> {
     let Some(form_nid) = doc.get_element_by_id(form_id) else {
         return Vec::new();
     };
     descendants_document_order(doc, form_nid)
         .into_iter()
-        .filter_map(|nid| doc.get_node(nid))
-        .filter_map(|node| control_baseline_pair(doc, node))
+        .filter_map(|nid| {
+            let node = doc.get_node(nid)?;
+            let (name, current) = control_baseline_pair(doc, node)?;
+            Some((nid, name, current, applied_value(node)))
+        })
         .collect()
 }
 
-/// Issue #15 (Designer lock 2026-10-20): this control's `data-hx-applied`
-/// value decoded into the same encoding as [`capture_form_controls`]
-/// (`"true"`/`"false"` for checkbox/radio, the literal value otherwise).
-/// `None` when the control carries no `data-hx-applied`.
-pub(crate) fn applied_value(node: &Node) -> Option<String> {
+/// This control's `data-hx-applied` value decoded into the same encoding as
+/// [`capture_form_controls`]'s current value (`"true"`/`"false"` for
+/// checkbox/radio, the literal value otherwise). `None` when absent.
+fn applied_value(node: &Node) -> Option<String> {
     let raw = attr(node, ATTR_HX_APPLIED)?;
     let tag = tag_name(node);
     if tag == "input" && matches!(input_type(node).as_str(), "checkbox" | "radio") {

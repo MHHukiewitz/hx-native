@@ -1397,6 +1397,7 @@ mod mailbox_and_buffer_tests {
         SyncPacket {
             versions: HashMap::from([("ticker".into(), 1)]),
             actions: Vec::new(),
+            input_rules: Vec::new(),
             fragments,
         }
     }
