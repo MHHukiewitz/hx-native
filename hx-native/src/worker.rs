@@ -1177,9 +1177,19 @@ impl PaintWorker {
     /// blink phase on the worker's own `Engine` (default surface),
     /// mirroring [`crate::Engine::test_caret_visible`]. Blocks (bounded by
     /// [`WORKER_STALL_TIMEOUT_NS`]) until commands queued before this call
-    /// are applied, same as [`Self::flush`].
+    /// are applied.
+    ///
+    /// Deliberately does not mirror [`Self::flush`]'s blanket
+    /// `poll_error()` pre-check: that check honours a *stale* recorded
+    /// `Stalled` permanently (by design, for production hosts deciding
+    /// whether to fall back to the sync `Engine`), but a test probing
+    /// worker state after one slow-but-recovered operation (e.g. an
+    /// expensive first paint under a loaded CI box) still wants a fresh
+    /// answer. Only a genuine `Panic` — the thread is actually gone — stays
+    /// fatal, the same distinction [`Self::check_stall_after_enqueue`]
+    /// already draws for every fire-and-forget command.
     pub fn test_caret_visible(&self) -> Result<Option<bool>, WorkerError> {
-        if let Some(err) = self.poll_error() {
+        if let Some(err @ WorkerError::Panic(_)) = self.poll_error() {
             return Err(err);
         }
         let (tx, rx) = mpsc::sync_channel(1);
