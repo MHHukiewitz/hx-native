@@ -780,3 +780,204 @@ fn probe19_partial_vs_full_matrix() {
         "{bad}/{total} probe19 scenario(s) differ from full repaint"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Caret blink-off truth: match `caret-color:transparent` full repaint
+// (Graph HOLD @ 9cceef1a). Catch colour-fill overlay / missing suppression.
+// ---------------------------------------------------------------------------
+
+fn caret_truth_fields() -> String {
+    r##"
+<div id="pbg" style="position:absolute;left:0;top:0;width:290px;height:200px;background:linear-gradient(135deg,#204080,#c08020)"></div>
+<input id="t" type="text" name="t" value="hello" style="position:absolute;left:13.3px;top:17.7px;width:120px;height:22px;font-size:14px"/>
+<input id="g" type="text" name="g" value="hello" style="position:absolute;left:150px;top:17.7px;width:120px;height:22px;font-size:14px;background:linear-gradient(90deg,#ff4040,#4040ff)"/>
+<input id="st" type="text" name="st" value="hello" style="position:absolute;left:13.3px;top:67.7px;width:120px;height:26px;font-size:14px;background:repeating-linear-gradient(0deg,#ffffff 0px,#ffffff 2px,#a0a0a0 2px,#a0a0a0 4px)"/>
+<input id="al" type="text" name="al" value="hello" style="position:absolute;left:150px;top:67.7px;width:120px;height:22px;font-size:14px;background:rgba(255,255,255,0.35)"/>
+<button id="other" style="position:absolute;left:150px;top:140px">other</button>"##
+        .to_string()
+}
+
+fn caret_truth_html(transformed: bool, oracle: bool) -> String {
+    let inner = caret_truth_fields();
+    let body = if transformed {
+        format!(
+            r#"<div id="panel" style="position:absolute;left:50%;top:50%;width:290px;height:200px;transform:translate(-50%,-50%)">{inner}</div>"#
+        )
+    } else {
+        inner
+    };
+    let edge = r#"<input id="edge" type="text" name="edge" value="ab" style="position:absolute;left:372px;top:280px;width:120px;height:24px"/>"#;
+    let style = if oracle {
+        "<style>input{caret-color:transparent !important}</style>"
+    } else {
+        ""
+    };
+    format!(
+        "<!DOCTYPE html><html><head>{style}</head><body style=\"margin:0;width:400px;height:300px;background:#fff\">{body}{edge}</body></html>"
+    )
+}
+
+fn caret_truth_boot(transformed: bool, scale: f64, oracle: bool) -> Engine {
+    let mut e = Engine::new(EngineConfig {
+        max_paint_ns: 50_000_000,
+        pending_timeout_frames: 5,
+        paint_mode: PaintMode::Exact,
+        ..Default::default()
+    });
+    e.load_html(&caret_truth_html(transformed, oracle)).unwrap();
+    let _ = e.paint(vp(scale)).unwrap();
+    e
+}
+
+fn caret_click_at(e: &mut Engine, id: &str, fx: f32) {
+    let b = e.test_element_box(id).unwrap();
+    let _ = ptr(e, b.0 + b.2 * fx, b.1 + b.3 * 0.5);
+}
+
+#[derive(Clone, Copy)]
+enum CaretSt {
+    Click(f32),
+    Text(&'static str),
+    Key(&'static str),
+    Blink,
+    FailPaint,
+}
+use CaretSt as CS;
+
+fn caret_run(e: &mut Engine, s: f64, f: &str, steps: &[CS], paint_each: bool) {
+    for st in steps {
+        match *st {
+            CS::Click(fx) => caret_click_at(e, f, if f == "edge" { 0.1 } else { fx }),
+            CS::Text(t) => {
+                let _ = e.input(InputEvent::Text(t.into()));
+            }
+            CS::Key(k) => {
+                let _ = e.input(InputEvent::Key(KeyEvent {
+                    key: k.into(),
+                    code: k.into(),
+                    mods: Modifiers::default(),
+                    repeat: false,
+                    pressed: true,
+                }));
+            }
+            CS::Blink => e.test_force_caret_blink(),
+            CS::FailPaint => {
+                e.test_fail_next_paint();
+                let _ = e.paint(vp(s));
+            }
+        }
+        if paint_each {
+            let _ = e.paint(vp(s)).unwrap();
+        }
+    }
+}
+
+fn rgba_diff_count(a: &RgbaImage, b: &RgbaImage) -> usize {
+    a.pixels
+        .iter()
+        .zip(b.pixels.iter())
+        .filter(|(p, q)| p != q)
+        .count()
+}
+
+/// Mutation: restore colour-fill `erase_caret_rect`, or skip FOCUS suppress →
+/// blink-off frames diverge from `caret-color:transparent` truth.
+#[test]
+fn caret_blink_off_matches_transparent_caret_truth() {
+    let scen: Vec<(&str, Vec<CS>)> = vec![
+        ("off", vec![CS::Click(0.9), CS::Blink]),
+        ("off_on", vec![CS::Click(0.9), CS::Blink, CS::Blink]),
+        (
+            "move_mid_off",
+            vec![
+                CS::Click(0.9),
+                CS::Key("Home"),
+                CS::Key("ArrowRight"),
+                CS::Key("ArrowRight"),
+                CS::Blink,
+            ],
+        ),
+        (
+            "type_during_off",
+            vec![CS::Click(0.9), CS::Blink, CS::Text("k"), CS::Blink],
+        ),
+        ("home_off", vec![CS::Click(0.9), CS::Key("Home"), CS::Blink]),
+        (
+            "failpaint_off",
+            vec![
+                CS::Click(0.9),
+                CS::Blink,
+                CS::FailPaint,
+                CS::Blink,
+                CS::Blink,
+            ],
+        ),
+    ];
+    let mut bad_parity = 0usize;
+    let mut bad_truth = 0usize;
+    let mut total = 0usize;
+    let mut truth_checked = 0usize;
+    for transformed in [false, true] {
+        for scale in [1.0, 1.25, 2.0] {
+            for field in ["t", "g", "st", "al", "edge"] {
+                for (name, steps) in &scen {
+                    total += 1;
+                    let mut a = caret_truth_boot(transformed, scale, false);
+                    caret_run(&mut a, scale, field, steps, true);
+                    let pa = a.last_frame().expect("partial").clone();
+                    let caret = a.test_caret_visible();
+
+                    let mut b = caret_truth_boot(transformed, scale, false);
+                    caret_run(&mut b, scale, field, steps, false);
+                    b.mark_theme_or_stylesheet_changed();
+                    let pb = b.paint(vp(scale)).unwrap().rgba.unwrap();
+                    let dp = rgba_diff_count(&pa, &pb);
+                    if dp != 0 {
+                        bad_parity += 1;
+                        eprintln!(
+                            "CARET PARITY FAIL transformed={transformed} scale={scale} \
+                             field={field} {name} diffs={dp}"
+                        );
+                    }
+
+                    // Truth only when blink-off (caret not visible).
+                    if caret != Some(true) {
+                        truth_checked += 1;
+                        let mut o = caret_truth_boot(transformed, scale, true);
+                        let osteps: Vec<CS> = steps
+                            .iter()
+                            .copied()
+                            .filter(|x| !matches!(x, CS::Blink))
+                            .collect();
+                        caret_run(&mut o, scale, field, &osteps, false);
+                        assert!(
+                            o.test_caret_visible().unwrap_or(true),
+                            "oracle must keep Blitz focus (caret_visible) while \
+                             caret-color:transparent hides pixels"
+                        );
+                        o.mark_theme_or_stylesheet_changed();
+                        let po = o.paint(vp(scale)).unwrap().rgba.unwrap();
+                        let dt = rgba_diff_count(&pa, &po);
+                        if dt != 0 {
+                            bad_truth += 1;
+                            eprintln!(
+                                "CARET TRUTH FAIL transformed={transformed} scale={scale} \
+                                 field={field} {name} diffs={dt} (focus ring / glyph / bg)"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        bad_parity, 0,
+        "{bad_parity}/{total} caret scenarios differ partial vs full"
+    );
+    assert!(truth_checked > 0, "expected blink-off truth cases");
+    assert_eq!(
+        bad_truth, 0,
+        "{bad_truth}/{truth_checked} blink-off frames differ from \
+         caret-color:transparent truth (colour overlay or missing FOCUS suppress)"
+    );
+}

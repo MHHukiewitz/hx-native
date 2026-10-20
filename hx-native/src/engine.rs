@@ -3624,6 +3624,24 @@ impl LiveSurface {
         // on `?` / panic via Drop.
         drop(session);
         let mut frame = rgba?;
+
+        // Blink-off: re-rasterize the caret damage rect with FOCUS cleared so
+        // Blitz skips caret drawing (render.rs is_focussed check). No colour
+        // overlay — that clipped glyphs and flattened gradients/stripes.
+        if self.text_edit.as_ref().is_some_and(|s| !s.caret_visible) {
+            let nid = self.text_edit.as_ref().map(|s| s.node_id);
+            if let Some(nid) = nid {
+                if !has_selection(&mut self.doc, nid) {
+                    if let Some(r) = caret_device_rect(&mut self.doc, nid, scale, width, height) {
+                        let mut suppress = SuppressCaretFocus::clear(&mut self.doc, nid);
+                        paint_damage_into(suppress.doc_mut(), &mut frame, scale, &[r], paint_mode)?;
+                        // Drop restores ElementState::FOCUS before overlays.
+                        drop(suppress);
+                    }
+                }
+            }
+        }
+
         // Engine-drawn select face button + open list (above Blitz content).
         paint_select_overlays(
             &self.doc,
@@ -3634,18 +3652,6 @@ impl LiveSurface {
                 .or_else(|| self.open_select.as_ref().map(|o| o.highlight)),
             &self.select_nids,
         );
-
-        // Blink-off overlay: hide Blitz caret without touching focus (blocker 5).
-        if self.text_edit.as_ref().is_some_and(|s| !s.caret_visible) {
-            let nid = self.text_edit.as_ref().map(|s| s.node_id);
-            if let Some(nid) = nid {
-                if !has_selection(&mut self.doc, nid) {
-                    if let Some(r) = caret_device_rect(&mut self.doc, nid, scale, width, height) {
-                        erase_caret_rect(&mut frame, r);
-                    }
-                }
-            }
-        }
         Ok(frame)
     }
 
@@ -3662,33 +3668,51 @@ impl LiveSurface {
     }
 }
 
-/// Hide Blitz's caret by filling its device-pixel rect with a neighbour sample
-/// (left of the caret, falling back to white). Keeps focus / selection / IME.
-fn erase_caret_rect(frame: &mut RgbaImage, r: IntRect) {
-    let x0 = r.x.max(0) as u32;
-    let y0 = r.y.max(0) as u32;
-    let x1 = ((r.x + r.w).max(0) as u32).min(frame.width);
-    let y1 = ((r.y + r.h).max(0) as u32).min(frame.height);
-    if x0 >= x1 || y0 >= y1 {
-        return;
+/// Temporarily clear `ElementState::FOCUS` for one paint so Blitz skips the
+/// caret (`is_focussed()` at paint time) without `snapshot_node_and`, ancestor
+/// dirty marks, or IME toggling. Restores FOCUS on Drop (incl. panic / `?`).
+struct SuppressCaretFocus<'a> {
+    doc: &'a mut HtmlDocument,
+    nid: NodeId,
+    had_focus: bool,
+}
+
+impl<'a> SuppressCaretFocus<'a> {
+    fn clear(doc: &'a mut HtmlDocument, nid: NodeId) -> Self {
+        let had_focus = doc
+            .get_node_mut(nid)
+            .and_then(|n| n.element_data_mut())
+            .map(|el| {
+                let had = el.element_state.contains(style_dom::ElementState::FOCUS);
+                if had {
+                    el.element_state.remove(style_dom::ElementState::FOCUS);
+                }
+                had
+            })
+            .unwrap_or(false);
+        Self {
+            doc,
+            nid,
+            had_focus,
+        }
     }
-    let sample_x = x0.saturating_sub(1);
-    let sample_y = y0.min(frame.height.saturating_sub(1));
-    let si = ((sample_y * frame.width + sample_x) * 4) as usize;
-    let color = if si + 4 <= frame.pixels.len() {
-        [
-            frame.pixels[si],
-            frame.pixels[si + 1],
-            frame.pixels[si + 2],
-            frame.pixels[si + 3],
-        ]
-    } else {
-        [255, 255, 255, 255]
-    };
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let i = ((y * frame.width + x) * 4) as usize;
-            frame.pixels[i..i + 4].copy_from_slice(&color);
+
+    fn doc_mut(&mut self) -> &mut HtmlDocument {
+        self.doc
+    }
+}
+
+impl Drop for SuppressCaretFocus<'_> {
+    fn drop(&mut self) {
+        if !self.had_focus {
+            return;
+        }
+        if let Some(el) = self
+            .doc
+            .get_node_mut(self.nid)
+            .and_then(|n| n.element_data_mut())
+        {
+            el.element_state.insert(style_dom::ElementState::FOCUS);
         }
     }
 }

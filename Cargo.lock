@@ -716,6 +716,7 @@ dependencies = [
  "peniko",
  "serde_json",
  "stylo",
+ "stylo_dom",
 ]
 
 [[package]]
