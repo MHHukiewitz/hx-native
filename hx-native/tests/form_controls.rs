@@ -1399,7 +1399,9 @@ fn open_select_closes_on_focus_change() {
         "Enter after Tab-away must activate button, got {out:?}"
     );
 
-    // --- Pointer click elsewhere (pointer-down focus reconcile). ---
+    // --- Primary click elsewhere: closes via pointer-down close_select (before
+    // focus), not via reconcile. Removing reconcile alone must not be required
+    // for this case; removing the Primary outside close_select must fail it. ---
     let mut eng = boot(html, &["set.lang", "noop"]);
     eng.test_set_focus("lang");
     open_select_alt_down(&mut eng);
@@ -1411,7 +1413,7 @@ fn open_select_closes_on_focus_change() {
     let esc = key(&mut eng, "Escape", Modifiers::default());
     assert!(
         matches!(esc, InputOutcome::Unhandled(ref k) if k.key == "Escape"),
-        "Esc after click-away close must be Unhandled (click_out={click_out:?}), got {esc:?}"
+        "Esc after primary click-away close must be Unhandled (click_out={click_out:?}), got {esc:?}"
     );
     assert_eq!(
         eng.focus_state().focused_id.as_deref(),
@@ -1422,6 +1424,38 @@ fn open_select_closes_on_focus_change() {
     assert!(
         !matches!(arrow, InputOutcome::None),
         "ArrowDown after click-away must not be consumed by open select; got {arrow:?}"
+    );
+
+    // --- Secondary click elsewhere: Primary close_select does not run, so close
+    // depends on reconcile_open_select_after_focus after focus moves. ---
+    let mut eng = boot(html, &["set.lang", "noop"]);
+    eng.test_set_focus("lang");
+    open_select_alt_down(&mut eng);
+    let _ = eng.paint(vp()).unwrap();
+    let other = eng.test_element_box("other").expect("other box");
+    let cx = other.0 + other.2 * 0.5;
+    let cy = other.1 + other.3 * 0.5;
+    let _ = eng.input(InputEvent::PointerDown {
+        x: cx,
+        y: cy,
+        button: PointerButton::Secondary,
+        mods: Modifiers::default(),
+    });
+    let _ = eng.input(InputEvent::PointerUp {
+        x: cx,
+        y: cy,
+        button: PointerButton::Secondary,
+        mods: Modifiers::default(),
+    });
+    assert_eq!(
+        eng.focus_state().focused_id.as_deref(),
+        Some("other"),
+        "secondary click on #other must focus it"
+    );
+    let esc = key(&mut eng, "Escape", Modifiers::default());
+    assert!(
+        matches!(esc, InputOutcome::Unhandled(ref k) if k.key == "Escape"),
+        "Esc after secondary click-away close must be Unhandled, got {esc:?}"
     );
 
     // Close-via-Tab pending damage must clear the list at 0 px vs full.
@@ -1665,6 +1699,55 @@ fn select_open_in_translated_panel_parity_and_clicks() {
         &SCALES[..],
         "radio scale loop must cover 1 / 1.25 / 2"
     );
+}
+
+/// Press on a list row, release outside: list must close (Esc Unhandled).
+/// Covers select-without-id inside a parent with id — a regression where
+/// pointer-up closed only when focus was still "on" the select.
+#[test]
+fn select_dragout_release_closes() {
+    for with_id in [true, false] {
+        // No hx-* so a missing id is dialect-legal; click still opens the list.
+        let select_open = if with_id {
+            r#"<select id="lang" name="language"
+        style="width:120px;height:22px;display:block">"#
+        } else {
+            r#"<select name="language"
+        style="width:120px;height:22px;display:block">"#
+        };
+        let html = format!(
+            r#"
+<div id="wrap" style="position:absolute;left:8px;top:8px;width:300px;height:200px">
+  {select_open}
+    <option value="en" selected="">English</option>
+    <option value="de">Deutsch</option>
+  </select>
+</div>
+"#
+        );
+        let mut eng = boot(&html, &[]);
+        // Open by clicking the control face.
+        let _ = click(&mut eng, 20.0, 18.0);
+        let _ = eng.paint(vp()).unwrap();
+        // Press on row 1 (Deutsch), release far outside.
+        let _ = eng.input(InputEvent::PointerDown {
+            x: 20.0,
+            y: 58.0,
+            button: PointerButton::Primary,
+            mods: Modifiers::default(),
+        });
+        let _ = eng.input(InputEvent::PointerUp {
+            x: 350.0,
+            y: 280.0,
+            button: PointerButton::Primary,
+            mods: Modifiers::default(),
+        });
+        let esc = key(&mut eng, "Escape", Modifiers::default());
+        assert!(
+            matches!(esc, InputOutcome::Unhandled(ref k) if k.key == "Escape"),
+            "with_id={with_id}: Esc after drag-out release must be Unhandled (list closed), got {esc:?}"
+        );
+    }
 }
 
 /// Overflowing open-list damage must be clamped to the surface (hosts upload
