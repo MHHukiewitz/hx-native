@@ -395,7 +395,7 @@ fn is_checked(node: &Node) -> bool {
     attr(node, "checked").is_some()
 }
 
-fn closest_form(doc: &HtmlDocument, nid: NodeId) -> Option<NodeId> {
+pub(crate) fn closest_form(doc: &HtmlDocument, nid: NodeId) -> Option<NodeId> {
     let mut parent = doc.get_node(nid)?.parent;
     while let Some(pid) = parent {
         let node = doc.get_node(pid)?;

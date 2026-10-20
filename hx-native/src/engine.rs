@@ -20,8 +20,9 @@ use crate::error::EngineError;
 use crate::focus::{focusable_ids, ids_in_document_order, step_focus};
 use crate::fonts::bundled_font_context;
 use crate::form_args::{
-    collect_action_args, is_number_input, is_numeric_input, set_range_value_from_x,
-    step_numeric_value,
+    clamp_snap_value, closest_form, collect_action_args, format_numeric, is_number_input,
+    is_numeric_input, parse_f64, set_range_value_from_x, step_numeric_value, write_value_attr,
+    NumericLimits,
 };
 use crate::form_controls::{
     activate_checkable, control_is_disabled, form_control_at_point, select_options, select_radio,
@@ -218,6 +219,10 @@ struct LiveSurface {
     panic_next_paint: bool,
     /// Focused text/number edit session (issue #17).
     text_edit: Option<TextEditSession>,
+    /// Cached `(action, input name, InputLimits)` from the last
+    /// `SliceSource::input_limits` call (issue #16). Re-applied to matching
+    /// inputs after a swap without calling `input_limits` again.
+    limits_cache: Vec<(String, String, InputLimits)>,
 }
 
 #[derive(Clone, Debug)]
@@ -1203,6 +1208,18 @@ impl Engine {
             .and_then(|live| live.text_edit.as_ref().map(|s| s.caret_visible))
     }
 
+    /// Test harness: current `PlainEditor` display text for `#id` (issue
+    /// #16: verifies a clamp regroups the unfocused number display).
+    #[doc(hidden)]
+    pub fn test_editor_display(&mut self, elem_id: &str) -> Option<String> {
+        let live = self
+            .surfaces
+            .get_mut(&SurfaceId::DEFAULT)
+            .and_then(|s| s.live.as_mut())?;
+        let nid = live.doc.get_element_by_id(elem_id)?;
+        editor_text(&mut live.doc, nid)
+    }
+
     /// Test helper: subscribed slice names the engine will ask `version` for.
     pub fn subscribed_slices(&self) -> HashSet<String> {
         let mut s = HashSet::new();
@@ -1302,6 +1319,7 @@ impl LiveSurface {
             fail_next_paint: false,
             panic_next_paint: false,
             text_edit: None,
+            limits_cache: Vec::new(),
         })
     }
 
@@ -1422,6 +1440,7 @@ impl LiveSurface {
             }
         }
 
+        let prev_actions_version = self.slice_versions.get("actions").copied();
         let initial = self.slice_versions.is_empty();
         let mut dirty_sections: Vec<String> = Vec::new();
 
@@ -1461,7 +1480,20 @@ impl LiveSurface {
             }
         }
 
+        let actions_changed = current.get("actions").copied() != prev_actions_version;
         self.slice_versions = current;
+
+        // Issue #16: range/number limits from the `actions` slice. Cheap by
+        // design (Game's request) — only re-pull `input_limits` on the
+        // initial sync or when the `actions` slice version changes. A swap
+        // elsewhere in this same sync still needs cached limits re-applied,
+        // since fragment HTML never carries them (Designer lock: samples
+        // omit min/max/step).
+        if initial || actions_changed {
+            self.refresh_input_limits(slices)?;
+        } else if !dirty_sections.is_empty() {
+            self.reapply_cached_limits();
+        }
 
         // Apply actions-slice greying only when the desired state differs from
         // what is already on the DOM (or after a swap that replaced elements).
@@ -1663,6 +1695,199 @@ impl LiveSurface {
         self.mark_paint_dirty();
         self.reconcile_open_select();
         self.reconcile_text_edit();
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #16: range/number min/max/step from the `actions` slice.
+    // ------------------------------------------------------------------
+
+    /// Pull `SliceSource::input_limits`, validate it, write it onto every
+    /// matching `<input type=range|number>`, clamp out-of-range values, and
+    /// cache it so later swaps can re-apply without calling `input_limits`
+    /// again.
+    fn refresh_input_limits(&mut self, slices: &dyn SliceSource) -> Result<(), EngineError> {
+        let raw = slices.input_limits();
+        for (action, input, limits) in &raw {
+            validate_input_limits(action, input, limits)?;
+        }
+        self.apply_limits_to_doc(&raw, true)?;
+        self.limits_cache = raw;
+        Ok(())
+    }
+
+    /// Re-apply the cached limits (no `input_limits` call). Best-effort: a
+    /// swap's fresh fragment that no longer matches a cached entry is not an
+    /// error here — only `refresh_input_limits` validates against the slice.
+    fn reapply_cached_limits(&mut self) {
+        if self.limits_cache.is_empty() {
+            return;
+        }
+        let cached = self.limits_cache.clone();
+        let _ = self.apply_limits_to_doc(&cached, false);
+    }
+
+    /// Write `entries` onto their matching inputs. `validate`: error
+    /// (`UnknownLimitInput`) on an input name with no match inside a form
+    /// that does exist for its action. Not an error when no form for the
+    /// action is in the document at all (it may be on another surface, or
+    /// not rendered yet).
+    fn apply_limits_to_doc(
+        &mut self,
+        entries: &[(String, String, InputLimits)],
+        validate: bool,
+    ) -> Result<(), EngineError> {
+        let mut any_changed = false;
+        for (action, input_name, limits) in entries {
+            let forms = self.forms_for_action(action);
+            if forms.is_empty() {
+                continue;
+            }
+            let mut matched = false;
+            for form_nid in forms {
+                for input_nid in self.range_or_number_inputs_named(form_nid, input_name) {
+                    matched = true;
+                    if self.write_limits_onto(input_nid, limits) {
+                        any_changed = true;
+                    }
+                }
+            }
+            if !matched && validate {
+                return Err(EngineError::UnknownLimitInput {
+                    action: action.clone(),
+                    input: input_name.clone(),
+                });
+            }
+        }
+        if any_changed {
+            self.mark_dom_dirty();
+            self.mark_paint_dirty();
+        }
+        Ok(())
+    }
+
+    /// Forms (by `NodeId`) that are, or contain, an element whose `hx-post`
+    /// names `action`. Dedup-preserving; empty when `action` has no
+    /// `hx-post` element anywhere in this document.
+    fn forms_for_action(&self, action: &str) -> Vec<NodeId> {
+        let mut forms = Vec::new();
+        for b in self.bindings.values() {
+            if b.hx_post.as_deref() != Some(action) {
+                continue;
+            }
+            let Some(nid) = self.doc.get_element_by_id(&b.id) else {
+                continue;
+            };
+            let is_form_itself = self
+                .doc
+                .get_node(nid)
+                .and_then(|n| n.element_data())
+                .is_some_and(|el| &*el.name.local == "form");
+            let form_nid = if is_form_itself {
+                Some(nid)
+            } else {
+                closest_form(&self.doc, nid)
+            };
+            if let Some(f) = form_nid {
+                if !forms.contains(&f) {
+                    forms.push(f);
+                }
+            }
+        }
+        forms
+    }
+
+    /// `<input type=range|number name=name>` descendants of `form_nid`.
+    fn range_or_number_inputs_named(&self, form_nid: NodeId, name: &str) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut stack = vec![form_nid];
+        while let Some(nid) = stack.pop() {
+            let Some(node) = self.doc.get_node(nid) else {
+                continue;
+            };
+            for &c in node.children.iter().rev() {
+                stack.push(c);
+            }
+            if is_numeric_input(node) && node_attr(&self.doc, nid, "name").as_deref() == Some(name)
+            {
+                out.push(nid);
+            }
+        }
+        out
+    }
+
+    /// Write `min`/`max`/`step` onto `nid` (slice wins over markup; a
+    /// debug-only warning logs when markup already disagreed) and
+    /// clamp/snap its current value. Returns `true` when any attribute
+    /// (including `value`) changed. Never fires `change` / `Action` — a
+    /// clamp is a local value change only, never an edit the host sees.
+    fn write_limits_onto(&mut self, nid: NodeId, limits: &InputLimits) -> bool {
+        let min_s = format_numeric(limits.min);
+        let max_s = format_numeric(limits.max);
+        let step_s = limits
+            .step
+            .map(format_numeric)
+            .unwrap_or_else(|| "any".to_string());
+
+        let cur_min = node_attr(&self.doc, nid, "min");
+        let cur_max = node_attr(&self.doc, nid, "max");
+        let cur_step = node_attr(&self.doc, nid, "step");
+        let is_number = self.doc.get_node(nid).is_some_and(is_number_input);
+
+        #[cfg(debug_assertions)]
+        {
+            let markup_disagrees = (cur_min.is_some() && cur_min.as_deref() != Some(min_s.as_str()))
+                || (cur_max.is_some() && cur_max.as_deref() != Some(max_s.as_str()))
+                || (cur_step.is_some() && cur_step.as_deref() != Some(step_s.as_str()));
+            if markup_disagrees {
+                eprintln!(
+                    "hx_native: actions-slice limits override markup min/max/step \
+                     (slice is the source of truth, issue #16)"
+                );
+            }
+        }
+
+        let mut changed = false;
+        {
+            let mut mutr = self.doc.mutate();
+            if cur_min.as_deref() != Some(min_s.as_str()) {
+                mutr.set_attribute(nid, qual_name!("min"), &min_s);
+                changed = true;
+            }
+            if cur_max.as_deref() != Some(max_s.as_str()) {
+                mutr.set_attribute(nid, qual_name!("max"), &max_s);
+                changed = true;
+            }
+            if cur_step.as_deref() != Some(step_s.as_str()) {
+                mutr.set_attribute(nid, qual_name!("step"), &step_s);
+                changed = true;
+            }
+        }
+
+        let clamp_limits = NumericLimits {
+            min: Some(limits.min),
+            max: Some(limits.max),
+            step: limits.step.unwrap_or(0.0),
+        };
+        let current = node_attr(&self.doc, nid, "value")
+            .and_then(|s| parse_f64(&s))
+            .unwrap_or(limits.min);
+        let clamped_s = format_numeric(clamp_snap_value(current, &clamp_limits));
+        if write_value_attr(&mut self.doc, nid, &clamped_s) {
+            changed = true;
+            let focused_here = self.text_edit.as_ref().is_some_and(|s| s.node_id == nid);
+            if is_number && !focused_here {
+                apply_unfocused_display(&mut self.doc, nid);
+            }
+            if let Some(elem_id) = node_id_attr(&self.doc, nid) {
+                let _ = sync_outputs_for(&mut self.doc, &elem_id);
+            }
+            if is_number {
+                self.queue_text_field_damage(nid);
+            } else {
+                self.mark_paint_dirty();
+            }
+        }
+        changed
     }
 
     fn count_damage(&self) -> (usize, usize) {
@@ -3906,6 +4131,54 @@ fn ids_removed_by_swap(doc: &HtmlDocument, target: NodeId, swap: SwapMode) -> Ha
         // outerHTML replaces the target node itself.
         SwapMode::OuterHtml => collect_subtree_ids(doc, target, true),
     }
+}
+
+/// Validate one `SliceSource::input_limits` entry (issue #16): finite
+/// bounds, `min <= max`, and `step` (when present) finite and `> 0`.
+fn validate_input_limits(
+    action: &str,
+    input: &str,
+    limits: &InputLimits,
+) -> Result<(), EngineError> {
+    let reason = if !limits.min.is_finite() || !limits.max.is_finite() {
+        Some("min/max must be finite numbers".to_string())
+    } else if limits.min > limits.max {
+        Some(format!(
+            "min ({}) must be <= max ({})",
+            limits.min, limits.max
+        ))
+    } else if let Some(step) = limits.step {
+        if !step.is_finite() || step <= 0.0 {
+            Some(format!("step ({step}) must be > 0 when present"))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    match reason {
+        Some(reason) => Err(EngineError::InvalidInputLimits {
+            action: action.to_string(),
+            input: input.to_string(),
+            reason,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Attribute `name` of node `nid`, if any (issue #16: inputs matched by
+/// `name=` rather than a stable `id`).
+fn node_attr(doc: &HtmlDocument, nid: NodeId, name: &str) -> Option<String> {
+    doc.get_node(nid)?
+        .attrs()?
+        .iter()
+        .find(|a| &*a.name.local == name)
+        .map(|a| a.value.to_string())
+}
+
+/// Stable `id` attribute of node `nid`, if any (non-empty).
+fn node_id_attr(doc: &HtmlDocument, nid: NodeId) -> Option<String> {
+    node_attr(doc, nid, "id").filter(|s| !s.is_empty())
 }
 
 fn element_id_and_attrs(node: &blitz_dom::Node) -> (String, Vec<(String, String)>) {

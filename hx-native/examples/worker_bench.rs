@@ -72,6 +72,7 @@ fn packet(ver: u64, offset: i32) -> SyncPacket {
         versions,
         actions: Vec::new(),
         fragments,
+        input_limits: Vec::new(),
     }
 }
 

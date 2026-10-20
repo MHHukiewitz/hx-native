@@ -130,10 +130,17 @@ pub struct SyncPacket {
     pub versions: HashMap<String, u64>,
     pub actions: Vec<(String, ActionState)>,
     pub fragments: HashMap<String, String>,
+    /// `(action, input name) -> InputLimits` (issue #16). See
+    /// [`SliceSource::input_limits`].
+    pub input_limits: Vec<(String, String, InputLimits)>,
 }
 
 impl SyncPacket {
     /// Merge `newer` per slice / section (latest key wins). Used when coalescing.
+    ///
+    /// `input_limits` is fixed per build (Game's design) and usually sent
+    /// once, so a later coalesced packet with an empty `input_limits` must
+    /// not drop limits a slightly older queued packet already carried.
     pub fn merge_per_slice(&mut self, newer: SyncPacket) {
         let replace_actions = newer.versions.contains_key("actions") || !newer.actions.is_empty();
         for (k, v) in newer.versions {
@@ -145,6 +152,9 @@ impl SyncPacket {
         if replace_actions {
             self.actions = newer.actions;
         }
+        if !newer.input_limits.is_empty() {
+            self.input_limits = newer.input_limits;
+        }
     }
 }
 
@@ -155,6 +165,10 @@ impl SliceSource for SyncPacket {
 
     fn action_states(&self) -> Vec<(String, ActionState)> {
         self.actions.clone()
+    }
+
+    fn input_limits(&self) -> Vec<(String, String, InputLimits)> {
+        self.input_limits.clone()
     }
 }
 
@@ -1388,6 +1402,7 @@ mod mailbox_and_buffer_tests {
             versions: HashMap::from([("ticker".into(), 1)]),
             actions: Vec::new(),
             fragments,
+            input_limits: Vec::new(),
         }
     }
 

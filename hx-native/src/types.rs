@@ -173,6 +173,21 @@ pub enum ActionState {
     },
 }
 
+/// Per-input numeric bounds declared via [`SliceSource::input_limits`] (issue
+/// #16: `actions.<action>.limits.<input>`). Samples/mocks omit `min`/`max`/
+/// `step` on `<input type=range|number>`; the host's `actions` slice is the
+/// source of truth and always wins over markup.
+///
+/// `step: None` means any value (htmx `step="any"`); the engine still writes
+/// `step="any"` and falls back to a step of `1` for arrow/spin stepping,
+/// matching the existing missing-`step` default.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InputLimits {
+    pub min: f64,
+    pub max: f64,
+    pub step: Option<f64>,
+}
+
 /// Host hook: renders HTML for one section. Called only for dirty sections
 /// (plus once for every section right after load).
 pub trait FragmentSource {
@@ -184,6 +199,19 @@ pub trait SliceSource {
     fn version(&self, name: &str) -> Option<u64>;
     /// Only for the reserved `actions` slice (greyed-before-click).
     fn action_states(&self) -> Vec<(String, ActionState)>;
+    /// `(action, input name) -> InputLimits`, from the reserved `actions`
+    /// slice (issue #16: `actions.<action>.limits.<input>`). Default: none —
+    /// a non-breaking addition, so existing `SliceSource` implementors
+    /// compile unchanged.
+    ///
+    /// The engine calls this only on the initial `sync` and whenever the
+    /// `actions` slice version changes (Game's request: limits are fixed per
+    /// build, so hand them over once rather than on every tick). It caches
+    /// the result and re-applies it from the cache whenever a later swap
+    /// re-renders a matching input.
+    fn input_limits(&self) -> Vec<(String, String, InputLimits)> {
+        Vec::new()
+    }
 }
 
 /// Input the host (UI) converts from egui/winit. Raw: no platform remapping.

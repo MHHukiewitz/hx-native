@@ -22,6 +22,19 @@ pub enum EngineError {
         attr: String,
         reason: String,
     },
+    /// `SliceSource::input_limits` (issue #16) names a range/number input
+    /// that does not exist inside any `<form>` that does exist for `action`.
+    /// **Not** raised when no form for `action` is in the document at all
+    /// (it may be on another surface, or simply not rendered yet).
+    UnknownLimitInput { action: String, input: String },
+    /// A `SliceSource::input_limits` (issue #16) entry failed validation:
+    /// non-finite `min`/`max`, `min > max`, or a non-finite / non-positive
+    /// `step` when `Some`.
+    InvalidInputLimits {
+        action: String,
+        input: String,
+        reason: String,
+    },
     /// Paint / layout failure.
     Paint(String),
     /// Engine used before `load_html`.
@@ -53,6 +66,18 @@ impl fmt::Display for EngineError {
             EngineError::InvalidAttribute { id, attr, reason } => {
                 write!(f, "invalid attribute `{attr}` on `{id}`: {reason}")
             }
+            EngineError::UnknownLimitInput { action, input } => write!(
+                f,
+                "input_limits names unknown input `{input}` for action `{action}`"
+            ),
+            EngineError::InvalidInputLimits {
+                action,
+                input,
+                reason,
+            } => write!(
+                f,
+                "invalid input_limits for `{action}.{input}`: {reason}"
+            ),
             EngineError::Paint(msg) => write!(f, "paint error: {msg}"),
             EngineError::NotLoaded => write!(f, "engine has no loaded HTML"),
             EngineError::UnknownSurface(id) => write!(f, "{id} is not open"),
