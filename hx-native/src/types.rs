@@ -164,7 +164,13 @@ impl From<String> for Reason {
 }
 
 /// Published by the host as the reserved `actions` slice.
+///
+/// `#[non_exhaustive]` (Graph review 17:01, one-time breaking change
+/// alongside adding `RequiresChange` — see docs/REQUIREMENTS.md): every
+/// downstream exhaustive match on `ActionState` needs a `_` arm from here
+/// on, the same as `InputEvent` / `InputOutcome` already require.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ActionState {
     Enabled,
     /// One plain string; the crate never invents copy.
