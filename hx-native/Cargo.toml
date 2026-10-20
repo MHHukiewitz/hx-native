@@ -91,6 +91,10 @@ path = "examples/surface_probe.rs"
 name = "worker_bench"
 path = "examples/worker_bench.rs"
 
+[[example]]
+name = "text_input_bench"
+path = "examples/text_input_bench.rs"
+
 [[bin]]
 name = "check_deps"
 path = "src/bin/check_deps.rs"

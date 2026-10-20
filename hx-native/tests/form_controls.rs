@@ -1813,3 +1813,93 @@ fn open_select_overflow_damage_clamped() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #17: typing inside a translate(-50%,-50%) panel — partial vs full
+// ---------------------------------------------------------------------------
+
+fn text_in_translated_panel_html() -> &'static str {
+    r#"
+<div id="panel" style="position:absolute;left:50%;top:50%;width:240px;height:80px;
+     transform:translate(-50%,-50%);background:#c0c0c0">
+  <input id="name" type="text" name="name" value=""
+         hx-post="set.name" hx-trigger="change"
+         style="width:200px;height:24px;display:block;margin:12px;font-size:14px" />
+</div>
+"#
+}
+
+/// Typing in a Pause-style centered panel: partial paint must match a forced
+/// full repaint at scales 1 / 1.25 / 2 (transform-aware field damage).
+///
+/// Mutations that make this fail (verified):
+/// - Skip `mark_dom_dirty` + `queue_text_field_damage` on `InputEvent::Text` →
+///   paint is skipped (`typing must paint`).
+/// - Use `absolute_position` instead of `element_border_box_device` in
+///   `queue_text_field_damage` **and** drop Blitz raw/style damage for the
+///   field → damage misses the translated box (overlap assert). With raw
+///   damage alone the glyph change can still be covered; pending must still
+///   go through transform-aware `push_pending_damage`.
+/// - Cut the scale loop to `[1.0]` only → `assert_eq!(seen, SCALES)` fails.
+#[test]
+fn type_in_translated_panel_partial_vs_full_parity() {
+    const SCALES: [f64; 3] = [1.0, 1.25, 2.0];
+    let mut seen = Vec::new();
+    for scale in SCALES {
+        seen.push(scale);
+        let html = text_in_translated_panel_html();
+        // Explicit path (not only the helper): assert damage overlaps the
+        // transform-aware input box — absolute_position damage would miss it.
+        let mut eng = boot_at(html, &["set.name"], scale);
+        eng.test_set_focus("name");
+        let _ = eng.paint(vp_at(scale)).unwrap();
+        let box_css = eng.test_element_box("name").expect("name box");
+        let _ = eng.input(InputEvent::Text("Hi".into()));
+        let partial = eng.paint(vp_at(scale)).unwrap();
+        assert!(
+            !partial.skipped && partial.rgba.is_some(),
+            "scale={scale}: typing must paint"
+        );
+        assert!(
+            !eng.last_paint_stats().full_repaint,
+            "scale={scale}: typing must be partial, stats={:?}",
+            eng.last_paint_stats()
+        );
+        let (bx, by, bw, bh) = box_css;
+        let scale_f = scale as f32;
+        let hit = partial.damage.iter().any(|r| {
+            let rx0 = r.x;
+            let ry0 = r.y;
+            let rx1 = r.x + r.width;
+            let ry1 = r.y + r.height;
+            let ix0 = bx * scale_f;
+            let iy0 = by * scale_f;
+            let ix1 = (bx + bw) * scale_f;
+            let iy1 = (by + bh) * scale_f;
+            rx0 < ix1 && rx1 > ix0 && ry0 < iy1 && ry1 > iy0
+        });
+        assert!(
+            hit,
+            "scale={scale}: damage must overlap transform-aware input box              box=({bx},{by},{bw},{bh}) scale={scale} damage={:?}",
+            partial.damage
+        );
+        let partial_px = partial.rgba.unwrap();
+
+        let mut eng_full = boot_at(html, &["set.name"], scale);
+        eng_full.test_set_focus("name");
+        let _ = eng_full.paint(vp_at(scale)).unwrap();
+        let _ = eng_full.input(InputEvent::Text("Hi".into()));
+        eng_full.mark_theme_or_stylesheet_changed();
+        let full = eng_full.paint(vp_at(scale)).unwrap();
+        assert_partial_eq_full(
+            &partial_px,
+            full.rgba.as_ref().unwrap(),
+            &format!("type in translated panel scale={scale}"),
+        );
+    }
+    assert_eq!(
+        seen.as_slice(),
+        &SCALES[..],
+        "typing scale loop must cover 1 / 1.25 / 2"
+    );
+}

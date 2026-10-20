@@ -20,7 +20,8 @@ use crate::error::EngineError;
 use crate::focus::{focusable_ids, ids_in_document_order, step_focus};
 use crate::fonts::bundled_font_context;
 use crate::form_args::{
-    collect_action_args, is_numeric_input, set_range_value_from_x, step_numeric_value,
+    collect_action_args, is_number_input, is_numeric_input, set_range_value_from_x,
+    step_numeric_value,
 };
 use crate::form_controls::{
     activate_checkable, control_is_disabled, form_control_at_point, select_options, select_radio,
@@ -33,6 +34,13 @@ use crate::pending::{PendingEntry, PendingState, PendingTimeout, QueuedRelease};
 use crate::select_ui::{
     collect_select_nids, control_rect_of, list_row_at, open_select_state, paint_select_overlays,
     select_damage_rects, select_row_damage_rect, select_ua_stylesheet, OpenSelect, SELECT_MAX_ROWS,
+};
+use crate::text_edit::{
+    apply_unfocused_display, backspace, caret_device_rect, commit_field, delete_forward,
+    delete_selection, editor_text, filter_number_insert, insert_text, is_disabled,
+    is_editable_input, move_end, move_home, move_left, move_right, place_caret_at,
+    prepare_focus_display, resolve_step_target, select_all, selected_text, step_and_regroup,
+    step_direction, sync_value_from_editor, TextEditSession, CARET_BLINK_HALF_PERIOD,
 };
 use crate::trigger::{
     filter_ctx_from_key, keydown_repeat_allowed, FilterCtx, FromTarget, TriggerEvent,
@@ -208,6 +216,8 @@ struct LiveSurface {
     fail_next_paint: bool,
     /// Test hook: panic after ellipsis swap (Drop must still restore).
     panic_next_paint: bool,
+    /// Focused text/number edit session (issue #17).
+    text_edit: Option<TextEditSession>,
 }
 
 #[derive(Clone, Debug)]
@@ -1041,6 +1051,35 @@ impl Engine {
             if let Some(nid) = live.doc.get_element_by_id(id) {
                 live.doc.set_focus_to(nid);
                 live.focus.focused_id = Some(id.to_string());
+                if live
+                    .doc
+                    .get_node(nid)
+                    .is_some_and(|n| is_editable_input(n) && !is_disabled(n))
+                {
+                    let value_at_focus = live
+                        .doc
+                        .get_node(nid)
+                        .and_then(|n| {
+                            n.attrs().and_then(|attrs| {
+                                attrs
+                                    .iter()
+                                    .find(|a| &*a.name.local == "value")
+                                    .map(|a| a.value.to_string())
+                            })
+                        })
+                        .unwrap_or_default();
+                    prepare_focus_display(&mut live.doc, nid);
+                    live.text_edit = Some(TextEditSession {
+                        id: id.to_string(),
+                        node_id: nid,
+                        value_at_focus,
+                        caret_visible: true,
+                        last_blink: Instant::now(),
+                        last_caret_rect: None,
+                    });
+                } else {
+                    live.text_edit = None;
+                }
                 live.mark_paint_dirty();
                 live.reconcile_open_select_after_focus();
             }
@@ -1128,6 +1167,26 @@ impl Engine {
         crate::damage::element_border_box_css(&live.doc, nid)
     }
 
+    /// Test helper: force one caret blink phase flip (damage + paint dirty).
+    pub fn test_force_caret_blink(&mut self) {
+        if let Some(live) = self
+            .surfaces
+            .get_mut(&SurfaceId::DEFAULT)
+            .and_then(|s| s.live.as_mut())
+        {
+            if let Some(session) = live.text_edit.as_mut() {
+                session.last_blink = Instant::now() - CARET_BLINK_HALF_PERIOD * 2;
+            }
+            live.advance_caret_blink();
+        }
+    }
+
+    /// Test helper: whether the caret is in the visible blink phase.
+    pub fn test_caret_visible(&self) -> Option<bool> {
+        self.live(SurfaceId::DEFAULT)
+            .and_then(|live| live.text_edit.as_ref().map(|s| s.caret_visible))
+    }
+
     /// Test helper: subscribed slice names the engine will ask `version` for.
     pub fn subscribed_slices(&self) -> HashSet<String> {
         let mut s = HashSet::new();
@@ -1168,6 +1227,7 @@ fn unrouted_outcome(ev: InputEvent) -> InputOutcome {
             repeat: false,
             pressed: true,
         }),
+        InputEvent::Paste(_) | InputEvent::Copy | InputEvent::Cut => InputOutcome::None,
         InputEvent::PointerLeave => InputOutcome::Hover { id: None },
         InputEvent::PointerDown { .. } | InputEvent::PointerUp { .. } => {
             InputOutcome::Press { id: None }
@@ -1225,6 +1285,7 @@ impl LiveSurface {
             resolve_count: 1,
             fail_next_paint: false,
             panic_next_paint: false,
+            text_edit: None,
         })
     }
 
@@ -1325,6 +1386,8 @@ impl LiveSurface {
         slices: &dyn SliceSource,
         frags: &mut dyn FragmentSource,
     ) -> Result<DirtySet, EngineError> {
+        // Caret blink: only while a field is focused; unfocused pages stay idle.
+        self.advance_caret_blink();
         // Always subscribe to `actions` for greying.
         let mut subscribed: HashSet<String> = HashSet::new();
         subscribed.insert("actions".into());
@@ -1616,20 +1679,14 @@ impl LiveSurface {
 
     fn input(&mut self, ctx: &mut ActionCtx<'_>, ev: InputEvent) -> InputOutcome {
         match ev {
-            InputEvent::Text(s) => {
-                // Reserved — first scope has no text fields.
-                InputOutcome::Unhandled(KeyEvent {
-                    key: s,
-                    code: String::new(),
-                    mods: Modifiers::default(),
-                    repeat: false,
-                    pressed: true,
-                })
-            }
+            InputEvent::Text(s) => self.on_text(s),
+            InputEvent::Paste(s) => self.on_paste(s),
+            InputEvent::Copy => self.on_copy(false),
+            InputEvent::Cut => self.on_copy(true),
             InputEvent::PointerLeave => self.on_pointer_leave(),
             InputEvent::PointerMove { x, y, .. } => self.on_pointer_move(x, y),
             InputEvent::PointerDown { x, y, button, mods } => {
-                self.on_pointer_down(x, y, button, mods)
+                self.on_pointer_down(ctx, x, y, button, mods)
             }
             InputEvent::PointerUp { x, y, button, mods } => {
                 self.on_pointer_up(ctx, x, y, button, mods)
@@ -1729,6 +1786,7 @@ impl LiveSurface {
 
     fn on_pointer_down(
         &mut self,
+        ctx: &mut ActionCtx<'_>,
         x: f32,
         y: f32,
         button: PointerButton,
@@ -1771,13 +1829,64 @@ impl LiveSurface {
             .or_else(|| self.hit_id(x, y));
 
         if let Some(ref eid) = id {
+            let editable = self
+                .doc
+                .get_element_by_id(eid)
+                .and_then(|nid| self.doc.get_node(nid))
+                .is_some_and(|n| is_editable_input(n) && !is_disabled(n));
+            let disabled_edit = self
+                .doc
+                .get_element_by_id(eid)
+                .and_then(|nid| self.doc.get_node(nid))
+                .is_some_and(|n| is_editable_input(n) && is_disabled(n));
+
+            if disabled_edit {
+                let _ = self.blur_text_edit(ctx);
+                self.doc.clear_focus();
+                self.focus.focused_id = None;
+                self.press = Some(PressState {
+                    id: eid.clone(),
+                    button,
+                    mods,
+                });
+                return InputOutcome::Press { id };
+            }
+
+            if editable {
+                let focus_out = self.focus_text_input(ctx, eid);
+                if let Some(nid) = self.doc.get_element_by_id(eid) {
+                    place_caret_at(&mut self.doc, nid, x, y);
+                    self.reset_caret_blink();
+                    self.queue_text_field_damage(nid);
+                }
+                self.range_drag_id = None;
+                self.press = Some(PressState {
+                    id: eid.clone(),
+                    button,
+                    mods,
+                });
+                return focus_out.unwrap_or(InputOutcome::Press { id });
+            }
+
+            // Click outside a text field (or on another control): commit/blur edit.
+            if self.text_edit.is_some()
+                && self.text_edit.as_ref().map(|s| s.id.as_str()) != Some(eid.as_str())
+            {
+                let _ = self.blur_text_edit(ctx);
+            }
+
             if let Some(nid) = self.doc.get_element_by_id(eid) {
                 self.doc.set_focus_to(nid);
                 self.focus.focused_id = Some(eid.clone());
             }
         } else if let Some(ref c) = ctrl {
+            if self.text_edit.is_some() {
+                let _ = self.blur_text_edit(ctx);
+            }
             self.doc.set_focus_to(c.node_id);
             self.focus.focused_id = c.element_id.clone();
+        } else if self.text_edit.is_some() {
+            let _ = self.blur_text_edit(ctx);
         }
         self.reconcile_open_select_after_focus();
 
@@ -1901,7 +2010,11 @@ impl LiveSurface {
             return InputOutcome::Press { id: None };
         }
 
+        // Spin-box step arrows (data-hx-step): commit once per click via fire_change.
         if button == PointerButton::Primary {
+            if let Some(out) = self.try_spin_step(ctx, &press.id) {
+                return out;
+            }
             if let Some(out) = self.try_activate_control_at(ctx, x, y) {
                 return out;
             }
@@ -2067,8 +2180,287 @@ impl LiveSurface {
         }
     }
 
+    fn try_spin_step(&mut self, ctx: &mut ActionCtx<'_>, hit_id: &str) -> Option<InputOutcome> {
+        let dir = step_direction(&self.doc, hit_id)?;
+        let (target_nid, target_id) = resolve_step_target(&self.doc, hit_id)?;
+        // Disabled target ignores clicks.
+        if self.doc.get_node(target_nid).is_some_and(is_disabled) {
+            return Some(InputOutcome::None);
+        }
+        let _ = step_and_regroup(&mut self.doc, target_nid, dir);
+        self.mark_dom_dirty();
+        self.queue_text_field_damage(target_nid);
+        if let Some(ref tid) = target_id {
+            return Some(self.fire_change(ctx, tid));
+        }
+        Some(InputOutcome::Clicked {
+            id: hit_id.to_string(),
+        })
+    }
+
+    fn focus_text_input(&mut self, ctx: &mut ActionCtx<'_>, id: &str) -> Option<InputOutcome> {
+        let nid = self.doc.get_element_by_id(id)?;
+        let node = self.doc.get_node(nid)?;
+        if !is_editable_input(node) || is_disabled(node) {
+            return None;
+        }
+        // Commit previous field if switching.
+        if self.text_edit.as_ref().map(|s| s.id.as_str()) != Some(id) {
+            let _ = self.blur_text_edit(ctx);
+        }
+        let value_at_focus = self.attr(id, "value").unwrap_or_default();
+        prepare_focus_display(&mut self.doc, nid);
+        self.doc.set_focus_to(nid);
+        self.focus.focused_id = Some(id.to_string());
+        self.text_edit = Some(TextEditSession {
+            id: id.to_string(),
+            node_id: nid,
+            value_at_focus,
+            caret_visible: true,
+            last_blink: Instant::now(),
+            last_caret_rect: None,
+        });
+        self.reset_caret_blink();
+        self.mark_dom_dirty();
+        self.queue_text_field_damage(nid);
+        Some(InputOutcome::FocusChanged(self.focus.clone()))
+    }
+
+    fn blur_text_edit(&mut self, ctx: &mut ActionCtx<'_>) -> Option<InputOutcome> {
+        self.commit_text_edit(ctx, true)
+    }
+
+    /// Commit the focused text/number field. If `clear_focus`, also clear focus.
+    fn commit_text_edit(
+        &mut self,
+        ctx: &mut ActionCtx<'_>,
+        clear_focus: bool,
+    ) -> Option<InputOutcome> {
+        let session = self.text_edit.take()?;
+        let _ = commit_field(&mut self.doc, session.node_id);
+        self.mark_dom_dirty();
+        self.queue_text_field_damage(session.node_id);
+        let change = self.fire_change(ctx, &session.id);
+        if clear_focus {
+            self.doc.clear_focus();
+            if self.focus.focused_id.as_deref() == Some(session.id.as_str()) {
+                self.focus.focused_id = None;
+            }
+            // Restore grouped display for number inputs.
+            apply_unfocused_display(&mut self.doc, session.node_id);
+        } else {
+            // Keep editing session after Enter commit.
+            let value = self.attr(&session.id, "value").unwrap_or_default();
+            prepare_focus_display(&mut self.doc, session.node_id);
+            self.text_edit = Some(TextEditSession {
+                id: session.id.clone(),
+                node_id: session.node_id,
+                value_at_focus: value,
+                caret_visible: true,
+                last_blink: Instant::now(),
+                last_caret_rect: session.last_caret_rect,
+            });
+            self.reset_caret_blink();
+        }
+        Some(change)
+    }
+
+    fn revert_text_edit(&mut self) {
+        let Some(session) = self.text_edit.take() else {
+            return;
+        };
+        let _ = crate::form_args::write_value_attr(
+            &mut self.doc,
+            session.node_id,
+            &session.value_at_focus,
+        );
+        apply_unfocused_display(&mut self.doc, session.node_id);
+        self.doc.clear_focus();
+        self.focus.focused_id = None;
+        self.mark_dom_dirty();
+        self.queue_text_field_damage(session.node_id);
+    }
+
+    fn on_text(&mut self, s: String) -> InputOutcome {
+        let Some(session) = self.text_edit.clone() else {
+            return InputOutcome::Unhandled(KeyEvent {
+                key: s,
+                code: String::new(),
+                mods: Modifiers::default(),
+                repeat: false,
+                pressed: true,
+            });
+        };
+        let nid = session.node_id;
+        let is_number = self.doc.get_node(nid).is_some_and(is_number_input);
+        let filtered = crate::text_edit::sanitize_text_insert(&s);
+        if filtered.is_empty() {
+            return InputOutcome::None;
+        }
+        if is_number {
+            let existing = editor_text(&mut self.doc, nid).unwrap_or_default();
+            let limits = self
+                .doc
+                .get_node(nid)
+                .map(crate::form_args::numeric_limits)
+                .unwrap_or(crate::form_args::NumericLimits {
+                    min: None,
+                    max: None,
+                    step: 1.0,
+                });
+            // Commas accepted and ignored (not inserted while focused).
+            let filtered = filter_number_insert(&existing, &filtered, &limits);
+            if filtered.is_empty() {
+                return InputOutcome::None;
+            }
+            insert_text(&mut self.doc, nid, &filtered);
+        } else {
+            insert_text(&mut self.doc, nid, &filtered);
+        }
+        let _ = sync_value_from_editor(&mut self.doc, nid, is_number, false);
+        self.reset_caret_blink();
+        self.mark_dom_dirty();
+        self.queue_text_field_damage(nid);
+        InputOutcome::None
+    }
+
+    fn on_paste(&mut self, s: String) -> InputOutcome {
+        if self.text_edit.is_none() {
+            return InputOutcome::None;
+        }
+        let prepared = crate::text_edit::sanitize_paste(&s);
+        self.on_text(prepared)
+    }
+
+    fn on_copy(&mut self, cut: bool) -> InputOutcome {
+        let Some(session) = self.text_edit.clone() else {
+            return InputOutcome::None;
+        };
+        let Some(text) = selected_text(&mut self.doc, session.node_id) else {
+            return InputOutcome::None;
+        };
+        if cut {
+            delete_selection(&mut self.doc, session.node_id);
+            let is_number = self
+                .doc
+                .get_node(session.node_id)
+                .is_some_and(is_number_input);
+            let _ = sync_value_from_editor(&mut self.doc, session.node_id, is_number, false);
+            self.reset_caret_blink();
+            self.mark_dom_dirty();
+            self.queue_text_field_damage(session.node_id);
+        }
+        InputOutcome::ClipboardWrite { text }
+    }
+
+    fn try_text_edit_key(&mut self, key: &KeyEvent) -> Option<InputOutcome> {
+        let session = self.text_edit.clone()?;
+        let nid = session.node_id;
+        let action_mod = key.mods.ctrl || key.mods.meta;
+        let select = key.mods.shift;
+
+        if action_mod && matches!(key.key.as_str(), "a" | "A") {
+            select_all(&mut self.doc, nid);
+            self.reset_caret_blink();
+            self.queue_text_field_damage(nid);
+            return Some(InputOutcome::None);
+        }
+
+        match key.key.as_str() {
+            "Backspace" => {
+                backspace(&mut self.doc, nid);
+            }
+            "Delete" => {
+                delete_forward(&mut self.doc, nid);
+            }
+            "ArrowLeft" => {
+                move_left(&mut self.doc, nid, select);
+                self.reset_caret_blink();
+                self.queue_text_field_damage(nid);
+                return Some(InputOutcome::None);
+            }
+            "ArrowRight" => {
+                move_right(&mut self.doc, nid, select);
+                self.reset_caret_blink();
+                self.queue_text_field_damage(nid);
+                return Some(InputOutcome::None);
+            }
+            "Home" => {
+                move_home(&mut self.doc, nid, select);
+                self.reset_caret_blink();
+                self.queue_text_field_damage(nid);
+                return Some(InputOutcome::None);
+            }
+            "End" => {
+                move_end(&mut self.doc, nid, select);
+                self.reset_caret_blink();
+                self.queue_text_field_damage(nid);
+                return Some(InputOutcome::None);
+            }
+            _ => return None,
+        }
+        let is_number = self.doc.get_node(nid).is_some_and(is_number_input);
+        let _ = sync_value_from_editor(&mut self.doc, nid, is_number, false);
+        self.reset_caret_blink();
+        self.mark_dom_dirty();
+        self.queue_text_field_damage(nid);
+        Some(InputOutcome::None)
+    }
+
+    fn reset_caret_blink(&mut self) {
+        if let Some(session) = self.text_edit.as_mut() {
+            session.caret_visible = true;
+            session.last_blink = Instant::now();
+        }
+    }
+
+    /// Queue transform-aware border-box damage for a text/number field.
+    /// All text-edit / caret / selection damage goes through [`Self::push_pending_damage`].
+    fn queue_text_field_damage(&mut self, nid: NodeId) {
+        let scale = self.layout_scale;
+        let Some((x, y, w, h)) = crate::damage::element_border_box_device(&self.doc, nid, scale)
+        else {
+            return;
+        };
+        let (sw, sh) = self.layout_viewport;
+        self.push_pending_damage(snap_outward(x, y, w, h, sw, sh));
+    }
+
+    /// Advance caret blink; when the phase flips, queue a small damage rect.
+    fn advance_caret_blink(&mut self) {
+        let Some(session) = self.text_edit.as_mut() else {
+            return;
+        };
+        if session.last_blink.elapsed() < CARET_BLINK_HALF_PERIOD {
+            return;
+        }
+        session.last_blink = Instant::now();
+        session.caret_visible = !session.caret_visible;
+        let nid = session.node_id;
+        let scale = self.layout_scale;
+        let (sw, sh) = self.layout_viewport;
+        let prev = session.last_caret_rect;
+        let cur = caret_device_rect(&mut self.doc, nid, scale, sw, sh);
+        let mut pushed = false;
+        if let Some(r) = cur {
+            if let Some(session) = self.text_edit.as_mut() {
+                session.last_caret_rect = Some(r);
+            }
+            self.push_pending_damage(r);
+            pushed = true;
+        }
+        if let Some(r) = prev {
+            self.push_pending_damage(r);
+            pushed = true;
+        }
+        // Fallback: if we have no caret geometry yet, damage the focused input box.
+        if !pushed {
+            self.queue_text_field_damage(nid);
+        }
+    }
+
     /// Single commit path for `hx-trigger="change"` (range release, toggle,
-    /// select pick, arrow step). Typed entry (#17) hooks Enter/blur here too.
+    /// select pick, arrow/spin step, typed Enter/blur).
     fn fire_change(&mut self, ctx: &mut ActionCtx<'_>, node_id: &str) -> InputOutcome {
         self.fire_on(
             ctx,
@@ -2243,7 +2635,8 @@ impl LiveSurface {
 
     /// Step focused number/range; returns `Some(outcome)` when handled (always
     /// consumes the key for a focused numeric, and fires `change` when the
-    /// value actually moved).
+    /// value actually moved). Number inputs: only ArrowUp/Down step (Left/Right
+    /// move the caret via text edit). Range keeps Left/Right stepping.
     fn try_step_focused_numeric(
         &mut self,
         ctx: &mut ActionCtx<'_>,
@@ -2253,23 +2646,38 @@ impl LiveSurface {
         if self.element_is_disabled_id(&fid) {
             return None;
         }
-        let is_numeric = self
-            .doc
-            .get_element_by_id(&fid)
-            .and_then(|nid| self.doc.get_node(nid))
-            .is_some_and(is_numeric_input);
-        if !is_numeric {
+        let nid = self.doc.get_element_by_id(&fid)?;
+        let node = self.doc.get_node(nid)?;
+        if !is_numeric_input(node) {
             return None;
         }
-        let dir = match key {
-            "ArrowUp" | "ArrowRight" => 1,
-            "ArrowDown" | "ArrowLeft" => -1,
-            _ => return None,
+        let is_number = is_number_input(node);
+        let dir = if is_number {
+            match key {
+                "ArrowUp" => 1,
+                "ArrowDown" => -1,
+                _ => return None,
+            }
+        } else {
+            match key {
+                "ArrowUp" | "ArrowRight" => 1,
+                "ArrowDown" | "ArrowLeft" => -1,
+                _ => return None,
+            }
         };
-        if step_numeric_value(&mut self.doc, &fid, dir) {
+        let changed = if is_number {
+            step_and_regroup(&mut self.doc, nid, dir)
+        } else {
+            step_numeric_value(&mut self.doc, &fid, dir)
+        };
+        if changed {
             let _ = sync_outputs_for(&mut self.doc, &fid);
             self.mark_dom_dirty();
-            self.mark_paint_dirty();
+            if is_number {
+                self.queue_text_field_damage(nid);
+            } else {
+                self.mark_paint_dirty();
+            }
             Some(self.fire_change(ctx, &fid))
         } else {
             Some(InputOutcome::None)
@@ -2503,6 +2911,28 @@ impl LiveSurface {
             return out;
         }
 
+        // Esc with a text field focused: revert to value-at-focus and consume
+        // (exception to Input rule 4). Without focus, Esc stays Unhandled.
+        if key.pressed && key.key == "Escape" && self.text_edit.is_some() {
+            self.revert_text_edit();
+            return InputOutcome::None;
+        }
+
+        // Editing keys on a focused text/number field (before action triggers).
+        if key.pressed {
+            if let Some(out) = self.try_text_edit_key(&key) {
+                return out;
+            }
+        }
+
+        // Enter on focused text/number: commit + fire_change (keep focus).
+        if key.pressed && key.key == "Enter" && !key.repeat && self.text_edit.is_some() {
+            if let Some(out) = self.commit_text_edit(ctx, false) {
+                return out;
+            }
+            return InputOutcome::None;
+        }
+
         // Number/range arrow editing (before action triggers) — fires change.
         if key.pressed
             && matches!(
@@ -2621,16 +3051,26 @@ impl LiveSurface {
         // (b) Tab / Shift+Tab focus order (engine-owned document-order walk).
         if key.pressed && key.key == "Tab" {
             self.ensure_resolved();
+            // Commit the current text field before leaving it.
+            let _ = self.blur_text_edit(ctx);
             let order = focusable_ids(&self.doc);
             let next = step_focus(&order, self.focus.focused_id.as_deref(), key.mods.shift);
             if let Some(ref nid_str) = next {
-                if let Some(nid) = self.doc.get_element_by_id(nid_str) {
+                let editable = self
+                    .doc
+                    .get_element_by_id(nid_str)
+                    .and_then(|nid| self.doc.get_node(nid))
+                    .is_some_and(|n| is_editable_input(n) && !is_disabled(n));
+                if editable {
+                    let _ = self.focus_text_input(ctx, nid_str);
+                } else if let Some(nid) = self.doc.get_element_by_id(nid_str) {
                     self.doc.set_focus_to(nid);
+                    self.focus.focused_id = Some(nid_str.clone());
                 }
             } else {
                 self.doc.clear_focus();
+                self.focus.focused_id = None;
             }
-            self.focus.focused_id = next;
             self.reconcile_open_select_after_focus();
             self.mark_paint_dirty();
             return InputOutcome::FocusChanged(self.focus.clone());
@@ -2987,6 +3427,17 @@ impl LiveSurface {
         scale: f64,
         paint_mode: PaintMode,
     ) -> Result<RgbaImage, EngineError> {
+        // Blink-off: clear Blitz focus for this paint only so the caret is not
+        // drawn; :focus ring outside the caret damage rect stays in the cached
+        // buffer. Blink-on keeps focus so Blitz draws the caret.
+        let restore_focus = if self.text_edit.as_ref().is_some_and(|s| !s.caret_visible) {
+            let id = self.text_edit.as_ref().map(|s| s.id.clone());
+            self.doc.clear_focus();
+            id
+        } else {
+            None
+        };
+
         // Issue #12: swap cached truncated TextLayouts for paint only. DOM text
         // stays full; EllipsisPaintSession restores layouts on Drop (also on
         // `?` / panic) — no document needs_resolve and no truncated geometry.
@@ -3049,6 +3500,12 @@ impl LiveSurface {
                 .or_else(|| self.open_select.as_ref().map(|o| o.highlight)),
             &self.select_nids,
         );
+
+        if let Some(id) = restore_focus {
+            if let Some(nid) = self.doc.get_element_by_id(&id) {
+                self.doc.set_focus_to(nid);
+            }
+        }
         Ok(frame)
     }
 

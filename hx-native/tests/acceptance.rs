@@ -2291,11 +2291,398 @@ fn k1_g4_raw_template_value_clamp_only_on_edit() {
 }
 
 #[test]
-fn k1_text_input_stays_unhandled() {
+fn k1_text_without_focus_stays_unhandled() {
     let mut eng = boot_form(
         r#"<button id="go" name="op" value="1" hx-post="save.write">Go</button>"#,
         &["save.write"],
     );
     let out = eng.input(InputEvent::Text("hello".into()));
     assert!(matches!(out, InputOutcome::Unhandled(_)));
+}
+
+// ─── A26 — Typed text / number entry (issue #17) ───────────────────────────
+
+fn boot_inputs(html: &str, actions: &[&str]) -> Engine {
+    boot_form(html, actions)
+}
+
+fn key(eng: &mut Engine, key: &str, code: &str, mods: Modifiers) {
+    let _ = eng.input(InputEvent::Key(KeyEvent {
+        key: key.into(),
+        code: code.into(),
+        mods,
+        repeat: false,
+        pressed: true,
+    }));
+}
+
+fn paint_once(eng: &mut Engine) -> PaintOutput {
+    eng.paint(Viewport::new(400, 120)).expect("paint")
+}
+
+#[test]
+fn a26_typing_editing_selection() {
+    let html = r#"
+<form id="f">
+  <input id="name" type="text" name="name" value="ab" />
+  <button id="go" name="op" value="1" hx-post="save.write">Go</button>
+</form>
+"#;
+    let mut eng = boot_inputs(html, &["save.write"]);
+    eng.test_set_focus("name");
+    let _ = eng.input(InputEvent::Text("c".into()));
+    assert_eq!(eng.attr("name", "value").as_deref(), Some("abc"));
+    key(&mut eng, "Backspace", "Backspace", Modifiers::default());
+    assert_eq!(eng.attr("name", "value").as_deref(), Some("ab"));
+    key(
+        &mut eng,
+        "a",
+        "KeyA",
+        Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        },
+    );
+    key(&mut eng, "Delete", "Delete", Modifiers::default());
+    // select-all then Delete clears
+    assert_eq!(eng.attr("name", "value").as_deref(), Some(""));
+    let _ = eng.input(InputEvent::Text("xy".into()));
+    key(&mut eng, "Home", "Home", Modifiers::default());
+    key(&mut eng, "ArrowRight", "ArrowRight", Modifiers::default());
+    let _ = eng.input(InputEvent::Text("Z".into()));
+    assert_eq!(eng.attr("name", "value").as_deref(), Some("xZy"));
+}
+
+#[test]
+fn a26_number_filter_and_clamp_on_commit() {
+    let html = r#"
+<form id="f">
+  <input id="qty" type="number" name="qty" value="2" min="0" max="9" step="1" />
+</form>
+"#;
+    let mut eng = boot_inputs(html, &[]);
+    eng.test_set_focus("qty");
+    let _ = eng.input(InputEvent::Text("a".into())); // rejected
+    assert_eq!(eng.attr("qty", "value").as_deref(), Some("2"));
+    let _ = eng.input(InputEvent::Text("5".into()));
+    // During edit: no clamp yet (25 allowed while typing)
+    assert_eq!(eng.attr("qty", "value").as_deref(), Some("25"));
+    // Replace with out-of-range then Enter commits and clamps to max 9
+    key(
+        &mut eng,
+        "a",
+        "KeyA",
+        Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        },
+    );
+    let _ = eng.input(InputEvent::Text("99".into()));
+    key(&mut eng, "Enter", "Enter", Modifiers::default());
+    assert_eq!(eng.attr("qty", "value").as_deref(), Some("9"));
+}
+
+#[test]
+fn a26_enter_blur_fire_change() {
+    let html = r#"
+<form id="f">
+  <input id="qty" type="number" name="qty" value="1" min="0" max="9" step="1"
+         hx-post="save.write" hx-trigger="change" />
+  <button id="other">x</button>
+</form>
+"#;
+    let mut eng = boot_inputs(html, &["save.write"]);
+    eng.test_set_focus("qty");
+    let _ = eng.input(InputEvent::Text("2".into()));
+    let out = eng.input(InputEvent::Key(KeyEvent {
+        key: "Enter".into(),
+        code: "Enter".into(),
+        mods: Modifiers::default(),
+        repeat: false,
+        pressed: true,
+    }));
+    match out {
+        InputOutcome::Action {
+            name,
+            source_id,
+            trigger,
+            ..
+        } => {
+            assert_eq!(name, "save.write");
+            assert_eq!(source_id, "qty");
+            assert!(matches!(trigger, TriggerInfo::Change));
+        }
+        other => panic!("expected Action from change, got {other:?}"),
+    }
+}
+
+#[test]
+fn a26_esc_reverts() {
+    let html = r#"
+<input id="t" type="text" name="t" value="hello" />
+"#;
+    let mut eng = boot_inputs(html, &[]);
+    eng.test_set_focus("t");
+    let _ = eng.input(InputEvent::Text("X".into()));
+    assert_eq!(eng.attr("t", "value").as_deref(), Some("helloX"));
+    let out = eng.input(InputEvent::Key(KeyEvent {
+        key: "Escape".into(),
+        code: "Escape".into(),
+        mods: Modifiers::default(),
+        repeat: false,
+        pressed: true,
+    }));
+    assert!(matches!(out, InputOutcome::None));
+    assert_eq!(eng.attr("t", "value").as_deref(), Some("hello"));
+    assert!(eng.focus_state().focused_id.is_none());
+    // Esc without focus stays Unhandled
+    let out2 = eng.input(InputEvent::Key(KeyEvent {
+        key: "Escape".into(),
+        code: "Escape".into(),
+        mods: Modifiers::default(),
+        repeat: false,
+        pressed: true,
+    }));
+    assert!(matches!(out2, InputOutcome::Unhandled(_)));
+}
+
+#[test]
+fn a26_typed_values_in_action_args() {
+    let html = r#"
+<form id="f">
+  <input id="name" type="text" name="name" value="" />
+  <input id="qty" type="number" name="qty" value="0" min="0" max="100" step="1" />
+  <button id="go" name="op" value="save" hx-post="save.write">Go</button>
+</form>
+"#;
+    let mut eng = boot_inputs(html, &["save.write"]);
+    eng.test_set_focus("name");
+    let _ = eng.input(InputEvent::Text("Ada".into()));
+    eng.test_set_focus("qty");
+    key(
+        &mut eng,
+        "a",
+        "KeyA",
+        Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        },
+    );
+    let _ = eng.input(InputEvent::Text("7".into()));
+    let out = activate(&mut eng, "go");
+    let args = action_args(&out).expect("Action");
+    assert!(args.contains(&("name".into(), "Ada".into())), "{args:?}");
+    assert!(args.contains(&("qty".into(), "7".into())), "{args:?}");
+}
+
+#[test]
+fn a26_disabled_refuses_focus_and_edits() {
+    let html = r#"
+<input id="t" type="text" name="t" value="x" disabled="" />
+"#;
+    let mut eng = boot_inputs(html, &[]);
+    eng.test_set_focus("t");
+    // Disabled: test_set_focus should not open a text session
+    assert!(eng.test_caret_visible().is_none());
+    let out = eng.input(InputEvent::Text("y".into()));
+    assert!(matches!(out, InputOutcome::Unhandled(_)));
+    assert_eq!(eng.attr("t", "value").as_deref(), Some("x"));
+}
+
+#[test]
+fn a26_grouping_display_parse_args_and_opt_out() {
+    let html = r#"
+<form id="f">
+  <input id="up" type="number" name="upfront" value="180000" step="1000" min="0" />
+  <input id="raw" type="number" name="raw" value="180000" step="1000" min="0" data-hx-group="off" />
+  <button id="go" name="op" value="1" hx-post="save.write">Go</button>
+</form>
+"#;
+    let mut eng = boot_inputs(html, &["save.write"]);
+    // Value attr stays canonical
+    assert_eq!(eng.attr("up", "value").as_deref(), Some("180000"));
+    assert_eq!(eng.attr("raw", "value").as_deref(), Some("180000"));
+    // Focus + type with commas accepted
+    eng.test_set_focus("up");
+    key(
+        &mut eng,
+        "a",
+        "KeyA",
+        Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        },
+    );
+    let _ = eng.input(InputEvent::Text("190,000".into()));
+    // Commas stripped from value attr
+    assert_eq!(eng.attr("up", "value").as_deref(), Some("190000"));
+    let out = activate(&mut eng, "go");
+    let args = action_args(&out).expect("Action");
+    assert!(
+        args.iter().any(|(n, v)| n == "upfront" && v == "190000"),
+        "args must carry canonical number, got {args:?}"
+    );
+    assert!(
+        args.iter().any(|(n, v)| n == "raw" && v == "180000"),
+        "opt-out field still canonical, got {args:?}"
+    );
+}
+
+#[test]
+fn a26_spin_step_clamp_precision_change() {
+    // Absolute positions so hit-testing lands on the step controls.
+    let html = r#"
+<style>
+html,body{margin:0}
+#fee{position:absolute;left:0;top:0;width:80px;height:24px}
+#up{position:absolute;left:90px;top:0;width:24px;height:12px}
+#dn{position:absolute;left:90px;top:12px;width:24px;height:12px}
+</style>
+<form id="f">
+  <input id="fee" type="number" name="fee" value="2.20" step="0.01" min="0" max="5"
+         hx-post="save.write" hx-trigger="change" />
+  <span id="up" data-hx-step="up" data-hx-step-for="fee">▲</span>
+  <span id="dn" data-hx-step="down" data-hx-step-for="fee">▼</span>
+</form>
+"#;
+    let mut eng = boot_inputs(html, &["save.write"]);
+    let _ = paint_once(&mut eng);
+    let click = |eng: &mut Engine, x: f32, y: f32| -> InputOutcome {
+        let _ = eng.input(InputEvent::PointerMove {
+            x,
+            y,
+            mods: Modifiers::default(),
+        });
+        let _ = eng.input(InputEvent::PointerDown {
+            x,
+            y,
+            button: PointerButton::Primary,
+            mods: Modifiers::default(),
+        });
+        eng.input(InputEvent::PointerUp {
+            x,
+            y,
+            button: PointerButton::Primary,
+            mods: Modifiers::default(),
+        })
+    };
+    // Up once: 2.20 + 0.01 = 2.21 (no float drift), one change Action.
+    let out = click(&mut eng, 100.0, 6.0);
+    assert_eq!(eng.attr("fee", "value").as_deref(), Some("2.21"));
+    let req = match out {
+        InputOutcome::Action {
+            request,
+            trigger: TriggerInfo::Change,
+            ..
+        } => request,
+        other => panic!("expected one change Action per spin click, got {other:?}"),
+    };
+    eng.complete(req, Ok(()));
+    let out2 = click(&mut eng, 100.0, 6.0);
+    assert_eq!(eng.attr("fee", "value").as_deref(), Some("2.22"));
+    match out2 {
+        InputOutcome::Action {
+            request,
+            trigger: TriggerInfo::Change,
+            ..
+        } => eng.complete(request, Ok(())),
+        other => panic!("expected second change Action, got {other:?}"),
+    }
+    // Clamp at max
+    for _ in 0..400 {
+        if let InputOutcome::Action { request, .. } = click(&mut eng, 100.0, 6.0) {
+            eng.complete(request, Ok(()));
+        }
+    }
+    assert_eq!(eng.attr("fee", "value").as_deref(), Some("5.00"));
+    // Down steps back
+    if let InputOutcome::Action { request, .. } = click(&mut eng, 100.0, 18.0) {
+        eng.complete(request, Ok(()));
+    }
+    assert_eq!(eng.attr("fee", "value").as_deref(), Some("4.99"));
+}
+
+#[test]
+fn a26_caret_blink_small_damage() {
+    let html = r#"
+<style>html,body{margin:0}#t{position:absolute;left:8px;top:8px;width:120px;height:24px}</style>
+<input id="t" type="text" name="t" value="hello" />
+"#;
+    let mut eng = boot_inputs(html, &[]);
+    let first = paint_once(&mut eng);
+    assert!(!first.skipped);
+    eng.test_set_focus("t");
+    let _ = paint_once(&mut eng);
+    eng.test_force_caret_blink();
+    let blink = paint_once(&mut eng);
+    assert!(!blink.skipped, "blink must paint");
+    assert!(!blink.damage.is_empty(), "blink must report damage rects");
+    let surface = 400u64 * 120u64;
+    let area: u64 = blink
+        .damage
+        .iter()
+        .map(|r| (r.width.ceil() as u64) * (r.height.ceil() as u64))
+        .sum();
+    assert!(
+        area < surface / 2,
+        "caret damage {area} must be under half surface {surface}"
+    );
+    let stats = eng.last_paint_stats();
+    assert!(!stats.full_repaint, "caret blink must not full-repaint");
+    assert!(
+        stats.damage_rect_count >= 1 && stats.damage_rect_count <= MAX_DAMAGE_RECTS,
+        "blink should keep a small rect count, got {}",
+        stats.damage_rect_count
+    );
+}
+
+#[test]
+fn a26_clipboard_host_hooks() {
+    let html = r#"<input id="t" type="text" name="t" value="abc" />"#;
+    let mut eng = boot_inputs(html, &[]);
+    eng.test_set_focus("t");
+    key(
+        &mut eng,
+        "a",
+        "KeyA",
+        Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        },
+    );
+    let out = eng.input(InputEvent::Copy);
+    match out {
+        InputOutcome::ClipboardWrite { text } => assert_eq!(text, "abc"),
+        other => panic!("expected ClipboardWrite, got {other:?}"),
+    }
+    let _ = eng.input(InputEvent::Paste("ZZ".into()));
+    assert_eq!(eng.attr("t", "value").as_deref(), Some("ZZ"));
+}
+
+#[test]
+fn a26_text_drops_control_chars() {
+    let html = r#"<input id="t" type="text" name="t" value="" />"#;
+    let mut eng = boot_inputs(html, &[]);
+    eng.test_set_focus("t");
+    let _ = eng.input(InputEvent::Text("a\u{7}b".into()));
+    assert_eq!(eng.attr("t", "value").as_deref(), Some("ab"));
+}
+
+#[test]
+fn a26_paste_newlines_become_space() {
+    let html = r#"<input id="t" type="text" name="t" value="" />"#;
+    let mut eng = boot_inputs(html, &[]);
+    eng.test_set_focus("t");
+    let _ = eng.input(InputEvent::Paste("12\r\n34".into()));
+    assert_eq!(eng.attr("t", "value").as_deref(), Some("12 34"));
+}
+
+#[test]
+fn a26_text_drops_bidi_overrides() {
+    let html = r#"<input id="t" type="text" name="t" value="" />"#;
+    let mut eng = boot_inputs(html, &[]);
+    eng.test_set_focus("t");
+    // U+202E RIGHT-TO-LEFT OVERRIDE must not enter the field.
+    let _ = eng.input(InputEvent::Text("ab\u{202E}cd".into()));
+    assert_eq!(eng.attr("t", "value").as_deref(), Some("abcd"));
 }

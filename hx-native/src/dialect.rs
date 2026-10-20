@@ -8,7 +8,16 @@ use std::collections::HashSet;
 use crate::error::EngineError;
 use crate::trigger::{parse_triggers, ParsedTrigger};
 
-/// Locked dialect attributes (exact names). `data-hx-*` aliases are not accepted.
+/// Locked spin-box step direction (`up` / `down`). Designer lock (issue #17).
+pub const ATTR_HX_STEP: &str = "data-hx-step";
+
+/// Locked optional target id for a spin-box step control (bare id, no `#`).
+pub const ATTR_HX_STEP_FOR: &str = "data-hx-step-for";
+
+/// Engine-side opt-out for thousands grouping on `<input type=number>` (issue #17).
+pub const ATTR_HX_GROUP: &str = "data-hx-group";
+
+/// Locked dialect attributes (exact names). Unknown `hx-*` / `data-hx-*` fail load.
 pub const SUPPORTED_HX_ATTRIBUTES: &[&str] = &[
     "hx-post",
     "hx-target",
@@ -16,6 +25,9 @@ pub const SUPPORTED_HX_ATTRIBUTES: &[&str] = &[
     "hx-trigger",
     "hx-sync",
     "hx-indicator",
+    ATTR_HX_GROUP,
+    ATTR_HX_STEP,
+    ATTR_HX_STEP_FOR,
 ];
 
 /// Locked swap strategies. Missing `hx-swap` defaults to `InnerHtml` (htmx parity).
