@@ -1679,3 +1679,208 @@ fn a27_hx_changed_opt_in_damage_partial_eq_full() {
         "standalone hx-changed opt-in damage",
     );
 }
+
+// ---------------------------------------------------------------------------
+// L: Graph's PR #24 HOLD review (3 blockers; https://github.com/MHHukiewitz/hx-native/pull/24).
+// Each test fails on cc6d93c's product code and passes with the fix; see
+// target/mutations.md G1-G3 for the exact failing line recorded while that
+// part of the fix was temporarily reverted.
+// ---------------------------------------------------------------------------
+
+const VISIBLE_GREYING_FORM: &str = r##"
+<style>button:disabled{background:#cc0000}</style>
+<form id="gf">
+  <input id="gmusic" type="checkbox" name="gmusic" style="display:block"/>
+  <button id="gapply" name="gapply" hx-post="settings.gapply" hx-trigger="click" style="width:80px;height:30px;display:block">Apply</button>
+</form>"##;
+
+fn boot_visible_greying_form() -> Engine {
+    boot(VISIBLE_GREYING_FORM, &["settings.gapply"])
+}
+
+/// G1 (blocker 1): an `ensure_resolved()` triggered by a second input event
+/// (here, a pointer move's hit-test) before the host's next `paint()` must
+/// not silently drop the first edit's greying damage. `button:disabled`
+/// changes Apply's background colour, so a lost style-damage flag is
+/// directly pixel-observable, not just attribute-observable.
+#[test]
+fn g1_style_damage_survives_input_time_resolve_before_next_paint() {
+    let mut eng = boot_visible_greying_form();
+    let mut slices = Slices::new();
+    let mut frags = Frags::default();
+    requires_change(
+        &mut eng,
+        &mut slices,
+        &mut frags,
+        "settings.gapply",
+        "gf",
+        REASON,
+    );
+    let _ = eng.paint(vp());
+    assert!(is_greyed(&eng, "gapply", REASON));
+
+    // Ungrey Apply (style-damage-producing edit)...
+    let _ = click(&mut eng, "gmusic");
+    assert!(is_enabled(&eng, "gapply"));
+    // ...then a SECOND input event before the next paint. on_pointer_move
+    // calls ensure_resolved() for hit-testing.
+    let (ax, ay) = center(&eng, "gapply");
+    let _ = eng.input(InputEvent::PointerMove {
+        x: ax,
+        y: ay,
+        mods: Modifiers::default(),
+    });
+
+    let partial = eng.paint(vp()).unwrap();
+    assert!(!partial.skipped && partial.rgba.is_some());
+    let partial_px = partial.rgba.unwrap();
+
+    let mut eng_full = boot_visible_greying_form();
+    let mut slices_full = Slices::new();
+    let mut frags_full = Frags::default();
+    requires_change(
+        &mut eng_full,
+        &mut slices_full,
+        &mut frags_full,
+        "settings.gapply",
+        "gf",
+        REASON,
+    );
+    let _ = eng_full.paint(vp());
+    let _ = click(&mut eng_full, "gmusic");
+    let _ = eng_full.input(InputEvent::PointerMove {
+        x: ax,
+        y: ay,
+        mods: Modifiers::default(),
+    });
+    eng_full.mark_theme_or_stylesheet_changed();
+    let full = eng_full.paint(vp()).unwrap();
+    assert_partial_eq_full(
+        &partial_px,
+        full.rgba.as_ref().unwrap(),
+        "G1: style damage must survive an input-time resolve before the next paint",
+    );
+}
+
+/// G2 (blocker 2): unchecking then rechecking a gate checkbox must not leave
+/// its own tick-mark rendering stale in a partial repaint — the checkbox's
+/// native checked-state paint is element state Blitz draws directly, which
+/// a CSS restyle does not necessarily flag as damage on its own.
+#[test]
+fn g2_recheck_gate_checkbox_no_stale_partial_repaint() {
+    let mut eng = boot(DEPENDENT_FORM, &["settings.g"]);
+    let mut slices = Slices::new();
+    let mut frags = Frags::default();
+    slices.rules = dependent_rules();
+    slices.bump("actions");
+    eng.sync(&slices, &mut frags).unwrap();
+    let _ = eng.paint(vp());
+
+    let _ = click(&mut eng, "music2"); // uncheck the gate
+    let _ = eng.paint(vp());
+    let _ = click(&mut eng, "music2"); // recheck it
+    let partial = eng.paint(vp()).unwrap();
+    assert!(!partial.skipped && partial.rgba.is_some());
+    let partial_px = partial.rgba.unwrap();
+
+    let mut eng_full = boot(DEPENDENT_FORM, &["settings.g"]);
+    let mut slices_full = Slices::new();
+    let mut frags_full = Frags::default();
+    slices_full.rules = dependent_rules();
+    slices_full.bump("actions");
+    eng_full.sync(&slices_full, &mut frags_full).unwrap();
+    let _ = eng_full.paint(vp());
+    let _ = click(&mut eng_full, "music2");
+    let _ = eng_full.paint(vp());
+    let _ = click(&mut eng_full, "music2");
+    eng_full.mark_theme_or_stylesheet_changed();
+    let full = eng_full.paint(vp()).unwrap();
+    assert_partial_eq_full(
+        &partial_px,
+        full.rgba.as_ref().unwrap(),
+        "G2: rechecking a gate checkbox must not leave its own tick mark stale",
+    );
+}
+
+const OVERLAP_FORM: &str = r##"
+<form id="o">
+  <input id="g" type="checkbox" name="g" checked style="display:block"/>
+  <input id="sl" type="range" name="sl" value="3" min="0" max="10" hx-post="o.set" hx-trigger="change" style="width:120px;height:24px;display:block"/>
+  <button id="ob" name="ob" hx-post="o.save" hx-trigger="click" style="display:block">Save</button>
+</form>"##;
+
+fn overlap_rules() -> Vec<(String, String, InputRule)> {
+    vec![(
+        "o.save".into(),
+        "sl".into(),
+        InputRule::EnabledWhen {
+            input: "g".into(),
+            checked: true,
+            reason: "gate".into(),
+        },
+    )]
+}
+
+/// G3 (blocker 3): `sl` is both a rule target (dependent on gate `g` via
+/// action `o.save`) and its own `[hx-post]` binding (action `o.set`). While
+/// `o.set` is `Disabled`, ticking the gate off must grey `sl` via the rule
+/// (not clear it because `o.set`'s map has nothing new to say), and ticking
+/// the gate back on must hand `sl` back to `o.set`'s `Disabled` reason
+/// rather than enabling it outright.
+#[test]
+fn g3_rule_and_action_greying_overlap_on_shared_control() {
+    let mut eng = Engine::new(EngineConfig {
+        max_paint_ns: 50_000_000,
+        pending_timeout_frames: 5,
+        paint_mode: PaintMode::Exact,
+        ..Default::default()
+    });
+    eng.declare_actions(&["o.set", "o.save"]);
+    let wrapped =
+        format!("<!DOCTYPE html><html><body style=\"margin:0\">{OVERLAP_FORM}</body></html>");
+    eng.load_html(&wrapped).expect("load");
+    let _ = eng.paint(vp());
+
+    let mut slices = Slices::new();
+    let mut frags = Frags::default();
+    slices.actions = vec![(
+        "o.set".to_string(),
+        ActionState::Disabled {
+            reason: "busy".into(),
+        },
+    )];
+    slices.rules = overlap_rules();
+    slices.bump("actions");
+    eng.sync(&slices, &mut frags).unwrap();
+    assert!(
+        is_greyed(&eng, "sl", "busy"),
+        "o.set Disabled must grey sl from the start"
+    );
+
+    // Tick the gate off: the rule now also wants sl greyed ("gate"). sl must
+    // stay greyed throughout — apply_disabled_map must not clear it just
+    // because o.set's own map entry has not changed.
+    let _ = click(&mut eng, "g");
+    assert!(
+        eng.attr("sl", "disabled").is_some(),
+        "sl must stay greyed while the gate is off and o.set is Disabled"
+    );
+
+    // Tick the gate back on: the rule clears, but o.set is still Disabled,
+    // so sl must hand back to that reason, not become enabled.
+    let _ = click(&mut eng, "g");
+    assert!(
+        is_greyed(&eng, "sl", "busy"),
+        "sl must hand back to o.set's Disabled reason when the rule clears, not enable"
+    );
+
+    // Now enable o.set via a sync with an unrelated/no reason: sl must
+    // finally ungrey.
+    slices.actions = vec![];
+    slices.bump("actions");
+    eng.sync(&slices, &mut frags).unwrap();
+    assert!(
+        is_enabled(&eng, "sl"),
+        "sl must ungrey once neither the rule nor o.set greys it"
+    );
+}
