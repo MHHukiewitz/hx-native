@@ -79,16 +79,39 @@ fn probe(html: &str, actions: &[&str]) -> Engine {
     eng
 }
 
+/// Crop `img` to the device-pixel box `(x, y, w, h)`, row-major RGBA bytes.
+/// Used to compare *just* one control's region — comparing whole frames
+/// would trivially differ whenever a click's own control (e.g. a checkbox's
+/// native tick mark) repaints, masking a mutation that specifically drops
+/// some *other* control's greying.
+fn region_pixels(img: &RgbaImage, x: f32, y: f32, w: f32, h: f32) -> Vec<u8> {
+    let x0 = x.max(0.0) as u32;
+    let y0 = y.max(0.0) as u32;
+    let x1 = (x + w).min(img.width as f32) as u32;
+    let y1 = (y + h).min(img.height as f32) as u32;
+    let mut out = Vec::new();
+    for yy in y0..y1 {
+        for xx in x0..x1 {
+            let i = ((yy * img.width + xx) * 4) as usize;
+            out.extend_from_slice(&img.pixels[i..i + 4]);
+        }
+    }
+    out
+}
+
 /// Run `steps` (each a batch of `InputEvent`s for one host-driven "frame")
 /// through a worker and a sync `Engine` booted identically from `html` with
 /// `pkt` already applied. Paints both after each step and captures the
-/// full RGBA frame. Returns one frame per step for each side.
+/// full RGBA frame. Returns the pre-`steps` baseline frame (ungreyed —
+/// callers use this to prove a checkpoint's greying is actually *visible*,
+/// not just identical on both sides because neither side applied it) plus
+/// one frame per step for each side.
 fn run_pixel_checkpoints(
     html: &str,
     actions: &[&str],
     pkt: SyncPacket,
     steps: &[Vec<InputEvent>],
-) -> (Vec<RgbaImage>, Vec<RgbaImage>) {
+) -> (RgbaImage, Vec<RgbaImage>, Vec<RgbaImage>) {
     let mut sync_eng = Engine::new(cfg());
     sync_eng.declare_actions(actions);
     sync_eng.load_html(html).unwrap();
@@ -98,6 +121,7 @@ fn run_pixel_checkpoints(
     sync_eng.sync(&slices, &mut frags).unwrap();
     let _ = &mut slices;
     let _ = sync_eng.paint(vp());
+    let baseline = sync_eng.last_frame().expect("baseline frame").clone();
 
     let worker = PaintWorker::spawn(cfg());
     worker.declare_actions(actions).unwrap();
@@ -136,7 +160,7 @@ fn run_pixel_checkpoints(
                 .clone(),
         );
     }
-    (worker_frames, sync_frames)
+    (baseline, worker_frames, sync_frames)
 }
 
 /// Replay `steps` against a fresh sync `Engine`, force a full repaint at the
@@ -213,8 +237,21 @@ fn pixel_parity_requires_change_apply_grey_ungrey() {
         click_script(mx, my), // reverts; regreys Apply
     ];
 
-    let (worker_frames, sync_frames) = run_pixel_checkpoints(&html, &actions, pkt.clone(), &steps);
+    let (baseline, worker_frames, sync_frames) =
+        run_pixel_checkpoints(&html, &actions, pkt.clone(), &steps);
     assert_all_checkpoints_match(&worker_frames, &sync_frames);
+    // Test gap (Graph 18:55 re-review): a worker/sync diff of 0 also passes
+    // vacuously if neither side ever applied the ungrey at all — and a
+    // whole-frame diff against the baseline would trivially pass anyway
+    // since clicking `music` repaints its own tick mark regardless of
+    // Apply's greying. Crop to *just* Apply's own region to isolate it.
+    let (ax, ay, aw, ah) = probe_eng.test_element_box("apply").unwrap();
+    assert_ne!(
+        region_pixels(&sync_frames[0], ax, ay, aw, ah),
+        region_pixels(&baseline, ax, ay, aw, ah),
+        "ungreying Apply must be visible in Apply's own region: checkpoint 0 must differ \
+         from the pre-click baseline there"
+    );
 
     let full = full_repaint_frame(&html, &actions, pkt, &steps);
     assert_eq!(
@@ -269,8 +306,22 @@ fn pixel_parity_enabled_when_dependent_input() {
         click_script(gx, gy), // gate on: dep ungreys
     ];
 
-    let (worker_frames, sync_frames) = run_pixel_checkpoints(&html, &actions, pkt.clone(), &steps);
+    let (baseline, worker_frames, sync_frames) =
+        run_pixel_checkpoints(&html, &actions, pkt.clone(), &steps);
     assert_all_checkpoints_match(&worker_frames, &sync_frames);
+    // Test gap (Graph 18:55 re-review): prove the rule-driven grey is
+    // actually visible in dep's own region, not just identical on both
+    // sides because neither applied it (a whole-frame diff would trivially
+    // pass anyway since clicking the gate repaints its own tick mark).
+    // Gate starts checked (dep enabled); checkpoint 0 unchecks the gate,
+    // which must grey dep.
+    let (dx, dy, dw, dh) = probe_eng.test_element_box("dep").unwrap();
+    assert_ne!(
+        region_pixels(&sync_frames[0], dx, dy, dw, dh),
+        region_pixels(&baseline, dx, dy, dw, dh),
+        "unchecking the gate must visibly grey dep: checkpoint 0 must differ from the \
+         baseline in dep's own region"
+    );
 
     let full = full_repaint_frame(&html, &actions, pkt, &steps);
     assert_eq!(
@@ -351,7 +402,8 @@ fn pixel_parity_hx_changed_standalone_only_no_action_no_sync_content() {
         set_text_script(rx, ry, "Base"),
     ];
 
-    let (worker_frames, sync_frames) = run_pixel_checkpoints(&html, &actions, pkt.clone(), &steps);
+    let (_baseline, worker_frames, sync_frames) =
+        run_pixel_checkpoints(&html, &actions, pkt.clone(), &steps);
     assert_all_checkpoints_match(&worker_frames, &sync_frames);
 
     let full = full_repaint_frame(&html, &actions, pkt, &steps);
@@ -387,8 +439,20 @@ fn pixel_parity_hx_changed_flips_in_form_and_standalone() {
         set_text_script(rx, ry, "Base"),   // row hx-changed off
     ];
 
-    let (worker_frames, sync_frames) = run_pixel_checkpoints(&html, &actions, pkt.clone(), &steps);
+    let (baseline, worker_frames, sync_frames) =
+        run_pixel_checkpoints(&html, &actions, pkt.clone(), &steps);
     assert_all_checkpoints_match(&worker_frames, &sync_frames);
+    // Sanity check only (not isolating the `hx-changed` class's own visual
+    // contribution specifically — editing label's value always repaints its
+    // glyphs regardless of the class, so this cannot distinguish "class
+    // applied" from "class dropped"; that isolation is
+    // `r2_hx_changed_select_flip_has_no_redundant_damage_source_partial_eq_full`'s
+    // job, via damage rects on a control whose edit has no other visual
+    // side effect). Just confirms the edit reached the screen at all.
+    assert_ne!(
+        sync_frames[0].pixels, baseline.pixels,
+        "editing label must change the painted frame: checkpoint 0 must differ from the baseline"
+    );
 
     let full = full_repaint_frame(&html, &actions, pkt, &steps);
     assert_eq!(
