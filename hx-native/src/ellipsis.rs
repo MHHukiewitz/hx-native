@@ -56,6 +56,17 @@
 //! - [`crate::stylo_text_style`] — copy of Blitz's `pub(crate)`
 //!   `stylo_to_parley::style` (font-size/family/weight/style, letter-/word-spacing,
 //!   line-height, features). Must stay aligned when bumping Blitz/stylo.
+//! - Direct `style = { package = "stylo", version = "=0.22.0" }` in
+//!   `hx-native/Cargo.toml`. Change this pin together with any Blitz bump that
+//!   moves stylo: a stylo patch release stays held at `=0.22.0`, and on 0.23
+//!   the types won't match so compilation fails loudly (the safe failure).
+//! - [`crate::fonts::bundled_font_context`] — copies Blitz's
+//!   `build_single_font_ctx` (system fonts off; register one face as every
+//!   generic family). Shares one parley `Blob` (and `SourceCache`) so the
+//!   glyph cache sees a single font id.
+//! - [`crate::stylo_text_style::{text_align,text_align_last,base_direction}`] —
+//!   copies of Blitz helpers applied outside `TextStyle` the way Blitz does
+//!   (`construct.rs` `set_base_direction`, `inline.rs` `layout.align`).
 //!
 //! Detection and pixel-match tests in `tests/text_overflow.rs` run in CI's
 //! normal test job (not `#[ignore]`, not feature-gated) so a bump that breaks
@@ -71,12 +82,14 @@ use std::collections::HashMap;
 use blitz_dom::node::{TextBrush, TextLayout};
 use blitz_dom::{FontContext, NodeId};
 use blitz_html::HtmlDocument;
-use parley::layout::Layout;
+use parley::layout::{Alignment, AlignmentOptions, Layout};
 use parley::style::TextStyle;
-use parley::LayoutContext;
+use parley::{BaseDirection, LayoutContext};
 
 use crate::fonts::bundled_font_context;
-use crate::stylo_text_style::text_style_from_computed;
+use crate::stylo_text_style::{
+    base_direction, text_align, text_align_last, text_style_from_computed,
+};
 
 /// U+2026 HORIZONTAL ELLIPSIS — CSS `text-overflow: ellipsis` marker.
 const ELLIPSIS: &str = "\u{2026}";
@@ -407,6 +420,23 @@ fn text_style_for_element(
     Some(text_style_from_computed(brush_id, &styles))
 }
 
+/// Blitz applies base direction / text-align outside `TextStyle`
+/// (`construct.rs:1061`, `inline.rs:827`).
+struct AlignParams {
+    base_direction: BaseDirection,
+    alignment: Alignment,
+    last_line_alignment: Option<Alignment>,
+}
+
+fn align_params_for_element(doc: &HtmlDocument, element_id: NodeId) -> Option<AlignParams> {
+    let styles = doc.get_node(element_id)?.primary_styles()?;
+    Some(AlignParams {
+        base_direction: base_direction(styles.clone_direction(), styles.clone_unicode_bidi()),
+        alignment: text_align(styles.clone_text_align()),
+        last_line_alignment: text_align_last(styles.clone_text_align_last()),
+    })
+}
+
 /// Shape `text` with the ellipsis element's computed style; returns a paint `TextLayout`.
 fn shape_text_layout(
     shaper: &mut EllipsisShaper,
@@ -415,14 +445,23 @@ fn shape_text_layout(
     scale: f32,
     max_advance: Option<f32>,
     template: &TextLayout,
+    align: &AlignParams,
 ) -> Box<TextLayout> {
     let mut builder = shaper
         .layout_ctx
         .tree_builder(&mut shaper.font_ctx, scale, true, style);
+    builder.set_base_direction(align.base_direction);
     builder.push_text(text);
     let mut layout = Layout::new();
     let shaped_text = builder.build_into(&mut layout);
     layout.break_all_lines(max_advance);
+    layout.align(
+        align.alignment,
+        AlignmentOptions {
+            align_when_overflowing: false,
+            last_line_alignment: align.last_line_alignment,
+        },
+    );
     Box::new(TextLayout {
         text: shaped_text,
         content_widths: None,
@@ -436,10 +475,12 @@ fn measure_ellipsis_advance(
     shaper: &mut EllipsisShaper,
     style: &TextStyle<'static, 'static, TextBrush>,
     scale: f32,
+    align: &AlignParams,
 ) -> f32 {
     let mut builder = shaper
         .layout_ctx
         .tree_builder(&mut shaper.font_ctx, scale, true, style);
+    builder.set_base_direction(align.base_direction);
     builder.push_text(ELLIPSIS);
     let mut layout = Layout::new();
     let _ = builder.build_into(&mut layout);
@@ -532,7 +573,8 @@ fn prepare_one(
 
     let budget = cand.content_w_css * scale;
     let style = text_style_for_element(doc, cand.element_id)?;
-    let ellipsis_adv = measure_ellipsis_advance(shaper, &style, scale);
+    let align = align_params_for_element(doc, cand.element_id)?;
+    let ellipsis_adv = measure_ellipsis_advance(shaper, &style, scale, &align);
     let truncated = truncate_by_clusters(
         &original_text,
         &original_layout.layout,
@@ -550,6 +592,7 @@ fn prepare_one(
         scale,
         Some(budget),
         &original_layout,
+        &align,
     );
 
     cache.by_node.insert(

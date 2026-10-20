@@ -39,11 +39,15 @@ mod stylo {
     pub(super) use style::values::computed::OverflowWrap;
     pub(super) use style::values::computed::WordBreak;
     pub(super) use style::values::generics::box_::BaselineShiftKeyword;
+    pub(super) use style::values::specified::TextAlignKeyword;
+    pub(super) use style::values::specified::TextAlignLast;
 }
 
 mod parley_types {
+    pub(super) use parley::layout::Alignment;
     pub(super) use parley::setting::Tag;
     pub(super) use parley::style::*;
+    pub(super) use parley::BaseDirection;
     pub(super) use parley::FontFeature;
     pub(super) use parley::FontVariation;
     pub(super) use parley::Language;
@@ -243,6 +247,48 @@ fn font_features(font_styles: &stylo::Font) -> Vec<parley_types::FontFeature> {
     features
 }
 
+/// Blitz applies this outside `TextStyle` (`construct.rs` `set_base_direction`).
+pub(crate) fn base_direction(
+    direction: stylo::Direction,
+    unicode_bidi: stylo::UnicodeBidi,
+) -> parley_types::BaseDirection {
+    if unicode_bidi == stylo::UnicodeBidi::Plaintext {
+        return parley_types::BaseDirection::Auto;
+    }
+    match direction {
+        stylo::Direction::Ltr => parley_types::BaseDirection::Ltr,
+        stylo::Direction::Rtl => parley_types::BaseDirection::Rtl,
+    }
+}
+
+/// Blitz applies this outside `TextStyle` (`inline.rs` `layout.align`).
+pub(crate) fn text_align(input: stylo::TextAlignKeyword) -> parley_types::Alignment {
+    match input {
+        stylo::TextAlignKeyword::Start => parley_types::Alignment::Start,
+        stylo::TextAlignKeyword::Left => parley_types::Alignment::Left,
+        stylo::TextAlignKeyword::Right => parley_types::Alignment::Right,
+        stylo::TextAlignKeyword::Center => parley_types::Alignment::Center,
+        stylo::TextAlignKeyword::Justify => parley_types::Alignment::Justify,
+        stylo::TextAlignKeyword::End => parley_types::Alignment::End,
+        stylo::TextAlignKeyword::MozCenter => parley_types::Alignment::Center,
+        stylo::TextAlignKeyword::MozLeft => parley_types::Alignment::Left,
+        stylo::TextAlignKeyword::MozRight => parley_types::Alignment::Right,
+    }
+}
+
+/// Returns `None` for `text-align-last: auto` (Blitz parity).
+pub(crate) fn text_align_last(input: stylo::TextAlignLast) -> Option<parley_types::Alignment> {
+    match input {
+        stylo::TextAlignLast::Auto => None,
+        stylo::TextAlignLast::Start => Some(parley_types::Alignment::Start),
+        stylo::TextAlignLast::End => Some(parley_types::Alignment::End),
+        stylo::TextAlignLast::Left => Some(parley_types::Alignment::Left),
+        stylo::TextAlignLast::Right => Some(parley_types::Alignment::Right),
+        stylo::TextAlignLast::Center => Some(parley_types::Alignment::Center),
+        stylo::TextAlignLast::Justify => Some(parley_types::Alignment::Justify),
+    }
+}
+
 fn text_wrap_mode(input: stylo::TextWrapMode) -> parley_types::TextWrapMode {
     match input {
         stylo::TextWrapMode::Wrap => parley_types::TextWrapMode::Wrap,
@@ -414,6 +460,134 @@ pub(crate) fn text_style_from_computed(
     }
 }
 
-// Silence unused-import warnings for Direction / UnicodeBidi kept for Blitz parity.
-#[allow(dead_code)]
-fn _parity_imports(_: stylo::Direction, _: stylo::UnicodeBidi) {}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use style::values::generics::font::{FeatureTagValue, FontSettings, FontTag};
+
+    /// Collect the (tag, value) pairs from a feature list for easy assertions.
+    fn pairs(features: &[parley_types::FontFeature]) -> Vec<([u8; 4], u16)> {
+        features
+            .iter()
+            .map(|f| (f.tag.to_bytes(), f.value))
+            .collect()
+    }
+
+    fn feature_settings(tags: &[(&[u8; 4], i32)]) -> stylo::FontFeatureSettings {
+        FontSettings(
+            tags.iter()
+                .map(|(tag, value)| FeatureTagValue {
+                    tag: FontTag(u32::from_be_bytes(**tag)),
+                    value: *value,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )
+    }
+
+    #[test]
+    fn ligatures_none_disables_all() {
+        let mut out = Vec::new();
+        font_variant_ligatures(stylo::FontVariantLigatures::NONE, &mut out);
+        assert_eq!(
+            pairs(&out),
+            vec![
+                (*b"liga", 0),
+                (*b"clig", 0),
+                (*b"dlig", 0),
+                (*b"hlig", 0),
+                (*b"calt", 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn ligatures_normal_emits_nothing() {
+        let mut out = Vec::new();
+        font_variant_ligatures(stylo::FontVariantLigatures::NORMAL, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn ligatures_mixed_toggles() {
+        let mut out = Vec::new();
+        let input = stylo::FontVariantLigatures::COMMON_LIGATURES
+            | stylo::FontVariantLigatures::NO_DISCRETIONARY_LIGATURES
+            | stylo::FontVariantLigatures::HISTORICAL_LIGATURES;
+        font_variant_ligatures(input, &mut out);
+        assert_eq!(
+            pairs(&out),
+            vec![(*b"liga", 1), (*b"clig", 1), (*b"dlig", 0), (*b"hlig", 1)]
+        );
+    }
+
+    #[test]
+    fn caps_small_caps() {
+        let mut out = Vec::new();
+        font_variant_caps(stylo::FontVariantCaps::SmallCaps, &mut out);
+        assert_eq!(pairs(&out), vec![(*b"smcp", 1)]);
+
+        let mut out = Vec::new();
+        font_variant_caps(stylo::FontVariantCaps::Normal, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn position_sub_and_super() {
+        let mut out = Vec::new();
+        font_variant_position(stylo::FontVariantPosition::Sub, &mut out);
+        assert_eq!(pairs(&out), vec![(*b"subs", 1)]);
+
+        let mut out = Vec::new();
+        font_variant_position(stylo::FontVariantPosition::Super, &mut out);
+        assert_eq!(pairs(&out), vec![(*b"sups", 1)]);
+    }
+
+    #[test]
+    fn numeric_features() {
+        let mut out = Vec::new();
+        let input = stylo::FontVariantNumeric::OLDSTYLE_NUMS
+            | stylo::FontVariantNumeric::TABULAR_NUMS
+            | stylo::FontVariantNumeric::SLASHED_ZERO;
+        font_variant_numeric(input, &mut out);
+        assert_eq!(
+            pairs(&out),
+            vec![(*b"onum", 1), (*b"tnum", 1), (*b"zero", 1)]
+        );
+    }
+
+    #[test]
+    fn east_asian_features() {
+        let mut out = Vec::new();
+        let input =
+            stylo::FontVariantEastAsian::JIS04 | stylo::FontVariantEastAsian::PROPORTIONAL_WIDTH;
+        font_variant_east_asian(input, &mut out);
+        assert_eq!(pairs(&out), vec![(*b"jp04", 1), (*b"pwid", 1)]);
+    }
+
+    #[test]
+    fn feature_settings_map_directly() {
+        let mut out = Vec::new();
+        font_feature_settings(&feature_settings(&[(b"smcp", 1), (b"tnum", 0)]), &mut out);
+        assert_eq!(pairs(&out), vec![(*b"smcp", 1), (*b"tnum", 0)]);
+    }
+
+    /// `font-feature-settings` has a higher precedence than the `font-variant-*`
+    /// properties, so its entries must be appended *after* the variant-derived ones.
+    /// Parley stably sorts by tag and HarfBuzz applies the last of any duplicate tags,
+    /// so the trailing `font-feature-settings` value wins.
+    #[test]
+    fn feature_settings_override_variant_features() {
+        let mut out = Vec::new();
+        // font-variant-numeric: tabular-nums => tnum=1
+        font_variant_numeric(stylo::FontVariantNumeric::TABULAR_NUMS, &mut out);
+        // font-feature-settings: "tnum" 0 (should override the variant)
+        font_feature_settings(&feature_settings(&[(b"tnum", 0)]), &mut out);
+
+        let flat = pairs(&out);
+        // Both are present, and the feature-settings value comes last.
+        assert_eq!(flat, vec![(*b"tnum", 1), (*b"tnum", 0)]);
+        let last_tnum = flat.iter().rev().find(|(tag, _)| tag == b"tnum").unwrap();
+        assert_eq!(last_tnum.1, 0);
+    }
+}

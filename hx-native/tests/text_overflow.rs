@@ -520,46 +520,58 @@ body {{ width: 400px; height: 80px; background: #1a1f2a; color: #9aa3b5;
         "flex title should truncate"
     );
 
-    // Just inside the full #title content box (max-width 200 at x=8 → edge ~208).
-    // Truncated geometry would shrink the hit target and miss here.
-    let edge_x = 200.0;
+    // Full #title content box: max-width 200 at x=8 → right edge at 208.
+    // Correct path keeps #title hovered through x=210; #act starts at 212.
+    // Old mutate-and-resolve shrinks the flex item so hover leaves #title by 208
+    // and #act starts at 210 — probes must catch that gap (not x=200 / x=230).
     let tx = with_e.input(InputEvent::PointerMove {
-        x: edge_x,
+        x: 210.0,
         y: 34.0,
         mods: Modifiers::default(),
     });
     let to = without.input(InputEvent::PointerMove {
-        x: edge_x,
+        x: 210.0,
         y: 34.0,
         mods: Modifiers::default(),
     });
     assert!(
         matches!(tx, InputOutcome::Hover { id: Some(ref id) } if id == "title"),
-        "ellipsis title hit at full edge: {tx:?}"
+        "ellipsis title hit at x=210: {tx:?}"
     );
     assert!(
         matches!(to, InputOutcome::Hover { id: Some(ref id) } if id == "title"),
-        "plain title hit at full edge: {to:?}"
+        "plain title hit at x=210: {to:?}"
     );
 
-    // Button sits after the 200px title (+ margin); both pages must hit #act.
+    // #act must not be hovered before x=212 (old path hit it at 210).
+    for x in [208.0_f32, 210.0, 211.0] {
+        let h = with_e.input(InputEvent::PointerMove {
+            x,
+            y: 34.0,
+            mods: Modifiers::default(),
+        });
+        assert!(
+            !matches!(h, InputOutcome::Hover { id: Some(ref id) } if id == "act"),
+            "ellipsis page must not hover #act at x={x}: {h:?}"
+        );
+    }
     let hx = with_e.input(InputEvent::PointerMove {
-        x: 230.0,
+        x: 212.0,
         y: 34.0,
         mods: Modifiers::default(),
     });
     let ho = without.input(InputEvent::PointerMove {
-        x: 230.0,
+        x: 212.0,
         y: 34.0,
         mods: Modifiers::default(),
     });
     assert!(
         matches!(hx, InputOutcome::Hover { id: Some(ref id) } if id == "act"),
-        "ellipsis page button hover: {hx:?}"
+        "ellipsis page button hover at x=212: {hx:?}"
     );
     assert!(
         matches!(ho, InputOutcome::Hover { id: Some(ref id) } if id == "act"),
-        "plain page button hover: {ho:?}"
+        "plain page button hover at x=212: {ho:?}"
     );
 }
 
@@ -623,12 +635,15 @@ body {{ width: 320px; height: 80px; background: #1a1f2a; color: #9aa3b5;
 
     let text = long_reason();
     // Cases Graph required (plus the Mainnet default). Zero tolerance: byte-identical.
+    // text-align right/center covered because Blitz sets align outside TextStyle.
     let cases = [
         ("default", ""),
         ("line-height 12px", "line-height: 12px;"),
         ("letter-spacing 1px", "letter-spacing: 1px;"),
         ("word-spacing 4px", "word-spacing: 4px;"),
         ("italic", "font-style: italic;"),
+        ("text-align right", "text-align: right;"),
+        ("text-align center", "text-align: center;"),
     ];
     for (name, extra) in cases {
         let (e, with_ellipsis) = paint_img(&page(extra, "text-overflow: ellipsis;", text));
