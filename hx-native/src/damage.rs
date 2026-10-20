@@ -341,12 +341,16 @@ pub(crate) fn ink_box_device(
     y1 = y1.max(overflow.y1 * to_scale);
 
     if let Some(style) = node.primary_styles() {
-        let outline_w = style.get_outline().outline_width.0.to_f64_px() * scale;
-        if outline_w > 0.0 {
-            x0 -= outline_w;
-            y0 -= outline_w;
-            x1 += outline_w;
-            y1 += outline_w;
+        let outline = style.get_outline();
+        let outline_w = outline.outline_width.0.to_f64_px() * scale;
+        // outline-offset can be negative (inward); only grow ink for outward offset.
+        let outline_off = outline.outline_offset.to_f64_px().max(0.0) * scale;
+        let outline_pad = outline_w + outline_off;
+        if outline_pad > 0.0 {
+            x0 -= outline_pad;
+            y0 -= outline_pad;
+            x1 += outline_pad;
+            y1 += outline_pad;
         }
 
         // box-shadow ≈ offset + 1.5×blur + spread (probe heuristic).

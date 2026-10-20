@@ -17,6 +17,10 @@ use blitz_dom::node::Node;
 use blitz_dom::{qual_name, NodeId};
 use blitz_html::HtmlDocument;
 
+/// IEEE-754 safe integer limit (±2^53). Beyond this, number fields clamp at commit
+/// and step math refuses to proceed with wrapping/`as i64` casts.
+pub(crate) const MAX_SAFE_NUMBER: f64 = 9_007_199_254_740_992.0; // 2^53
+
 /// First value for `name`, if any (htmx / HTML single-value accessor).
 pub fn args_get<'a>(args: &'a [(String, String)], name: &str) -> Option<&'a str> {
     args.iter()
@@ -96,6 +100,16 @@ pub fn is_numeric_input(node: &Node) -> bool {
     tag_name(node) == "input" && matches!(input_type(node).as_str(), "number" | "range")
 }
 
+/// True when `node` is an `<input type="number">` (not range).
+pub fn is_number_input(node: &Node) -> bool {
+    tag_name(node) == "input" && input_type(node).as_str() == "number"
+}
+
+/// True when `node` is an `<input type="text">` (or missing type → text).
+pub fn is_text_input(node: &Node) -> bool {
+    tag_name(node) == "input" && matches!(input_type(node).as_str(), "text" | "")
+}
+
 /// True when `node` is an `<input type="range">`.
 pub fn is_range_input(node: &Node) -> bool {
     tag_name(node) == "input" && input_type(node).as_str() == "range"
@@ -103,6 +117,8 @@ pub fn is_range_input(node: &Node) -> bool {
 
 /// Step a number/range control by `dir` (±1) × `step`, clamp, snap, write `value`.
 /// Returns `true` when the attribute changed.
+///
+/// Uses integer scaled arithmetic so `2.20 + 0.01` stays `2.21` (no float drift).
 pub fn step_numeric_value(doc: &mut HtmlDocument, id: &str, dir: i32) -> bool {
     let Some(nid) = doc.get_element_by_id(id) else {
         return false;
@@ -117,9 +133,109 @@ pub fn step_numeric_value(doc: &mut HtmlDocument, id: &str, dir: i32) -> bool {
     let current = attr(node, "value")
         .and_then(|s| parse_f64(&s))
         .unwrap_or(limits.min.unwrap_or(0.0));
-    let next = current + (dir as f64) * limits.step;
-    let snapped = clamp_snap(next, &limits);
-    write_value_attr(doc, nid, &format_numeric(snapped))
+    let next = step_precise(current, dir, &limits);
+    write_value_attr(doc, nid, &format_numeric_for_step(next, &limits))
+}
+
+fn clamp_safe_number(v: f64) -> f64 {
+    if !v.is_finite() {
+        return 0.0;
+    }
+    v.clamp(-MAX_SAFE_NUMBER, MAX_SAFE_NUMBER)
+}
+
+fn scale_to_i64(v: f64, scale: i64) -> Option<i64> {
+    let scaled = clamp_safe_number(v) * scale as f64;
+    if !scaled.is_finite() || scaled.abs() > i64::MAX as f64 {
+        return None;
+    }
+    Some(scaled.round() as i64)
+}
+
+/// Step with integer-scaled math; clamp to min/max; snap to step grid from min.
+/// Uses checked scale conversions — values beyond ±2^53 clamp; overflow yields
+/// the clamped current value (never panics or wraps).
+pub(crate) fn step_precise(current: f64, dir: i32, limits: &NumericLimits) -> f64 {
+    let current = clamp_safe_number(current);
+    let decimals = step_decimal_places(limits.step);
+    let scale = 10i64.pow(decimals as u32);
+    let Some(cur_i) = scale_to_i64(current, scale) else {
+        return current;
+    };
+    let Some(step_i) = scale_to_i64(limits.step, scale) else {
+        return current;
+    };
+    let Some(mut next_i) = cur_i.checked_add((dir as i64).checked_mul(step_i).unwrap_or(0)) else {
+        return if dir > 0 {
+            MAX_SAFE_NUMBER
+        } else {
+            -MAX_SAFE_NUMBER
+        };
+    };
+    if let Some(min) = limits.min {
+        if let Some(min_i) = scale_to_i64(min, scale) {
+            if next_i < min_i {
+                next_i = min_i;
+            }
+        }
+    }
+    if let Some(max) = limits.max {
+        if let Some(max_i) = scale_to_i64(max, scale) {
+            if next_i > max_i {
+                next_i = max_i;
+            }
+        }
+    }
+    // Snap to step grid from min (or 0) in integer space.
+    let base = limits.min.unwrap_or(0.0);
+    if let (Some(base_i), true) = (scale_to_i64(base, scale), step_i > 0) {
+        let delta = next_i - base_i;
+        let n = if delta >= 0 {
+            (delta + step_i / 2) / step_i
+        } else {
+            (delta - step_i / 2) / step_i
+        };
+        next_i = base_i + n * step_i;
+        if let Some(min) = limits.min {
+            if let Some(min_i) = scale_to_i64(min, scale) {
+                if next_i < min_i {
+                    next_i = min_i;
+                }
+            }
+        }
+        if let Some(max) = limits.max {
+            if let Some(max_i) = scale_to_i64(max, scale) {
+                if next_i > max_i {
+                    next_i = max_i;
+                }
+            }
+        }
+    }
+    clamp_safe_number(next_i as f64 / scale as f64)
+}
+
+pub(crate) fn step_decimal_places(step: f64) -> usize {
+    if step <= 0.0 || !step.is_finite() {
+        return 0;
+    }
+    // Count decimals in a stable rendering of step (max 10).
+    let s = format!("{step:.10}");
+    let s = s.trim_end_matches('0');
+    match s.split_once('.') {
+        Some((_, frac)) => frac.len().min(10),
+        None => 0,
+    }
+}
+
+pub(crate) fn format_numeric_for_step(v: f64, limits: &NumericLimits) -> String {
+    let decimals = step_decimal_places(limits.step);
+    if decimals == 0 {
+        return format_numeric(v);
+    }
+    let s = format!("{v:.decimals$}");
+    // Trim only trailing zeros beyond the step's natural decimals? Keep step precision.
+    // "2.20" with step 0.01 stays "2.20"; "2.00" → "2.00" is fine for fee displays.
+    s
 }
 
 /// Set a range control's value from pointer `x` (document coordinates).
@@ -153,13 +269,13 @@ pub fn set_range_value_from_x(doc: &mut HtmlDocument, id: &str, x: f32) -> bool 
     write_value_attr(doc, nid, &format_numeric(snapped))
 }
 
-struct NumericLimits {
-    min: Option<f64>,
-    max: Option<f64>,
-    step: f64,
+pub(crate) struct NumericLimits {
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub step: f64,
 }
 
-fn numeric_limits(node: &Node) -> NumericLimits {
+pub(crate) fn numeric_limits(node: &Node) -> NumericLimits {
     let is_range = is_range_input(node);
     let min = attr(node, "min")
         .and_then(|s| parse_f64(&s))
@@ -175,18 +291,24 @@ fn numeric_limits(node: &Node) -> NumericLimits {
 }
 
 fn clamp_snap(value: f64, limits: &NumericLimits) -> f64 {
-    let min = limits.min.unwrap_or(f64::NEG_INFINITY);
-    let max = limits.max.unwrap_or(f64::INFINITY);
+    let value = clamp_safe_number(value);
+    let min = limits.min.unwrap_or(-MAX_SAFE_NUMBER);
+    let max = limits.max.unwrap_or(MAX_SAFE_NUMBER);
     let base = limits.min.unwrap_or(0.0);
     let stepped = if limits.step > 0.0 {
         base + ((value - base) / limits.step).round() * limits.step
     } else {
         value
     };
-    stepped.clamp(min, max)
+    clamp_safe_number(stepped.clamp(min, max))
 }
 
-fn write_value_attr(doc: &mut HtmlDocument, nid: NodeId, new_value: &str) -> bool {
+/// Public clamp+snap for text-edit commit.
+pub(crate) fn clamp_snap_value(value: f64, limits: &NumericLimits) -> f64 {
+    clamp_snap(value, limits)
+}
+
+pub(crate) fn write_value_attr(doc: &mut HtmlDocument, nid: NodeId, new_value: &str) -> bool {
     let old = doc
         .get_node(nid)
         .and_then(|n| attr(n, "value"))
@@ -209,7 +331,7 @@ fn form_control_pair(doc: &HtmlDocument, node: &Node) -> Option<(String, String)
         "input" => {
             let ty = input_type(node);
             match ty.as_str() {
-                "number" | "range" | "hidden" => Some((name, control_value(node))),
+                "number" | "range" | "hidden" | "text" => Some((name, control_value(node))),
                 "checkbox" | "radio" => {
                     if !is_checked(node) {
                         return None;
@@ -220,7 +342,7 @@ fn form_control_pair(doc: &HtmlDocument, node: &Node) -> Option<(String, String)
                     };
                     Some((name, value))
                 }
-                // Other input types (text, submit, button, …) are out of scope.
+                // submit / button / file / … stay out of form args.
                 _ => None,
             }
         }
@@ -313,7 +435,7 @@ fn tag_name(node: &Node) -> String {
         .unwrap_or_default()
 }
 
-fn input_type(node: &Node) -> String {
+pub(crate) fn input_type(node: &Node) -> String {
     attr(node, "type")
         .unwrap_or_else(|| "text".to_string())
         .to_ascii_lowercase()
@@ -332,11 +454,11 @@ fn named_attr(node: &Node, name: &str) -> Option<String> {
     attr(node, name).filter(|s| !s.is_empty())
 }
 
-fn parse_f64(s: &str) -> Option<f64> {
+pub(crate) fn parse_f64(s: &str) -> Option<f64> {
     s.trim().parse::<f64>().ok()
 }
 
-fn format_numeric(v: f64) -> String {
+pub(crate) fn format_numeric(v: f64) -> String {
     if v.is_finite() && (v - v.round()).abs() < 1e-9 {
         return (v.round() as i64).to_string();
     }

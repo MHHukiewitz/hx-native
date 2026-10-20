@@ -16,7 +16,7 @@ pub enum TriggerEvent {
     KeyDown,
     KeyUp,
     /// Commit-only form control event (range release, checkbox/radio toggle,
-    /// select pick, arrow step). Takes no filters.
+    /// select pick, arrow step, typed Enter/blur). Takes no filters.
     Change,
     Slice(String),
 }
@@ -164,6 +164,13 @@ fn parse_one_trigger(raw: &str, source_id: &str) -> Result<ParsedTrigger, Engine
     }
 
     let event = parse_event_name(event_name, source_id)?;
+
+    if matches!(event, TriggerEvent::Change) && filter.is_some() {
+        return Err(invalid(
+            source_id,
+            "change triggers do not accept filters yet (change[...] is a load error)",
+        ));
+    }
 
     if from.is_some() {
         match event {

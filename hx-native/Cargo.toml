@@ -43,6 +43,9 @@ parley = { version = "0.12", default-features = false, features = ["std"] }
 # Bump this pin together with any Blitz bump that moves stylo — see the pin-
 # sensitivity list in `src/ellipsis.rs`.
 style = { package = "stylo", version = "=0.22.0" }
+# Already pulled by Blitz/stylo; direct so we can clear ElementState::FOCUS for
+# caret blink-off paint without snapshot_node_and (Graph HOLD #19).
+style_dom = { package = "stylo_dom", version = "=0.22.0" }
 
 [dev-dependencies]
 serde_json = "1"
@@ -79,6 +82,10 @@ path = "tests/text_overflow.rs"
 name = "form_controls"
 path = "tests/form_controls.rs"
 
+[[test]]
+name = "text_edit_controls"
+path = "tests/text_edit_controls.rs"
+
 [[example]]
 name = "paint_bench"
 path = "examples/paint_bench.rs"
@@ -90,6 +97,10 @@ path = "examples/surface_probe.rs"
 [[example]]
 name = "worker_bench"
 path = "examples/worker_bench.rs"
+
+[[example]]
+name = "text_input_bench"
+path = "examples/text_input_bench.rs"
 
 [[bin]]
 name = "check_deps"

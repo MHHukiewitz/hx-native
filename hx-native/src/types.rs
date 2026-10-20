@@ -187,6 +187,10 @@ pub trait SliceSource {
 }
 
 /// Input the host (UI) converts from egui/winit. Raw: no platform remapping.
+///
+/// `#[non_exhaustive]` so adding variants (Text/Paste/Copy/Cut, …) does not
+/// break exhaustive matches in Mainnet / other downstream crates.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub enum InputEvent {
     PointerMove {
@@ -208,8 +212,17 @@ pub enum InputEvent {
     },
     PointerLeave,
     Key(KeyEvent),
-    /// Reserved: no text fields in the first scope; returned as Unhandled.
+    /// Committed text for a focused `<input type=text|number>`.
+    /// Without a focused editable field, returned as [`InputOutcome::Unhandled`].
     Text(String),
+    /// Host-supplied paste text for the focused editable field (no system clipboard
+    /// inside the engine). Without focus, returned as [`InputOutcome::None`].
+    Paste(String),
+    /// Request a copy of the current selection. Yields
+    /// [`InputOutcome::ClipboardWrite`] when there is selected text.
+    Copy,
+    /// Cut the current selection: [`InputOutcome::ClipboardWrite`] plus delete.
+    Cut,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -259,7 +272,8 @@ pub enum TriggerInfo {
         mods: Modifiers,
         repeat: bool,
     },
-    /// Commit-only form control change (range release, toggle, select pick, step).
+    /// Commit-only form control change (range release, toggle, select pick,
+    /// arrow/spin step, typed Enter/blur).
     Change,
     Slice {
         name: String,
@@ -389,6 +403,10 @@ pub struct Rect {
 }
 
 /// Reported in pointer order: no-click -> Hover -> Press -> Clicked/Action.
+///
+/// `#[non_exhaustive]` so adding variants (e.g. `ClipboardWrite`) does not
+/// break exhaustive matches in Mainnet / other downstream crates.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq)]
 pub enum InputOutcome {
     None,
@@ -419,4 +437,9 @@ pub enum InputOutcome {
     FocusChanged(FocusState),
     /// Key the engine did not consume. Host routes to game hotkeys / Esc stack.
     Unhandled(KeyEvent),
+    /// Host should place `text` on the system clipboard (Copy/Cut). The engine
+    /// never touches the OS clipboard itself.
+    ClipboardWrite {
+        text: String,
+    },
 }

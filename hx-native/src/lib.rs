@@ -21,12 +21,15 @@ mod paint;
 mod pending;
 mod select_ui;
 mod stylo_text_style;
+mod text_edit;
 mod trigger;
 mod types;
 pub mod worker;
 
 pub use damage::{element_border_box_css, element_border_box_device};
-pub use dialect::{SwapMode, SyncMode};
+pub use dialect::{
+    SwapMode, SyncMode, ATTR_HX_GROUP, ATTR_HX_STEP, ATTR_HX_STEP_FOR, SUPPORTED_HX_ATTRIBUTES,
+};
 pub use engine::{DirtySet, Engine};
 pub use error::EngineError;
 pub use form_args::{args_get, args_get_all};
