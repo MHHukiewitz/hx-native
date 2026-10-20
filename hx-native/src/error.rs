@@ -74,10 +74,7 @@ impl fmt::Display for EngineError {
                 action,
                 input,
                 reason,
-            } => write!(
-                f,
-                "invalid input_limits for `{action}.{input}`: {reason}"
-            ),
+            } => write!(f, "invalid input_limits for `{action}.{input}`: {reason}"),
             EngineError::Paint(msg) => write!(f, "paint error: {msg}"),
             EngineError::NotLoaded => write!(f, "engine has no loaded HTML"),
             EngineError::UnknownSurface(id) => write!(f, "{id} is not open"),

@@ -1835,7 +1835,8 @@ impl LiveSurface {
 
         #[cfg(debug_assertions)]
         {
-            let markup_disagrees = (cur_min.is_some() && cur_min.as_deref() != Some(min_s.as_str()))
+            let markup_disagrees = (cur_min.is_some()
+                && cur_min.as_deref() != Some(min_s.as_str()))
                 || (cur_max.is_some() && cur_max.as_deref() != Some(max_s.as_str()))
                 || (cur_step.is_some() && cur_step.as_deref() != Some(step_s.as_str()));
             if markup_disagrees {

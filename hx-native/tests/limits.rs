@@ -221,7 +221,11 @@ fn changing_limits_reclamps_and_recalls_only_on_version_change() {
     };
     let mut frags = Frags::default();
     eng.sync(&slices, &mut frags).unwrap();
-    assert_eq!(*calls.lock().unwrap(), 1, "initial sync calls input_limits once");
+    assert_eq!(
+        *calls.lock().unwrap(),
+        1,
+        "initial sync calls input_limits once"
+    );
 
     // Same actions version again: must not recall input_limits.
     eng.sync(&slices, &mut frags).unwrap();
@@ -663,7 +667,10 @@ fn clamp_on_limit_change_emits_no_action_and_regroups_display() {
     );
     let mut frags = Frags::default();
     eng.sync(&slices, &mut frags).unwrap();
-    assert!(!eng.has_pending(), "a clamp must never create a pending Action");
+    assert!(
+        !eng.has_pending(),
+        "a clamp must never create a pending Action"
+    );
 
     // Tighten the max below the current value: the clamp must fire silently.
     let slices2 = LimitsSlices {
