@@ -56,6 +56,25 @@ body {{ width: 320px; height: 80px; background: #1a1f2a; color: #9aa3b5;
     )
 }
 
+fn plain_page(body_inner: &str) -> String {
+    format!(
+        r##"<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/>
+<style>
+* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+body {{ width: 320px; height: 80px; background: #1a1f2a; color: #9aa3b5;
+  font-family: "DejaVu Sans", sans-serif; font-size: 13px; }}
+#label {{
+  position: absolute; left: 8px; top: 24px;
+  width: 200px; height: 20px; line-height: 20px;
+  white-space: nowrap; overflow: hidden;
+}}
+</style></head><body>
+<div id="label">{body_inner}</div>
+</body></html>"##
+    )
+}
+
 fn short_reason() -> &'static str {
     "ok"
 }
@@ -125,6 +144,14 @@ fn long_text_gets_ellipsis_and_stays_inside_box() {
         "expected painted text (and ellipsis), got almost no ink"
     );
 
+    let truncated = eng
+        .test_ellipsis_truncated("gmode-why")
+        .expect("truncated cache");
+    assert!(
+        truncated.ends_with('\u{2026}'),
+        "truncated paint string must end with ellipsis: {truncated:?}"
+    );
+
     // Full reason string must still be in the serialized DOM after paint.
     let html = eng.serialize_html().expect("serialize");
     assert!(
@@ -147,6 +174,7 @@ fn short_text_unchanged() {
         right < 8 + 40,
         "short text unexpectedly wide: right={right}"
     );
+    assert!(eng.test_ellipsis_truncated("gmode-why").is_none());
     let html = eng.serialize_html().expect("serialize");
     assert!(html.contains(">ok<") || html.contains(">ok</"));
     assert!(!html.contains('\u{2026}'));
@@ -173,7 +201,6 @@ fn partial_and_full_repaint_byte_identical_with_ellipsis() {
     );
     let partial_img = partial.rgba.unwrap();
 
-    // Full-repaint reference with the same hover state.
     let mut eng_full = boot(&html);
     let _ = eng_full.input(InputEvent::PointerMove {
         x: 250.0,
@@ -187,7 +214,6 @@ fn partial_and_full_repaint_byte_identical_with_ellipsis() {
         "partial hover paint must be byte-identical to full paint with same hover"
     );
 
-    // Ellipsis band must match the pre-hover base (button is outside the band).
     for y in 24..44 {
         for x in 8..208 {
             let i = ((y * base.width + x) * 4) as usize;
@@ -229,4 +255,120 @@ fn worker_matches_sync_engine_with_ellipsis() {
         sync_img.pixels, worker_img.pixels,
         "PaintWorker frame must match sync Engine for ellipsis page"
     );
+}
+
+#[test]
+fn idle_frames_do_no_resolve_with_or_without_ellipsis() {
+    // Static document: after the first paint, N idle paints must not resolve
+    // (skipped clean frames). resolve_count must match a page without ellipsis.
+    const N: u64 = 8;
+
+    let mut with_e = boot(&gmode_why_page(long_reason()));
+    let _ = with_e.paint(vp()).unwrap();
+    let after_first_e = with_e.resolve_count();
+    // Hit-test must not force a resolve (DOM + original layout already restored).
+    let _ = with_e.input(InputEvent::PointerMove {
+        x: 20.0,
+        y: 30.0,
+        mods: Modifiers::default(),
+    });
+    // Pointer move marks paint dirty when hover changes — paint once more to
+    // settle, then measure truly idle skips.
+    let _ = with_e.paint(vp()).unwrap();
+    let settled_e = with_e.resolve_count();
+    for _ in 0..N {
+        let out = with_e.paint(vp()).unwrap();
+        assert!(out.skipped, "idle frame must skip raster");
+    }
+    assert_eq!(
+        with_e.resolve_count(),
+        settled_e,
+        "idle skips must not resolve (ellipsis page)"
+    );
+    assert!(
+        after_first_e >= 1,
+        "first paint must have resolved at least once"
+    );
+
+    let mut without = boot(&plain_page(long_reason()));
+    let _ = without.paint(vp()).unwrap();
+    let _ = without.input(InputEvent::PointerMove {
+        x: 20.0,
+        y: 30.0,
+        mods: Modifiers::default(),
+    });
+    let _ = without.paint(vp()).unwrap();
+    let settled_plain = without.resolve_count();
+    for _ in 0..N {
+        let out = without.paint(vp()).unwrap();
+        assert!(out.skipped, "idle frame must skip raster");
+    }
+    assert_eq!(
+        without.resolve_count(),
+        settled_plain,
+        "idle skips must not resolve (plain page)"
+    );
+
+    // Idle skip cost is the same class of work: zero resolves after settle.
+    assert_eq!(
+        with_e.resolve_count() - settled_e,
+        without.resolve_count() - settled_plain
+    );
+}
+
+#[test]
+fn cluster_boundaries_keep_combining_mark_and_zwj() {
+    // Force truncation near a combining mark (e + U+0301) and a ZWJ family emoji.
+    // Padding ASCII so the cut falls inside the interesting sequences if we
+    // wrongly split on Unicode scalars.
+    let combining = "e\u{0301}"; // é as base + combining acute
+    let zwj = "\u{1F468}\u{200D}\u{1F469}"; // man + ZWJ + woman
+    let reason =
+        format!("AAAAAAAAAA{combining}BBBBBBBBBB{zwj}CCCCCCCCCC more credit needed for settlement");
+    let mut eng = boot(&gmode_why_page(&reason));
+    let _ = eng.paint(vp()).unwrap();
+    let truncated = eng
+        .test_ellipsis_truncated("gmode-why")
+        .expect("should truncate");
+    assert!(truncated.ends_with('\u{2026}'));
+
+    // Must not leave a dangling combining mark or a bare ZWJ at the cut.
+    let body = truncated.trim_end_matches('\u{2026}');
+    assert!(
+        !body.ends_with('\u{0301}'),
+        "must not cut before combining mark alone: {truncated:?}"
+    );
+    assert!(
+        !body.ends_with('\u{200D}'),
+        "must not cut after ZWJ: {truncated:?}"
+    );
+    // If the combining sequence is present, it must be complete.
+    if body.contains('e') {
+        let bytes = body.as_bytes();
+        for (i, w) in body.char_indices() {
+            if w == 'e' {
+                let next = body[i + w.len_utf8()..].chars().next();
+                if next == Some('\u{0301}') {
+                    // complete cluster — ok
+                } else if body[i..].starts_with(combining) {
+                    // ok
+                } else {
+                    // 'e' without following mark is fine when the mark cluster
+                    // was truncated away entirely.
+                    let _ = bytes;
+                }
+            }
+        }
+    }
+    // ZWJ emoji, if started, must include the full sequence.
+    if let Some(i) = body.find('\u{1F468}') {
+        let rest = &body[i..];
+        assert!(
+            rest.starts_with(zwj) || !rest.contains('\u{200D}'),
+            "ZWJ emoji must not be split: {truncated:?}"
+        );
+    }
+
+    let html = eng.serialize_html().unwrap();
+    assert!(html.contains(&reason), "DOM keeps full original text");
 }

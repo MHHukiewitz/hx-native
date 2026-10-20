@@ -712,6 +712,7 @@ dependencies = [
  "blitz-paint",
  "blitz-traits",
  "kurbo",
+ "parley",
  "peniko",
  "serde_json",
 ]

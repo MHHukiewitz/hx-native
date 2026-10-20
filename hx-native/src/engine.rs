@@ -15,7 +15,7 @@ use crate::damage::{
     DamagePlan, IntRect,
 };
 use crate::dialect::{validate_loaded_attrs, ElementBinding, SwapMode, SyncMode};
-use crate::ellipsis::apply_text_overflow_ellipsis;
+use crate::ellipsis::{prepare_ellipsis_for_paint, EllipsisCache};
 use crate::error::EngineError;
 use crate::focus::{focusable_ids, ids_in_document_order, step_focus};
 use crate::fonts::bundled_font_context;
@@ -175,6 +175,10 @@ struct LiveSurface {
     last_bounds: BoundsSnapshot,
     /// Primary-button drag on an `<input type="range">`.
     range_drag_id: Option<String>,
+    /// Cached truncated paint layouts for `text-overflow: ellipsis` (issue #12).
+    ellipsis_cache: EllipsisCache,
+    /// Total `doc.resolve` calls on this surface (tests: idle frames must not grow).
+    resolve_count: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -877,6 +881,21 @@ impl Engine {
         self.style_layout_passes
     }
 
+    /// Total `HtmlDocument::resolve` calls on the default surface (issue #12).
+    /// Idle paints with a cached ellipsis must not grow this after the first frame.
+    pub fn resolve_count(&self) -> u64 {
+        self.live(SurfaceId::DEFAULT)
+            .map(|l| l.resolve_count)
+            .unwrap_or(0)
+    }
+
+    /// Test harness: truncated paint string cached for `#id`, if any.
+    pub fn test_ellipsis_truncated(&self, elem_id: &str) -> Option<String> {
+        let live = self.live(SurfaceId::DEFAULT)?;
+        let nid = live.doc.get_element_by_id(elem_id)?;
+        live.ellipsis_cache.truncated_for(nid).map(str::to_string)
+    }
+
     pub fn config(&self) -> &EngineConfig {
         &self.config
     }
@@ -1022,7 +1041,19 @@ impl LiveSurface {
             cached_rgba: None,
             last_bounds: BoundsSnapshot::new(),
             range_drag_id: None,
+            ellipsis_cache: EllipsisCache::default(),
+            resolve_count: 1,
         })
+    }
+
+    fn resolve_doc(&mut self) {
+        self.doc.resolve(0.0);
+        self.resolve_count = self.resolve_count.saturating_add(1);
+    }
+
+    fn mark_dom_dirty(&mut self) {
+        self.needs_resolve = true;
+        self.ellipsis_cache.clear();
     }
 
     /// Waiting on `complete()` (or a queued release the host has not taken yet).
@@ -1213,7 +1244,7 @@ impl LiveSurface {
             }
         }
 
-        self.needs_resolve = true;
+        self.mark_dom_dirty();
         self.mark_paint_dirty();
         // Reindex after swap so new hx-* inside fragments are visible.
         self.reindex_bindings(declared_actions)?;
@@ -1325,7 +1356,7 @@ impl LiveSurface {
                 }
             }
         }
-        self.needs_resolve = true;
+        self.mark_dom_dirty();
         self.mark_paint_dirty();
     }
 
@@ -1354,7 +1385,7 @@ impl LiveSurface {
 
     fn ensure_resolved(&mut self) {
         if self.needs_resolve {
-            self.doc.resolve(0.0);
+            self.resolve_doc();
             self.needs_resolve = false;
         }
     }
@@ -1693,7 +1724,7 @@ impl LiveSurface {
         self.ensure_resolved();
         let changed = set_range_value_from_x(&mut self.doc, id, x);
         if changed {
-            self.needs_resolve = true;
+            self.mark_dom_dirty();
             self.mark_paint_dirty();
         }
         changed
@@ -1717,7 +1748,7 @@ impl LiveSurface {
             _ => return false,
         };
         if step_numeric_value(&mut self.doc, &fid, dir) {
-            self.needs_resolve = true;
+            self.mark_dom_dirty();
             self.mark_paint_dirty();
         }
         true
@@ -1826,7 +1857,7 @@ impl LiveSurface {
                 mutr.set_attribute(nid, qual_name!("class"), &new_class);
             }
         }
-        self.needs_resolve = true;
+        self.mark_dom_dirty();
         self.mark_paint_dirty();
     }
 
@@ -2092,7 +2123,7 @@ impl LiveSurface {
                     &reason.0,
                 );
             }
-            self.needs_resolve = true;
+            self.mark_dom_dirty();
             self.mark_paint_dirty();
         }
 
@@ -2162,8 +2193,7 @@ impl LiveSurface {
         let had_previous = !self.last_bounds.is_empty() && self.cached_rgba.is_some();
         let previous = std::mem::take(&mut self.last_bounds);
 
-        let doc = &mut self.doc;
-        doc.set_viewport(BlitzViewport::new(
+        self.doc.set_viewport(BlitzViewport::new(
             width,
             height,
             scale as f32,
@@ -2175,19 +2205,19 @@ impl LiveSurface {
         let style_damaged = if force_full || !had_previous {
             Vec::new()
         } else {
-            doc.resolve_stylist(0.0);
-            collect_style_damaged(doc)
+            self.doc.resolve_stylist(0.0);
+            collect_style_damaged(&self.doc)
         };
 
         // Style + layout once. A second pass is allowed only when the hovered
         // node changes (Graph: at most 2 passes total per paint).
-        let hover_before = doc.get_hover_node_id();
-        doc.resolve(0.0);
+        let hover_before = self.doc.get_hover_node_id();
+        self.resolve_doc();
         let mut passes = 1;
         // resolve() ends with refresh_hover(); compare hover node to decide follow-up.
-        let hover_changed = doc.get_hover_node_id() != hover_before;
+        let hover_changed = self.doc.get_hover_node_id() != hover_before;
         if hover_changed {
-            doc.resolve(0.0);
+            self.resolve_doc();
             passes += 1;
         }
         self.needs_resolve = false;
@@ -2195,7 +2225,8 @@ impl LiveSurface {
         let plan = if force_full || !had_previous {
             DamagePlan::full(width, height)
         } else {
-            let raw = compute_raw_damage(doc, scale, width, height, &previous, &style_damaged);
+            let raw =
+                compute_raw_damage(&self.doc, scale, width, height, &previous, &style_damaged);
             let merged = merge_damage_rects(raw, width, height);
             // Dirty paint with no detected rects: fall back to full (safer than a no-op).
             if merged.rects.is_empty() {
@@ -2205,7 +2236,7 @@ impl LiveSurface {
             }
         };
 
-        self.last_bounds = snapshot_bounds(doc, scale);
+        self.last_bounds = snapshot_bounds(&self.doc, scale);
         (plan, passes)
     }
 
@@ -2217,14 +2248,16 @@ impl LiveSurface {
         scale: f64,
         paint_mode: PaintMode,
     ) -> Result<RgbaImage, EngineError> {
-        // Issue #12: truncate single-line ellipsis candidates for this paint only.
-        // Damage was planned on the full text (element boxes unchanged under
-        // overflow:hidden). Restore originals after raster so hit-testing / sync
-        // keep the real string; see `ellipsis` module docs.
-        let backup = apply_text_overflow_ellipsis(&mut self.doc);
-        if backup.did_mutate() {
-            self.doc.resolve(0.0);
-        }
+        // Issue #12: swap cached truncated TextLayouts for paint only. DOM text
+        // stays full; layouts are restored afterward — no needs_resolve.
+        let guard = {
+            let cache = &mut self.ellipsis_cache;
+            let resolve_count = &mut self.resolve_count;
+            prepare_ellipsis_for_paint(&mut self.doc, cache, |doc| {
+                doc.resolve(0.0);
+                *resolve_count = resolve_count.saturating_add(1);
+            })
+        };
 
         let rgba = if plan.full_repaint
             || plan.rects.len() == 1 && plan.rects[0] == IntRect::full_surface(width, height)
@@ -2247,12 +2280,7 @@ impl LiveSurface {
             Ok(frame)
         };
 
-        let mutated = backup.did_mutate();
-        backup.restore(&mut self.doc);
-        if mutated {
-            // Layout still reflects truncated text until the next resolve.
-            self.needs_resolve = true;
-        }
+        guard.restore(&mut self.doc);
         rgba
     }
 
