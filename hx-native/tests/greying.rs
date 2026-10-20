@@ -980,11 +980,20 @@ fn a27_damage_scoped_to_changed_controls_exact_damaged_set() {
     let without_requires_change = click_music_with_action(ActionState::Enabled);
     let damaged_without = without_requires_change.test_damaged_element_count();
 
-    assert!(
-        damaged_with > damaged_without,
-        "ungreying Apply must add its own node (and ancestors) to the \
-         damaged set beyond what the identical hx-changed-flipping click \
-         damages on its own (with={damaged_with} without={damaged_without})"
+    // Test gap (Graph 18:55 re-review): a lower bound (`>`) only proves the
+    // ungrey write adds *something*; it does not bound damage from above,
+    // so an over-damaging regression (e.g. a mutation that forces a wider
+    // repaint) would still leave the inequality true. `music` and `apply`
+    // are both direct children of the same `<form id="f">`, so ungreying
+    // Apply must add *exactly* its own node to the damaged set — nothing
+    // else, since the shared ancestor chain (form/body/html) is already
+    // counted via `music` in both runs.
+    assert_eq!(
+        damaged_with,
+        damaged_without + 1,
+        "ungreying Apply must add exactly its own node to the damaged set \
+         (with={damaged_with} without={damaged_without}) — not fewer (missed \
+         damage) and not more (an over-damaging regression)"
     );
 }
 
@@ -1701,6 +1710,94 @@ fn a27_hx_changed_applies_to_standalone_control_outside_any_form() {
     );
 }
 
+/// Test gap (mutation `M12b_standalone_write_every_pass` survived except via
+/// a flaky worker test): `apply_standalone_changed_classes` must write the
+/// `hx-changed` class only on an actual flip, exactly like the
+/// `RequiresChange`-scoped path's own
+/// `a27_hx_changed_second_keystroke_same_state_no_class_write_no_extra_damage`.
+/// Asserts the *exact* `test_hx_changed_write_count()` at each step, not
+/// just "some write happened" — a mutation that writes on every pass
+/// regardless of whether the state changed would inflate every count below.
+#[test]
+fn r2_standalone_hx_changed_writes_exactly_on_flips() {
+    let mut eng = boot(STANDALONE_APPLIED_CONTROL, &[]);
+    assert_eq!(
+        eng.test_hx_changed_write_count(),
+        0,
+        "clean load writes nothing"
+    );
+
+    set_field_text(&mut eng, "row-qty", "Edited"); // flip: unchanged -> changed
+    assert_eq!(eng.test_hx_changed_write_count(), 1);
+
+    let _ = eng.input(InputEvent::Text("!".into())); // still changed: no flip
+    assert_eq!(
+        eng.test_hx_changed_write_count(),
+        1,
+        "typing more while already changed must not rewrite the class"
+    );
+
+    set_field_text(&mut eng, "row-qty", "Base"); // flip: changed -> unchanged
+    assert_eq!(eng.test_hx_changed_write_count(), 2);
+
+    let _ = eng.input(InputEvent::Key(KeyEvent {
+        key: "ArrowLeft".into(),
+        code: "ArrowLeft".into(),
+        mods: Modifiers::default(),
+        repeat: false,
+        pressed: true,
+    })); // cursor move, no value change: no flip
+    assert_eq!(
+        eng.test_hx_changed_write_count(),
+        2,
+        "a non-value-changing edit must not rewrite the class"
+    );
+}
+
+const SWAP_IN_NEW_STANDALONE_FORM: &str = r##"
+<section id="sec-newctl" hx-trigger="slice:panel" hx-target="#newctl-holder" hx-swap="innerHTML">
+  <div id="newctl-holder"></div>
+</section>"##;
+
+/// Test gap (mutation `M15_standalone_not_refreshed_on_swap` survived): a
+/// swap that introduces a *brand new* `data-hx-applied` control (one that
+/// did not exist before the swap, so it could never have been in
+/// `applied_control_nids` from load time) must still have `hx-changed`
+/// opt-in working on it — `applied_control_nids` has to be refreshed by
+/// `reindex_bindings` on every swap, not just captured once at load.
+#[test]
+fn r2_standalone_opt_in_works_on_swapped_in_control() {
+    let mut eng = boot(SWAP_IN_NEW_STANDALONE_FORM, &[]);
+    let mut slices = Slices::new();
+    let mut frags = Frags::default();
+    frags.set("sec-newctl", r#"<div id="newctl-holder"></div>"#);
+    slices.bump("actions");
+    eng.sync(&slices, &mut frags).unwrap();
+    assert!(
+        eng.test_element_box("newctl-holder").is_some(),
+        "initial render must have landed"
+    );
+
+    // Swap in a new data-hx-applied control that never existed before.
+    frags.set(
+        "sec-newctl",
+        r#"<div id="newctl-holder"><input id="newctl" type="text" name="newctl" value="Base" data-hx-applied="Base" style="display:block"/></div>"#,
+    );
+    slices.bump("panel");
+    eng.sync(&slices, &mut frags).unwrap();
+    assert!(
+        !eng.has_class("newctl", "hx-changed"),
+        "swapped-in control must start clean"
+    );
+
+    set_field_text(&mut eng, "newctl", "Edited");
+    assert!(
+        eng.has_class("newctl", "hx-changed"),
+        "a swapped-in data-hx-applied control must opt into hx-changed on edit, \
+         same as one present from load"
+    );
+}
+
 /// Damage from the opt-in-by-attribute path (no `RequiresChange` form in
 /// play at all) must stay scoped to the edited control, and a partial
 /// repaint of that edit must be byte-identical to a forced full repaint —
@@ -1739,6 +1836,57 @@ fn a27_hx_changed_opt_in_damage_partial_eq_full() {
         &partial_px,
         full.rgba.as_ref().unwrap(),
         "standalone hx-changed opt-in damage",
+    );
+}
+
+const STANDALONE_SELECT_APPLIED: &str = r##"<style>.hx-changed{outline:3px solid #0a0;outline-offset:1px;background:#ffd}</style>
+<select id="qsel" name="qsel" data-hx-applied="low" style="width:100px;height:22px;display:block">
+  <option value="low">Low</option>
+  <option value="high">High</option>
+</select>"##;
+
+/// Test gap (mutation `G3_skip_damage_hxchanged_nodes` survived): every
+/// existing `hx-changed`-flip damage test edits a text/checkbox/radio
+/// control, whose *own* commit path already queues explicit ink-box damage
+/// via `queue_text_field_damage` (or, for radios, `damage_previous_radio`
+/// for the sibling) — independent of whatever the `hx-changed` class's own
+/// style damage contributes. A mutation that drops style damage
+/// specifically for `hx-changed`-classed nodes would hide behind that
+/// redundant damage source in every one of those tests. A keyboard-stepped
+/// `<select>` has no such redundant source (`select_step`'s commit path
+/// only calls `mark_dom_dirty`/`mark_paint_dirty`, no explicit ink-box
+/// queue) — this isolates the class's own style damage.
+#[test]
+fn r2_hx_changed_select_flip_has_no_redundant_damage_source_partial_eq_full() {
+    let mut eng = boot(STANDALONE_SELECT_APPLIED, &[]);
+    let _ = eng.paint(vp());
+    eng.test_set_focus("qsel");
+    let _ = key(&mut eng, "ArrowDown"); // low -> high: flips hx-changed
+    assert!(eng.has_class("qsel", "hx-changed"));
+    let partial = eng.paint(vp()).unwrap();
+    assert!(!partial.skipped && partial.rgba.is_some());
+    let partial_px = partial.rgba.unwrap();
+    let damage = partial.damage.clone();
+
+    let (qx, qy, qw, qh) = eng.test_element_box("qsel").unwrap();
+    let covers_qsel = damage
+        .iter()
+        .any(|r| r.x < qx + qw && qx < r.x + r.width && r.y < qy + qh && qy < r.y + r.height);
+    assert!(
+        covers_qsel,
+        "the select's own hx-changed flip must be in the damage plan: {damage:?}"
+    );
+
+    let mut eng_full = boot(STANDALONE_SELECT_APPLIED, &[]);
+    let _ = eng_full.paint(vp());
+    eng_full.test_set_focus("qsel");
+    let _ = key(&mut eng_full, "ArrowDown");
+    eng_full.mark_theme_or_stylesheet_changed();
+    let full = eng_full.paint(vp()).unwrap();
+    assert_partial_eq_full(
+        &partial_px,
+        full.rgba.as_ref().unwrap(),
+        "select hx-changed flip damage (no redundant damage source)",
     );
 }
 
