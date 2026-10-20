@@ -75,6 +75,10 @@ path = "tests/paint_worker.rs"
 name = "text_overflow"
 path = "tests/text_overflow.rs"
 
+[[test]]
+name = "form_controls"
+path = "tests/form_controls.rs"
+
 [[example]]
 name = "paint_bench"
 path = "examples/paint_bench.rs"

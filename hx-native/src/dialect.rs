@@ -171,7 +171,14 @@ pub fn validate_loaded_attrs(
 }
 
 impl ElementBinding {
-    pub fn from_attrs(id: &str, attrs: &[(String, String)]) -> Result<Option<Self>, EngineError> {
+    /// Parse bindings from attributes. Pass `tag` / `input_type` so
+    /// `hx-trigger="change"` is rejected on non-form-controls (A24).
+    pub fn from_attrs_with_tag(
+        id: &str,
+        attrs: &[(String, String)],
+        tag: Option<&str>,
+        input_type: Option<&str>,
+    ) -> Result<Option<Self>, EngineError> {
         let hx_post = attr_get(attrs, "hx-post").map(str::to_string);
         let hx_trigger_raw = attr_get(attrs, "hx-trigger");
         let hx_target = attr_get(attrs, "hx-target").map(str::to_string);
@@ -209,6 +216,25 @@ impl ElementBinding {
                 }
             }
         };
+
+        for t in &triggers {
+            if t.event == crate::trigger::TriggerEvent::Change {
+                let ok = match tag {
+                    Some(tag) => crate::form_controls::is_change_eligible_tag(tag, input_type),
+                    // Tag unknown (unit tests on attrs alone): allow; load path always passes tag.
+                    None => true,
+                };
+                if !ok {
+                    return Err(EngineError::InvalidTrigger {
+                        source_id: id.to_string(),
+                        detail: format!(
+                            "change is only valid on input/select/textarea, not `<{}>`",
+                            tag.unwrap_or("?")
+                        ),
+                    });
+                }
+            }
+        }
 
         let slice_subs: Vec<String> = triggers
             .iter()
