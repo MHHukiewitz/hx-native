@@ -343,6 +343,12 @@ fn pending_full_surface_rect_forces_full_repaint() {
         "pending full-surface rect must force full_repaint; stats={stats:?} damage={:?}",
         out.damage
     );
+    // Must be the explicit pending-full rule, not the area-fraction fallback
+    // (without `|| pending_full` the area fallback can still set full_repaint).
+    assert!(
+        !stats.full_repaint_area_fallback,
+        "pending full-surface must not rely on area fallback; stats={stats:?}"
+    );
     assert_eq!(out.damage.len(), 1, "expected one full-surface damage rect");
     assert_eq!(out.damage[0].x, 0.0);
     assert_eq!(out.damage[0].y, 0.0);
@@ -383,4 +389,100 @@ fn transformed_panel_box_matches_visual_center() {
         (w - 320.0).abs() < 2.0 && (h - 328.0).abs() < 2.0,
         "panel size should be ~320×328, got ({w}×{h})"
     );
+}
+
+/// After a swap, a forced paint error must not drop pending/bounds: the next
+/// paint (after another change) must match a full repaint (0 px). Without
+/// `force_full_repaint` on rasterize failure the cached frame stays on the
+/// pre-swap ink (~20,240 px wrong vs confirm at scale 1).
+#[test]
+fn paint_error_after_swap_recovers_with_full_repaint() {
+    let mut eng = boot(&pause_page());
+    let mut slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    frags.set("pause-exit", &exit_row_html());
+    eng.sync(&slices, &mut frags).unwrap();
+    let view = vp_css(1280, 800, 1.0);
+    let _ = eng.paint(view.clone()).unwrap();
+
+    // Swap to confirm, then force the paint that would apply it to error.
+    slices.bump("pause");
+    frags.set("pause-exit", &exit_confirm_html());
+    eng.sync(&slices, &mut frags).unwrap();
+    eng.test_fail_next_paint();
+    let err = eng.paint(view.clone());
+    assert!(err.is_err(), "expected forced paint error, got {err:?}");
+
+    // One more change that does not cover the stale exit-row ink: a small
+    // pending rect in the corner. Without force_full_repaint the next paint
+    // only patches that corner and leaves ~20k wrong pixels in the panel.
+    eng.test_push_pending_damage(Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 40.0,
+        height: 40.0,
+    });
+    let recovered = eng.paint(view.clone()).unwrap();
+    assert!(!recovered.skipped);
+
+    let expected = paint_swap_forced_full(
+        &pause_page(),
+        "pause-exit",
+        &exit_confirm_html(),
+        1.0,
+        1280,
+        800,
+    );
+    let diffs = pixel_diffs(
+        recovered.rgba.as_ref().unwrap(),
+        expected.rgba.as_ref().unwrap(),
+    );
+    eprintln!(
+        "paint-error recovery diffs={diffs} full_repaint={} damage={:?}",
+        eng.last_paint_stats().full_repaint,
+        recovered.damage
+    );
+    assert_eq!(
+        diffs, 0,
+        "after paint error, next frame must match full repaint; diffs={diffs} damage={:?}",
+        recovered.damage
+    );
+    assert!(
+        eng.last_paint_stats().full_repaint,
+        "paint-error recovery must force full_repaint; stats={:?}",
+        eng.last_paint_stats()
+    );
+}
+
+/// Out-of-bounds pending rects are clamped on push (single pending list).
+#[test]
+fn pending_damage_clamps_out_of_bounds_on_push() {
+    let mut eng = boot(&pause_page());
+    let slices = MemSlices::new();
+    let mut frags = SpyFrags::new();
+    frags.set("pause-exit", &exit_row_html());
+    eng.sync(&slices, &mut frags).unwrap();
+    let view = vp_css(1280, 800, 1.0);
+    let _ = eng.paint(view.clone()).unwrap();
+
+    // Negative origin + oversized extent → clamp to surface; must not panic
+    // and the next paint's damage must stay inside the surface.
+    eng.test_push_pending_damage(Rect {
+        x: -80.0,
+        y: -40.0,
+        width: 200.0,
+        height: 100.0,
+    });
+    let out = eng.paint(view.clone()).unwrap();
+    assert!(!out.skipped);
+    for r in &out.damage {
+        assert!(
+            r.x >= 0.0 && r.y >= 0.0,
+            "damage origin must be clamped: {r:?}"
+        );
+        assert!(
+            r.x + r.width <= view.width as f32 + 0.5 && r.y + r.height <= view.height as f32 + 0.5,
+            "damage extent must be clamped to surface: {r:?}"
+        );
+    }
 }

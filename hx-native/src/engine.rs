@@ -2308,7 +2308,17 @@ impl LiveSurface {
         }
 
         let (plan, passes) = self.resolve_and_plan_damage(width, height, scale, force_full);
-        let rgba = self.rasterize_plan(&plan, width, height, scale, paint_mode)?;
+        // resolve_and_plan_damage already drained pending_damage and replaced
+        // last_bounds. If raster fails, force a full repaint next time so those
+        // drained rects / bounds are not silently dropped.
+        let rgba = match self.rasterize_plan(&plan, width, height, scale, paint_mode) {
+            Ok(rgba) => rgba,
+            Err(e) => {
+                self.force_full_repaint = true;
+                self.paint_dirty = true;
+                return Err(e);
+            }
+        };
 
         self.paint_dirty = false;
         self.force_full_repaint = false;
