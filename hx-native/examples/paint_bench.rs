@@ -640,6 +640,247 @@ fn bench_eviction_pressure(phys_w: u32, phys_h: u32) {
     }
 }
 
+fn gmode_why_html(reason: &str, ellipsis: bool) -> String {
+    let overflow = if ellipsis {
+        "white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"
+    } else {
+        "white-space: nowrap; overflow: hidden;"
+    };
+    format!(
+        r##"<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/>
+<style>
+* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+body {{ width: 320px; height: 80px; background: #1a1f2a; color: #9aa3b5;
+  font-family: "DejaVu Sans", sans-serif; font-size: 13px; }}
+#gmode-why {{
+  position: absolute; left: 8px; top: 24px;
+  width: 200px; height: 20px; line-height: 20px;
+  {overflow}
+}}
+</style></head><body>
+<div id="gmode-why">{reason}</div>
+<section id="sec-why" hx-trigger="slice:why" hx-target="#gmode-why" hx-swap="innerHTML"></section>
+</body></html>"##
+    )
+}
+
+fn ellipsis_cfg() -> EngineConfig {
+    EngineConfig {
+        paint_mode: PaintMode::Exact,
+        max_paint_ns: 50_000_000,
+        ..EngineConfig::default()
+    }
+}
+
+fn mean_p95(samples: &mut [u64]) -> (f64, u64) {
+    samples.sort_unstable();
+    let mean = samples.iter().sum::<u64>() as f64 / samples.len() as f64;
+    let p95 = samples[((samples.len() as f64) * 0.95) as usize];
+    (mean, p95)
+}
+
+fn print_row(label: &str, samples: &mut [u64]) {
+    let (mean, p95) = mean_p95(samples);
+    println!(
+        "  {label}: mean={:.3} ms  p95={:.3} ms  n={}",
+        mean / 1e6,
+        p95 as f64 / 1e6,
+        samples.len()
+    );
+}
+
+/// Issue #12: idle with/without ellipsis, text-change frame, 2000-char string.
+fn bench_text_overflow_ellipsis() {
+    const N: usize = 80;
+    const W: usize = 10;
+    let view = Viewport::new(320, 80);
+    let reason = "Disabled: not enough credit on the active settlement rail for this order size";
+    let reason_b = "Paused: settlement rail busy — retry after the next confirmation window opens";
+    let long_2k: String = "A".repeat(2000);
+
+    println!();
+    println!("### text-overflow: ellipsis (issue #12, 320×80 Exact, 200px #gmode-why)");
+
+    // --- Idle frames (static document, skipped paints) ---
+    let mut with_e = Engine::new(ellipsis_cfg());
+    with_e.declare_actions(&["act.do"]);
+    with_e.load_html(&gmode_why_html(reason, true)).unwrap();
+    let _ = with_e.paint(view.clone()).unwrap(); // fill truncation cache
+    let mut idle_with = Vec::with_capacity(N);
+    for i in 0..(W + N) {
+        let t0 = std::time::Instant::now();
+        let out = with_e.paint(view.clone()).unwrap();
+        let ns = t0.elapsed().as_nanos() as u64;
+        assert!(out.skipped, "idle with-ellipsis must skip");
+        if i >= W {
+            idle_with.push(ns);
+        }
+    }
+    print_row("idle frame (with ellipsis)", &mut idle_with);
+
+    let mut without = Engine::new(ellipsis_cfg());
+    without.declare_actions(&["act.do"]);
+    without.load_html(&gmode_why_html(reason, false)).unwrap();
+    let _ = without.paint(view.clone()).unwrap();
+    let mut idle_without = Vec::with_capacity(N);
+    for i in 0..(W + N) {
+        let t0 = std::time::Instant::now();
+        let out = without.paint(view.clone()).unwrap();
+        let ns = t0.elapsed().as_nanos() as u64;
+        assert!(out.skipped, "idle without-ellipsis must skip");
+        if i >= W {
+            idle_without.push(ns);
+        }
+    }
+    print_row("idle frame (without ellipsis)", &mut idle_without);
+
+    // --- Forced dirty paint: cache hit vs no-ellipsis baseline ---
+    let mut dirty_with = Vec::with_capacity(N);
+    for i in 0..(W + N) {
+        with_e.mark_theme_or_stylesheet_changed();
+        let t0 = std::time::Instant::now();
+        let out = with_e.paint(view.clone()).unwrap();
+        let ns = t0.elapsed().as_nanos() as u64;
+        assert!(!out.skipped);
+        if i >= W {
+            dirty_with.push(ns);
+        }
+    }
+    print_row("dirty paint (with ellipsis, cache hit)", &mut dirty_with);
+
+    let mut dirty_without = Vec::with_capacity(N);
+    for i in 0..(W + N) {
+        without.mark_theme_or_stylesheet_changed();
+        let t0 = std::time::Instant::now();
+        let out = without.paint(view.clone()).unwrap();
+        let ns = t0.elapsed().as_nanos() as u64;
+        assert!(!out.skipped);
+        if i >= W {
+            dirty_without.push(ns);
+        }
+    }
+    print_row("dirty paint (without ellipsis)", &mut dirty_without);
+
+    // --- Text-change frame: new string → truncation cache miss + reshape ---
+    struct WhySlices {
+        v: u64,
+    }
+    impl SliceSource for WhySlices {
+        fn version(&self, name: &str) -> Option<u64> {
+            if name == "why" {
+                Some(self.v)
+            } else {
+                None
+            }
+        }
+        fn action_states(&self) -> Vec<(String, ActionState)> {
+            Vec::new()
+        }
+    }
+    struct WhyFrags {
+        body: String,
+    }
+    impl FragmentSource for WhyFrags {
+        fn render(&mut self, section_id: &str, _slices: &[&str]) -> String {
+            if section_id == "sec-why" {
+                self.body.clone()
+            } else {
+                String::new()
+            }
+        }
+    }
+
+    let mut change_samples = Vec::with_capacity(N);
+    for i in 0..(W + N) {
+        let mut eng = Engine::new(ellipsis_cfg());
+        eng.declare_actions(&["act.do"]);
+        eng.load_html(&gmode_why_html(reason, true)).unwrap();
+        let mut slices = WhySlices { v: 1 };
+        let mut frags = WhyFrags {
+            body: reason.to_string(),
+        };
+        let _ = eng.sync(&slices, &mut frags).unwrap();
+        let _ = eng.paint(view.clone()).unwrap(); // warm cache
+
+        let next = if i % 2 == 0 { reason_b } else { reason };
+        slices.v += 1;
+        frags.body = next.to_string();
+        let _ = eng.sync(&slices, &mut frags).unwrap();
+        let t0 = std::time::Instant::now();
+        let out = eng.paint(view.clone()).unwrap();
+        let ns = t0.elapsed().as_nanos() as u64;
+        assert!(!out.skipped);
+        if i >= W {
+            change_samples.push(ns);
+        }
+    }
+    print_row("text-change frame (cache miss)", &mut change_samples);
+
+    // --- 2000-character string on the same 200px box ---
+    let mut long_samples = Vec::with_capacity(N);
+    for i in 0..(W + N) {
+        let mut eng = Engine::new(ellipsis_cfg());
+        eng.declare_actions(&["act.do"]);
+        eng.load_html(&gmode_why_html(&long_2k, true)).unwrap();
+        let t0 = std::time::Instant::now();
+        let out = eng.paint(view.clone()).unwrap();
+        let ns = t0.elapsed().as_nanos() as u64;
+        assert!(!out.skipped);
+        if i >= W {
+            long_samples.push(ns);
+        }
+    }
+    print_row(
+        "2000-char first paint (truncate+reshape)",
+        &mut long_samples,
+    );
+
+    // Steady dirty paints after the 2000-char cache is warm.
+    let mut eng_long = Engine::new(ellipsis_cfg());
+    eng_long.declare_actions(&["act.do"]);
+    eng_long.load_html(&gmode_why_html(&long_2k, true)).unwrap();
+    let _ = eng_long.paint(view.clone()).unwrap();
+    let mut long_idle_dirty = Vec::with_capacity(N);
+    for i in 0..(W + N) {
+        eng_long.mark_theme_or_stylesheet_changed();
+        let t0 = std::time::Instant::now();
+        let _ = eng_long.paint(view.clone()).unwrap();
+        let ns = t0.elapsed().as_nanos() as u64;
+        if i >= W {
+            long_idle_dirty.push(ns);
+        }
+    }
+    print_row("2000-char dirty paint (cache hit)", &mut long_idle_dirty);
+
+    // --- String that changes every frame (always cache miss) ---
+    let mut every_frame = Vec::with_capacity(N);
+    let mut eng_chg = Engine::new(ellipsis_cfg());
+    eng_chg.declare_actions(&["act.do"]);
+    eng_chg.load_html(&gmode_why_html(reason, true)).unwrap();
+    let mut slices = WhySlices { v: 1 };
+    let mut frags = WhyFrags {
+        body: reason.to_string(),
+    };
+    let _ = eng_chg.sync(&slices, &mut frags).unwrap();
+    let _ = eng_chg.paint(view.clone()).unwrap();
+    for i in 0..(W + N) {
+        slices.v += 1;
+        frags.body = format!(
+            "tick {i}: Disabled: not enough credit on the active settlement rail for this order size"
+        );
+        let _ = eng_chg.sync(&slices, &mut frags).unwrap();
+        let t0 = std::time::Instant::now();
+        let out = eng_chg.paint(view.clone()).unwrap();
+        let ns = t0.elapsed().as_nanos() as u64;
+        assert!(!out.skipped);
+        if i >= W {
+            every_frame.push(ns);
+        }
+    }
+    print_row("text changes every frame (always miss)", &mut every_frame);
+}
+
 fn main() {
     let cpu = std::fs::read_to_string("/proc/cpuinfo")
         .ok()
@@ -661,4 +902,5 @@ fn main() {
     bench_resolution("1440p (2560x1440)", 2560, 1440);
     bench_open_paths(1920, 1080);
     bench_eviction_pressure(1920, 1080);
+    bench_text_overflow_ellipsis();
 }

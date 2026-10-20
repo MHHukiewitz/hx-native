@@ -9,6 +9,7 @@
 
 mod damage;
 mod dialect;
+mod ellipsis;
 mod engine;
 mod error;
 mod focus;
@@ -17,6 +18,7 @@ mod form_args;
 mod memory;
 mod paint;
 mod pending;
+mod stylo_text_style;
 mod trigger;
 mod types;
 pub mod worker;
