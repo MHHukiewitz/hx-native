@@ -1201,14 +1201,6 @@ impl Engine {
             .unwrap_or(0)
     }
 
-    /// Test helper: whether element `id` currently carries class `hx-changed`.
-    #[doc(hidden)]
-    pub fn test_has_hx_changed(&self, id: &str) -> bool {
-        self.live(SurfaceId::DEFAULT)
-            .and_then(|l| l.doc.get_element_by_id(id).map(|nid| l.node_has_class(nid, HX_CHANGED_CLASS)))
-            .unwrap_or(false)
-    }
-
     /// Test helper: count of elements that currently carry non-empty Blitz
     /// restyle damage (or a damaged descendant) on the default surface,
     /// read **before** any `resolve`/`paint` clears the flags. Used to prove
@@ -2053,34 +2045,27 @@ impl LiveSurface {
         self.mark_paint_dirty();
     }
 
-    fn node_has_class(&self, nid: NodeId, class: &str) -> bool {
+    fn node_class(&self, nid: NodeId) -> String {
         self.doc
             .get_node(nid)
             .and_then(|n| n.attrs())
             .and_then(|attrs| attrs.iter().find(|a| &*a.name.local == "class"))
             .map(|a| a.value.to_string())
             .unwrap_or_default()
-            .split_ascii_whitespace()
-            .any(|t| t == class)
+    }
+
+    fn node_has_class(&self, nid: NodeId, class: &str) -> bool {
+        class_tokens(&self.node_class(nid)).any(|t| t == class)
     }
 
     /// Preserve any host classes on the element; only add/remove `class`.
     fn toggle_class(&mut self, nid: NodeId, class: &str, on: bool) {
-        let current = self
-            .doc
-            .get_node(nid)
-            .and_then(|n| n.attrs())
-            .and_then(|attrs| attrs.iter().find(|a| &*a.name.local == "class"))
-            .map(|a| a.value.to_string())
-            .unwrap_or_default();
-        let mut tokens: Vec<&str> = current
-            .split_ascii_whitespace()
-            .filter(|t| *t != class)
-            .collect();
-        if on {
-            tokens.push(class);
-        }
-        let new_value = tokens.join(" ");
+        let current = self.node_class(nid);
+        let new_value = if on {
+            add_class_token(&current, class)
+        } else {
+            remove_class_token(&current, class)
+        };
         let mut mutr = self.doc.mutate();
         if new_value.is_empty() {
             mutr.clear_attribute(nid, qual_name!("class"));
