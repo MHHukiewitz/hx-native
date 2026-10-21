@@ -272,8 +272,8 @@ fn mock34_panel_scrolls_with_proportional_win95_bar() {
     );
     assert_eq!(
         px(&img, upr.0 + 15.0, upr.1 + 15.0),
-        [0x0A, 0x0A, 0x0A, 0xFF],
-        "bottom-right = --dk"
+        [0x00, 0x00, 0x00, 0xFF],
+        "bottom-right = --edge-dk (Win95 #000 fallback, issue #35)"
     );
     assert_eq!(
         px(&img, upr.0 + 14.0, upr.1 + 14.0),
@@ -455,8 +455,8 @@ fn arrows_track_and_thumb_drag() {
     let (_, img) = frame(&mut eng, vp34());
     assert_eq!(
         px(&img, dnr.0, dnr.1),
-        [0x0A, 0x0A, 0x0A, 0xFF],
-        "pressed: --press top-left = --dk"
+        [0x00, 0x00, 0x00, 0xFF],
+        "pressed: --press top-left = --edge-dk"
     );
     assert_eq!(eng.input(up(dx, dy)), InputOutcome::None);
     let (_, img) = frame(&mut eng, vp34());

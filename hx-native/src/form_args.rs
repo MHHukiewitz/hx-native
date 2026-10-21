@@ -329,9 +329,12 @@ pub(crate) fn format_numeric_for_step(v: f64, limits: &NumericLimits) -> String 
     s
 }
 
-/// Set a range control's value from pointer `x` (document coordinates).
-/// Returns `true` when the attribute changed.
-pub fn set_range_value_from_x(doc: &mut HtmlDocument, id: &str, x: f32) -> bool {
+/// Set a range control's value from pointer `x` (document coordinates) with
+/// the thumb held `grab` px right of its centre (issue #35: the engine-drawn
+/// thumb's centre follows the pointer; see `slider::ratio_for_x`). The value
+/// snaps to the `step` grid, rounded at the step's decimals (no float
+/// noise), and is written in the same shortest form as before. Returns `true` when the attribute changed.
+pub fn set_range_value_from_x(doc: &mut HtmlDocument, id: &str, x: f32, grab: f32) -> bool {
     let Some(nid) = doc.get_element_by_id(id) else {
         return false;
     };
@@ -344,20 +347,45 @@ pub fn set_range_value_from_x(doc: &mut HtmlDocument, id: &str, x: f32) -> bool 
         }
         numeric_limits(node)
     };
-    let min = limits.min.unwrap_or(0.0);
-    let max = limits.max.unwrap_or(100.0);
-    // Transform-aware box (Pause / centered panels use CSS transform).
-    let Some((box_x, _box_y, width, _h)) = crate::damage::element_border_box_css(doc, nid) else {
+    let Some(geom) = crate::slider::slider_geometry(doc, nid) else {
         return false;
     };
-    let ratio = if width <= 0.0 {
-        0.0
-    } else {
-        ((x - box_x) / width).clamp(0.0, 1.0) as f64
-    };
+    let min = limits.min.unwrap_or(0.0);
+    let max = limits.max.unwrap_or(100.0);
+    let ratio = crate::slider::ratio_for_x(&geom, x, grab);
     let raw = min + ratio * (max - min);
-    let snapped = clamp_snap(raw, &limits);
+    let snapped = range_snap(raw, &limits);
     write_value_attr(doc, nid, &format_numeric(snapped))
+}
+
+/// Issue #35: Home / End on a range — write `min` (or `max` snapped onto
+/// the step grid). Returns `true` when the attribute changed.
+pub(crate) fn range_to_end(doc: &mut HtmlDocument, nid: NodeId, to_max: bool) -> bool {
+    let Some(node) = doc.get_node(nid) else {
+        return false;
+    };
+    if !is_range_input(node) {
+        return false;
+    }
+    let limits = numeric_limits(node);
+    let target = if to_max {
+        limits.max.unwrap_or(100.0)
+    } else {
+        limits.min.unwrap_or(0.0)
+    };
+    write_value_attr(doc, nid, &format_numeric(range_snap(target, &limits)))
+}
+
+/// Clamp + snap a range value to its grid, rounded at the step's decimals so
+/// `0.05 × 23` lands on `1.15`, not `1.1500000000000001`.
+pub(crate) fn range_snap(raw: f64, limits: &NumericLimits) -> f64 {
+    let snapped = clamp_snap(raw, limits);
+    if limits.unconstrained {
+        return snapped;
+    }
+    let min = limits.min.unwrap_or(-MAX_SAFE_NUMBER);
+    let max = limits.max.unwrap_or(MAX_SAFE_NUMBER).max(min);
+    round_decimal(snapped, step_decimal_places(limits.step)).clamp(min, max)
 }
 
 pub(crate) struct NumericLimits {

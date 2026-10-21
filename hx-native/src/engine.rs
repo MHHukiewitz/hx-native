@@ -18,13 +18,14 @@ use crate::damage::{
 use crate::dialect::{validate_loaded_attrs, ElementBinding, SwapMode, SyncMode};
 use crate::ellipsis::{prepare_ellipsis_for_paint, EllipsisCache, EllipsisShaper};
 use crate::error::EngineError;
+use crate::fields::{align_text_inputs, paint_field_bevels};
 use crate::focus::{focusable_ids, ids_in_document_order, step_focus};
 use crate::fonts::{bundled_font_context, HostFonts};
 use crate::form_args::{
     capture_applied_controls, capture_form_controls, clamp_snap_value, closest_form,
     collect_action_args, collect_applied_control_nids, format_numeric, is_number_input,
-    is_numeric_input, parse_f64, set_range_value_from_x, step_numeric_value, write_value_attr,
-    NumericLimits, MAX_SAFE_NUMBER,
+    is_numeric_input, parse_f64, range_to_end, set_range_value_from_x, step_numeric_value,
+    write_value_attr, NumericLimits, MAX_SAFE_NUMBER,
 };
 use crate::form_controls::{
     activate_checkable, checkbox_checked_by_name, control_is_disabled, form_control_at_point,
@@ -44,6 +45,9 @@ use crate::scroll::{
 use crate::select_ui::{
     collect_select_nids, control_rect_of, list_row_at, open_select_state, paint_select_overlays,
     select_damage_rects, select_row_damage_rect, select_ua_stylesheet, OpenSelect, SELECT_MAX_ROWS,
+};
+use crate::slider::{
+    all_sliders, grab_offset, paint_sliders, slider_geometry, slider_ua_stylesheet, SliderGeom,
 };
 use crate::text_edit::{
     apply_unfocused_display, backspace, caret_device_rect, commit_field, delete_forward,
@@ -256,6 +260,15 @@ struct LiveSurface {
     /// Set when a range drag was active on the press that is about to release,
     /// so `PointerUp` can fire `change` once and suppress `click`.
     range_drag_released: Option<String>,
+    /// Issue #35: pointer offset from the thumb centre for the active range
+    /// drag (0 when the press landed on the track and the thumb jumped).
+    range_grab: f32,
+    /// Issue #35: the range's value when the press began; the release fires
+    /// `change` only when the value differs (HTML: no change, no event).
+    range_press_value: Option<String>,
+    /// Issue #35: engine-drawn slider geometry painted last frame; a change
+    /// damages that slider's old and new rects only.
+    last_sliders: Vec<SliderGeom>,
     /// Open Win95 `<select>` drop list (engine-drawn overlay).
     open_select: Option<OpenSelect>,
     /// Hovered row in the open list (document coords from last move).
@@ -1368,6 +1381,26 @@ impl Engine {
         Some((t(g.up), t(g.down), t(g.track), g.thumb.map(t)))
     }
 
+    /// Test helper (issue #35): engine-drawn slider geometry for range input
+    /// `id` (CSS px): `(content, track, thumb, disabled)` as `(x, y, w, h)`.
+    #[doc(hidden)]
+    #[allow(clippy::type_complexity)]
+    pub fn test_slider(
+        &self,
+        id: &str,
+    ) -> Option<(
+        (f32, f32, f32, f32),
+        (f32, f32, f32, f32),
+        (f32, f32, f32, f32),
+        bool,
+    )> {
+        let live = self.live(SurfaceId::DEFAULT)?;
+        let nid = live.doc.get_element_by_id(id)?;
+        let g = crate::slider::slider_geometry(&live.doc, nid)?;
+        let t = |r: crate::select_ui::ControlRect| (r.x, r.y, r.w, r.h);
+        Some((t(g.content), t(g.track), t(g.thumb), g.disabled))
+    }
+
     /// Test helper (issue #15): total `hx-changed` class attribute writes on
     /// the default surface so far. Must not grow on an edit that keeps the
     /// same changed/unchanged state (flip-only mutation).
@@ -1516,7 +1549,9 @@ impl LiveSurface {
         let (bindings, sections) = index_bindings(declared_actions, &doc)?;
 
         doc.add_user_agent_stylesheet(select_ua_stylesheet());
+        doc.add_user_agent_stylesheet(slider_ua_stylesheet());
         doc.resolve(0.0);
+        align_text_inputs(&mut doc);
         let select_nids = collect_select_nids(&doc);
         let applied_control_nids = collect_applied_control_nids(&doc);
         Ok(Self {
@@ -1547,6 +1582,9 @@ impl LiveSurface {
             pending_damage: Vec::new(),
             range_drag_id: None,
             range_drag_released: None,
+            range_grab: 0.0,
+            range_press_value: None,
+            last_sliders: Vec::new(),
             open_select: None,
             select_hover_row: None,
             select_nids,
@@ -1594,6 +1632,8 @@ impl LiveSurface {
             self.paint_dirty = true;
         }
         self.settle_scroll_offsets();
+        // Issue #35: single-line typed fields with text-align right/center.
+        align_text_inputs(&mut self.doc);
         passes
     }
 
@@ -3306,14 +3346,22 @@ impl LiveSurface {
             }
 
             if let Some(nid) = self.doc.get_element_by_id(eid) {
-                self.doc.set_focus_to(nid);
+                if self.doc.set_focus_to(nid) {
+                    // Issue #35: a focus move alone (no value change) still
+                    // repaints (`:focus` styles, the slider focus dots).
+                    self.mark_dom_dirty_raw();
+                    self.mark_paint_dirty();
+                }
                 self.focus.focused_id = Some(eid.clone());
             }
         } else if let Some(ref c) = ctrl {
             if self.text_edit.is_some() {
                 self.blur_text_edit_queued(ctx);
             }
-            self.doc.set_focus_to(c.node_id);
+            if self.doc.set_focus_to(c.node_id) {
+                self.mark_dom_dirty_raw();
+                self.mark_paint_dirty();
+            }
             self.focus.focused_id = c.element_id.clone();
         } else if self.text_edit.is_some() {
             self.blur_text_edit_queued(ctx);
@@ -3325,6 +3373,12 @@ impl LiveSurface {
             if let Some(ref c) = ctrl {
                 if c.kind == FormControlKind::Range && !control_is_disabled(&self.doc, c.node_id) {
                     if let Some(ref eid) = c.element_id {
+                        // Issue #35: a press on the thumb grabs it in place;
+                        // a press on the track jumps the thumb under it.
+                        self.range_grab = slider_geometry(&self.doc, c.node_id)
+                            .map(|g| grab_offset(&g, x, y))
+                            .unwrap_or(0.0);
+                        self.range_press_value = self.attr(eid, "value");
                         self.apply_range_from_x(eid, x);
                         self.range_drag_id = Some(eid.clone());
                     }
@@ -3364,13 +3418,16 @@ impl LiveSurface {
         let mut suppress_click = false;
         if let Some(ref rid) = self.range_drag_id.clone() {
             if button == PointerButton::Primary {
+                // Issue #35: the release only repaints when the value moves
+                // (`apply_range_from_x` marks dirty and syncs outputs then);
+                // an unmoved release costs no frame.
                 if !self.element_is_disabled_id(rid) {
                     self.apply_range_from_x(rid, x);
-                    let _ = sync_outputs_for(&mut self.doc, rid);
-                    self.mark_dom_dirty();
-                    self.mark_paint_dirty();
                 }
-                self.range_drag_released = Some(rid.clone());
+                let now = self.attr(rid, "value");
+                if now != self.range_press_value.take() {
+                    self.range_drag_released = Some(rid.clone());
+                }
                 suppress_click = true;
             }
         }
@@ -3646,7 +3703,13 @@ impl LiveSurface {
             return;
         }
         prepare_focus_display(&mut self.doc, nid);
-        self.doc.set_focus_to(nid);
+        // Issue #35: the rebound node gains FOCUS here, after this frame's
+        // resolve; restyle now so its `:focus` look (outline) is in this
+        // frame instead of one frame late (partial == full on the swap frame).
+        if self.doc.set_focus_to(nid) {
+            self.needs_resolve = true;
+            self.ensure_resolved();
+        }
         if let Some(s) = self.text_edit.as_mut() {
             s.needs_prepare = false;
             s.caret_visible = true;
@@ -4194,7 +4257,7 @@ impl LiveSurface {
 
     fn apply_range_from_x(&mut self, id: &str, x: f32) -> bool {
         self.ensure_resolved();
-        let changed = set_range_value_from_x(&mut self.doc, id, x);
+        let changed = set_range_value_from_x(&mut self.doc, id, x, self.range_grab);
         if changed {
             let _ = sync_outputs_for(&mut self.doc, id);
             self.mark_dom_dirty();
@@ -4222,6 +4285,18 @@ impl LiveSurface {
             return None;
         }
         let is_number = is_number_input(node);
+        // Issue #35: Home / End on a focused range jump to min / max (the
+        // max snapped onto the step grid), committing like an arrow step.
+        if !is_number && matches!(key, "Home" | "End") {
+            let changed = range_to_end(&mut self.doc, nid, key == "End");
+            if changed {
+                let _ = sync_outputs_for(&mut self.doc, &fid);
+                self.mark_dom_dirty();
+                self.mark_paint_dirty();
+                return Some(self.fire_change(ctx, &fid));
+            }
+            return Some(InputOutcome::None);
+        }
         let dir = if is_number {
             match key {
                 "ArrowUp" => 1,
@@ -4507,7 +4582,7 @@ impl LiveSurface {
         if key.pressed
             && matches!(
                 key.key.as_str(),
-                "ArrowUp" | "ArrowRight" | "ArrowDown" | "ArrowLeft"
+                "ArrowUp" | "ArrowRight" | "ArrowDown" | "ArrowLeft" | "Home" | "End"
             )
         {
             if let Some(out) = self.try_step_focused_numeric(ctx, &key.key) {
@@ -4948,7 +5023,7 @@ impl LiveSurface {
 
         // Probe: public resolve_stylist first so Node::damage() is readable,
         // then full resolve (stylist is a no-op; layout + paint-tree run).
-        let style_damaged = if force_full || !had_previous {
+        let mut style_damaged = if force_full || !had_previous {
             Vec::new()
         } else {
             self.doc.resolve_stylist(0.0);
@@ -4997,13 +5072,33 @@ impl LiveSurface {
             }
             self.last_bars = bars;
         }
-        pending.append(&mut self.pending_damage);
-
+        // Issue #35: an engine-drawn slider whose thumb / box / greying /
+        // clip changed damages its old and new rects (nothing else).
+        let sliders = all_sliders(&self.doc);
+        if sliders != self.last_sliders {
+            let changed = self
+                .last_sliders
+                .iter()
+                .filter(|g| !sliders.contains(g))
+                .chain(sliders.iter().filter(|g| !self.last_sliders.contains(g)));
+            for g in changed {
+                let r = g.damage_rect(scale).clamp_to_surface(width, height);
+                if !r.is_empty() {
+                    pending.push(r);
+                }
+            }
+            self.last_sliders = sliders;
+        }
         // Same-id swap: PlainEditor now exists — seed from value + caret at end
-        // before damage planning so partial frames match a full repaint.
+        // before damage planning so partial frames match a full repaint. Its
+        // refocus restyle and field damage join this frame's plan.
         if self.text_edit.as_ref().is_some_and(|s| s.needs_prepare) {
             self.ensure_text_edit_prepared();
+            if !force_full && had_previous {
+                style_damaged.extend(self.carried_style_damage.drain());
+            }
         }
+        pending.append(&mut self.pending_damage);
 
         let plan = self.compute_plan(
             width,
@@ -5147,6 +5242,11 @@ impl LiveSurface {
         // on `?` / panic via Drop.
         drop(session);
         let mut frame = rgba?;
+
+        // Issue #35: engine-drawn typed-field bevels and range sliders (under
+        // the scrollbars, which own the reserved gutter strip).
+        paint_field_bevels(&self.doc, &mut frame, scale);
+        paint_sliders(&self.doc, &mut frame, scale);
 
         // Issue #26: engine-drawn Win95 scrollbars (under select overlays).
         paint_scrollbars(&self.doc, &mut frame, scale, self.scroll_pressed);
