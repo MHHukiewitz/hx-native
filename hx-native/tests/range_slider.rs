@@ -1193,6 +1193,17 @@ fn drag_and_end_stop_on_the_grid_below_an_off_grid_max() {
         x += 1.0;
     }
     let _ = eng.input(up(x, cy));
+    // 0..10 step 4: the top grid value is 8; rounding 10 / 4 = 2.5 up would
+    // give 12, clamped to the off-grid 10 without the grid-top rule.
+    let mut eng = boot(&graph_range(r#"min="0" max="10" step="4" value="0""#));
+    let (cx, cy) = thumb_centre(&eng, "d");
+    let _ = eng.input(down(cx, cy));
+    let _ = eng.input(mv(cx + 1000.0, cy));
+    assert_eq!(value(&eng, "d"), "8", "drag past the end, step 4");
+    let _ = eng.input(up(cx + 1000.0, cy));
+    let _ = eng.input(key("Home"));
+    let _ = eng.input(key("End"));
+    assert_eq!(value(&eng, "d"), "8", "End, step 4");
 }
 
 /// PageUp / PageDown on a focused slider page one block (max(step,
