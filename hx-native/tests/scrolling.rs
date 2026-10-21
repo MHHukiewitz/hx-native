@@ -858,3 +858,208 @@ body {{ width:400px; height:300px; overflow:hidden; background:#fff; font-family
     let full = full_frame(&mut eng, small_vp());
     assert!(img.pixels == full.pixels);
 }
+
+// ---------------------------------------------------------------------------
+// Round 3: engine-reserved 16 px gutter (open decision 12b).
+
+fn right(b: (f32, f32, f32, f32)) -> f32 {
+    b.0 + b.2
+}
+
+#[test]
+fn mock34_reserves_gutter_so_bar_never_covers_content() {
+    let mut eng = boot34();
+    let pb = bx(&eng, PANEL);
+    let cb = eng.test_content_box(PANEL).unwrap();
+    assert_eq!(
+        right(cb),
+        right(pb) - 16.0,
+        "content ends 16 px before the panel edge"
+    );
+    let (upr, _, _, _) = eng.test_scrollbar(PANEL).unwrap();
+    assert_eq!(upr.0, right(cb), "bar sits exactly in the reserved strip");
+    // No row content reaches into the strip.
+    for id in [
+        "set-engine-sim-tick-wall-ms-val",
+        "set-engine-access-capex-scale-val",
+    ] {
+        assert!(
+            right(bx(&eng, id)) <= right(cb),
+            "{id} inside the content box"
+        );
+    }
+    let (_, img) = frame(&mut eng, vp34());
+    let full = full_frame(&mut eng, vp34());
+    assert!(img.pixels == full.pixels);
+}
+
+fn gutter_page(g1_rows: usize) -> String {
+    format!(
+        r##"<!DOCTYPE html><html><head><style>
+* {{ margin:0; padding:0; box-sizing:border-box; }}
+body {{ width:400px; height:300px; overflow:hidden; background:#fff; font-family:"DejaVu Sans",sans-serif; font-size:12px; }}
+.sc {{ position:absolute; overflow-y:auto; background:#e8e8e8; width:150px; height:100px; }}
+#g1 {{ left:10px; top:10px; padding-right:8px; }}
+#g2 {{ left:200px; top:10px; padding-right:8px; }}
+#g3 {{ left:10px; top:150px; overflow-y:scroll; }}
+#g4 {{ left:200px; top:150px; padding-right:5%; }}
+.r {{ height:20px; background:#99a; }}
+</style></head><body>
+<section id="sec-g1" hx-trigger="slice:g1" hx-target="#g1wrap" hx-swap="innerHTML"><div id="g1wrap"><div id="g1" class="sc">{g1}</div></div></section>
+<div id="g2" class="sc"><div id="g2c" class="r">fits</div></div>
+<div id="g3" class="sc"><div id="g3c" class="r">fits, scroll</div></div>
+<div id="g4" class="sc"><div id="g4c" class="r">x</div>{g4}</div>
+</body></html>"##,
+        g1 = g1_body(g1_rows, "g1c"),
+        g4 = "<div class=\"r\">y</div>".repeat(10),
+    )
+}
+
+fn g1_body(rows: usize, first_id: &str) -> String {
+    let mut s = format!(r#"<div id="{first_id}" class="r">row 0</div>"#);
+    for i in 1..rows {
+        s.push_str(&format!(r#"<div class="r">row {i}</div>"#));
+    }
+    s
+}
+
+#[test]
+fn gutter_only_on_overflow_and_adds_to_author_padding() {
+    let eng = boot_with(&gutter_page(20), small_vp());
+    // Overflowing auto with author padding-right 8px: 8 + 16.
+    assert_eq!(right(bx(&eng, "g1c")), right(bx(&eng, "g1")) - 24.0);
+    // Fitting auto: author padding only, no gutter.
+    assert_eq!(right(bx(&eng, "g2c")), right(bx(&eng, "g2")) - 8.0);
+    assert!(eng.test_scrollbar("g2").is_none());
+    // overflow-y: scroll always reserves, even when it fits.
+    assert_eq!(right(bx(&eng, "g3c")), right(bx(&eng, "g3")) - 16.0);
+    // Percentage author padding (5% of the 400 px containing block = 20 px).
+    assert_eq!(right(bx(&eng, "g4c")), right(bx(&eng, "g4")) - 36.0);
+    // Nothing engine-owned leaks into the serialized document.
+    let html = eng.serialize_html().unwrap();
+    assert!(
+        !html.contains("calc(") && !html.contains("!important"),
+        "{html}"
+    );
+}
+
+#[test]
+fn gutter_sticks_per_id_across_swaps_and_drops_on_new_id() {
+    let mut eng = boot_with(&gutter_page(20), small_vp());
+    let mut src = Src::new(&["g1"]);
+    src.bodies.insert(
+        "sec-g1".into(),
+        format!(r#"<div id="g1" class="sc">{}</div>"#, g1_body(20, "g1c")),
+    );
+    sync(&mut eng, &mut src);
+    let _ = frame(&mut eng, small_vp());
+    assert_eq!(right(bx(&eng, "g1c")), right(bx(&eng, "g1")) - 24.0);
+
+    // Same id, now short content: the gutter sticks (no oscillation).
+    src.set(
+        "g1",
+        "sec-g1",
+        &format!(r#"<div id="g1" class="sc">{}</div>"#, g1_body(2, "g1c")),
+    );
+    sync(&mut eng, &mut src);
+    let (_, img) = frame(&mut eng, small_vp());
+    assert_eq!(max(&eng, "g1"), 0.0, "fits now");
+    assert_eq!(
+        right(bx(&eng, "g1c")),
+        right(bx(&eng, "g1")) - 24.0,
+        "gutter kept for the same id"
+    );
+    let full = full_frame(&mut eng, small_vp());
+    assert!(img.pixels == full.pixels);
+
+    // New id with short content: no gutter.
+    src.set(
+        "g1",
+        "sec-g1",
+        &format!(
+            r#"<div id="g1b" class="sc" style="left:10px;top:10px;padding-right:8px">{}</div>"#,
+            g1_body(2, "g1bc")
+        ),
+    );
+    sync(&mut eng, &mut src);
+    let (_, img) = frame(&mut eng, small_vp());
+    assert_eq!(
+        right(bx(&eng, "g1bc")),
+        right(bx(&eng, "g1b")) - 8.0,
+        "new id: no gutter"
+    );
+    let full = full_frame(&mut eng, small_vp());
+    assert!(img.pixels == full.pixels);
+
+    // The old id was dropped with its element: bringing `g1` back with
+    // short content gets no gutter.
+    src.set(
+        "g1",
+        "sec-g1",
+        &format!(r#"<div id="g1" class="sc">{}</div>"#, g1_body(2, "g1c")),
+    );
+    sync(&mut eng, &mut src);
+    let (_, img) = frame(&mut eng, small_vp());
+    assert_eq!(
+        right(bx(&eng, "g1c")),
+        right(bx(&eng, "g1")) - 8.0,
+        "dropped id: no gutter"
+    );
+    let full = full_frame(&mut eng, small_vp());
+    assert!(img.pixels == full.pixels);
+
+    // load_html starts with no gutters (fits: none).
+    let eng2 = boot_with(&gutter_page(2), small_vp());
+    assert_eq!(right(bx(&eng2, "g1c")), right(bx(&eng2, "g1")) - 8.0);
+}
+
+#[test]
+fn first_overflow_costs_at_most_one_extra_layout_pass() {
+    let mut eng = boot_with(&gutter_page(2), small_vp());
+    let mut src = Src::new(&["g1"]);
+    src.bodies.insert(
+        "sec-g1".into(),
+        format!(r#"<div id="g1" class="sc">{}</div>"#, g1_body(2, "g1c")),
+    );
+    sync(&mut eng, &mut src);
+    let _ = frame(&mut eng, small_vp());
+    assert_eq!(right(bx(&eng, "g1c")), right(bx(&eng, "g1")) - 8.0);
+
+    // Swap that makes #g1 overflow: exactly one extra pass on that frame.
+    src.set(
+        "g1",
+        "sec-g1",
+        &format!(r#"<div id="g1" class="sc">{}</div>"#, g1_body(20, "g1c")),
+    );
+    sync(&mut eng, &mut src);
+    let p0 = eng.style_layout_pass_count();
+    let (_, img) = frame(&mut eng, small_vp());
+    assert_eq!(
+        eng.style_layout_pass_count() - p0,
+        2,
+        "first overflow: one extra pass"
+    );
+    assert_eq!(right(bx(&eng, "g1c")), right(bx(&eng, "g1")) - 24.0);
+    let full = full_frame(&mut eng, small_vp());
+    assert!(img.pixels == full.pixels);
+
+    // Next change on the same (gutter-holding) id: back to one pass.
+    src.set(
+        "g1",
+        "sec-g1",
+        &format!(r#"<div id="g1" class="sc">{}</div>"#, g1_body(21, "g1c")),
+    );
+    sync(&mut eng, &mut src);
+    let p1 = eng.style_layout_pass_count();
+    let _ = frame(&mut eng, small_vp());
+    assert_eq!(
+        eng.style_layout_pass_count() - p1,
+        1,
+        "no repeated extra pass"
+    );
+    // Idle frame: no pass at all.
+    let p2 = eng.style_layout_pass_count();
+    let out = eng.paint(small_vp()).unwrap();
+    assert!(out.skipped);
+    assert_eq!(eng.style_layout_pass_count(), p2);
+}

@@ -8,6 +8,10 @@
 //! own overlay thumb is behind the `scrollbars` feature, which stays off: it
 //! fades on a wall-clock timer and is not the Win95 look).
 //!
+//! The engine also reserves the 16 px scrollbar gutter (Blitz beta.4 layout
+//! hard-codes Taffy's `scrollbar_width` to 0): see [`gutter_css`] and
+//! `LiveSurface::reserve_new_gutters`.
+//!
 //! Vertical only: `overflow-x` offsets are never written.
 
 use blitz_dom::{NodeId, ScrollBehavior};
@@ -49,6 +53,55 @@ fn overflow_y_is_scroll(doc: &HtmlDocument, nid: NodeId) -> bool {
     doc.get_node(nid)
         .and_then(|n| n.primary_styles())
         .is_some_and(|s| matches!(s.clone_overflow_y(), Overflow::Scroll))
+}
+
+/// Whether a container needs the engine-reserved 16 px gutter (issue #26
+/// round 3): `overflow-y: scroll` always, `auto` once its content overflows.
+pub(crate) fn wants_gutter(doc: &HtmlDocument, nid: NodeId) -> bool {
+    is_scroll_container(doc, nid)
+        && (overflow_y_is_scroll(doc, nid) || max_offset_y(doc, nid) > 0.5)
+}
+
+/// The author's computed `padding-right` of `nid` as CSS text, read before
+/// the engine's gutter rule applies to it: a length (`8px`), a percentage
+/// (`5%`, still relative to the containing block), or for a mixed `calc()`
+/// the used value in px from the last layout.
+pub(crate) fn author_padding_right_css(doc: &HtmlDocument, nid: NodeId) -> String {
+    let Some(node) = doc.get_node(nid) else {
+        return "0px".into();
+    };
+    let used = node.final_layout().padding.right;
+    let Some(styles) = node.primary_styles() else {
+        return format!("{used}px");
+    };
+    let lp = &styles.get_padding().padding_right.0;
+    if let Some(l) = lp.to_length() {
+        format!("{}px", l.px())
+    } else if let Some(p) = lp.to_percentage() {
+        format!("{}%", p.0 * 100.0)
+    } else {
+        format!("{used}px")
+    }
+}
+
+/// CSS for the engine-owned gutter sheet: one `!important` rule per
+/// reserved id, author padding + [`SCROLLBAR_WIDTH_PX`].
+pub(crate) fn gutter_css<'a>(gutters: impl Iterator<Item = (&'a String, &'a String)>) -> String {
+    let mut css = String::new();
+    for (id, base) in gutters {
+        let esc: String = id
+            .chars()
+            .flat_map(|c| match c {
+                '"' | '\\' => vec!['\\', c],
+                '\n' | '\r' | '\x0c' => vec![' '],
+                c => vec![c],
+            })
+            .collect();
+        css.push_str(&format!(
+            "[id=\"{esc}\"]{{padding-right:calc({base} + {SCROLLBAR_WIDTH_PX}px) !important}}\n"
+        ));
+    }
+    css
 }
 
 /// Every scroll container, in document order (ancestors before descendants).

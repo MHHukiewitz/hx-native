@@ -35,10 +35,11 @@ use crate::memory::estimate_surface_engine_bytes;
 use crate::paint::{paint_damage_into, paint_rgba};
 use crate::pending::{PendingEntry, PendingState, PendingTimeout, QueuedRelease};
 use crate::scroll::{
-    all_bars, bar_geometry, bar_hit, can_scroll, container_damage_rect, containers_at,
-    is_scroll_container, max_offset_y, offset_y as scroll_offset_y,
+    all_bars, author_padding_right_css, bar_geometry, bar_hit, can_scroll, container_damage_rect,
+    containers_at, gutter_css, is_scroll_container, max_offset_y, offset_y as scroll_offset_y,
     padding_box_css as scroll_padding_box, page_px, paint_scrollbars, scroll_ancestors,
-    scroll_containers, set_offset_y, visible_element_from_point, BarGeom, BarPart, PressedArrow,
+    scroll_containers, set_offset_y, visible_element_from_point, wants_gutter, BarGeom, BarPart,
+    PressedArrow,
 };
 use crate::select_ui::{
     collect_select_nids, control_rect_of, list_row_at, open_select_state, paint_select_overlays,
@@ -298,6 +299,15 @@ struct LiveSurface {
     /// Issue #26: scrollbar geometry + pressed state painted last frame; a
     /// change damages the old and new bar rects.
     last_bars: Vec<(BarGeom, Option<BarPart>)>,
+    /// Issue #26 round 3: element id -> author `padding-right` (CSS text)
+    /// for every container with an engine-reserved 16 px gutter. Sticky per
+    /// id: kept across same-id swaps, dropped once no element has the id.
+    gutters: BTreeMap<String, String>,
+    /// Detached engine-owned element carrying the gutter stylesheet (never
+    /// in the tree, so never serialized and never hit-tested).
+    gutter_sheet_node: Option<NodeId>,
+    /// A gutter made another container overflow: resolve again next time.
+    gutter_followup: bool,
 }
 
 /// Thumb drag state (issue #26).
@@ -1319,6 +1329,24 @@ impl Engine {
         ))
     }
 
+    /// Test helper (issue #26 round 3): content box of `id` in CSS px
+    /// `(x, y, w, h)` — border box minus border and padding (the reserved
+    /// gutter is part of the padding).
+    #[doc(hidden)]
+    pub fn test_content_box(&self, id: &str) -> Option<(f32, f32, f32, f32)> {
+        let live = self.live(SurfaceId::DEFAULT)?;
+        let nid = live.doc.get_element_by_id(id)?;
+        let (x, y, w, h) = crate::damage::element_border_box_css(&live.doc, nid)?;
+        let l = live.doc.get_node(nid)?.final_layout();
+        let (b, p) = (l.border, l.padding);
+        Some((
+            x + b.left + p.left,
+            y + b.top + p.top,
+            w - b.left - b.right - p.left - p.right,
+            h - b.top - b.bottom - p.top - p.bottom,
+        ))
+    }
+
     /// Test helper (issue #26): engine-drawn scrollbar geometry for `id`
     /// (CSS px): `(up, down, track, thumb)` as `(x, y, w, h)`; `None` when no
     /// bar is shown.
@@ -1537,13 +1565,97 @@ impl LiveSurface {
             scroll_pressed: None,
             scroll_press_active: false,
             last_bars: Vec::new(),
+            gutters: BTreeMap::new(),
+            gutter_sheet_node: None,
+            gutter_followup: false,
         })
     }
 
-    fn resolve_doc(&mut self) {
+    /// Blitz resolve plus scroll bookkeeping. Returns the number of
+    /// style+layout passes run: 1, or 2 on the frame where a scroll
+    /// container first needs its gutter (issue #26 round 3).
+    fn resolve_doc(&mut self) -> u64 {
+        self.prune_gutters();
         self.doc.resolve(0.0);
         self.resolve_count = self.resolve_count.saturating_add(1);
+        let mut passes = 1;
+        if self.reserve_new_gutters() {
+            self.doc.resolve(0.0);
+            self.resolve_count = self.resolve_count.saturating_add(1);
+            passes += 1;
+            // A gutter can make another container overflow (narrower
+            // content): never loop here; the next resolve picks it up.
+            if self.containers_needing_gutter().next().is_some() {
+                self.gutter_followup = true;
+                self.paint_dirty = true;
+            }
+        }
         self.settle_scroll_offsets();
+        passes
+    }
+
+    /// Scroll containers with an id that need a gutter but have none yet.
+    fn containers_needing_gutter(&self) -> impl Iterator<Item = (NodeId, String)> + '_ {
+        scroll_containers(&self.doc).into_iter().filter_map(|nid| {
+            let id = node_id_attr(&self.doc, nid)?;
+            (!self.gutters.contains_key(&id) && wants_gutter(&self.doc, nid)).then_some((nid, id))
+        })
+    }
+
+    /// Issue #26 round 3: reserve the 16 px gutter on containers that first
+    /// overflow (or are `overflow-y: scroll`) after a layout. Returns whether
+    /// the gutter sheet changed (caller lays out once more).
+    fn reserve_new_gutters(&mut self) -> bool {
+        let new: Vec<(NodeId, String)> = self.containers_needing_gutter().collect();
+        if new.is_empty() {
+            return false;
+        }
+        for (nid, id) in &new {
+            let base = author_padding_right_css(&self.doc, *nid);
+            self.gutters.insert(id.clone(), base);
+        }
+        self.install_gutter_sheet();
+        for (nid, _) in new {
+            let r = container_damage_rect(&self.doc, nid, self.layout_scale);
+            self.push_pending_damage(r);
+        }
+        self.mark_paint_dirty();
+        true
+    }
+
+    /// Drop gutters whose id is gone from the document (element replaced by
+    /// a new id). Runs before layout; no extra pass.
+    fn prune_gutters(&mut self) {
+        if self.gutters.is_empty() {
+            return;
+        }
+        let before = self.gutters.len();
+        let doc = &self.doc;
+        self.gutters
+            .retain(|id, _| doc.get_element_by_id(id).is_some());
+        if self.gutters.len() != before {
+            self.install_gutter_sheet();
+        }
+    }
+
+    /// (Re)install the engine-owned gutter stylesheet on a detached element.
+    fn install_gutter_sheet(&mut self) {
+        let node = match self.gutter_sheet_node {
+            Some(n) => n,
+            None => {
+                let n = self
+                    .doc
+                    .mutate()
+                    .create_element(qual_name!("style"), vec![]);
+                self.gutter_sheet_node = Some(n);
+                n
+            }
+        };
+        let css = gutter_css(self.gutters.iter());
+        let sheet = self
+            .doc
+            .make_stylesheet(css, style::stylesheets::Origin::Author);
+        self.doc.add_stylesheet_for_node(sheet, node);
     }
 
     /// Issue #26, after every layout: restore offsets recorded across a swap
@@ -2823,8 +2935,8 @@ impl LiveSurface {
             self.doc.resolve_stylist(0.0);
             let carried = collect_style_damaged(&self.doc);
             self.carried_style_damage.extend(carried);
-            self.resolve_doc();
-            self.needs_resolve = false;
+            let _ = self.resolve_doc();
+            self.needs_resolve = std::mem::take(&mut self.gutter_followup);
         }
     }
 
@@ -4839,15 +4951,13 @@ impl LiveSurface {
         // node changes (Graph: at most 2 passes total per paint).
         let hover_before = self.doc.get_hover_node_id();
         // #13: resolve_doc runs Blitz resolve + ellipsis cache bookkeeping.
-        self.resolve_doc();
-        let mut passes = 1;
+        let mut passes = self.resolve_doc();
         // resolve() ends with refresh_hover(); compare hover node to decide follow-up.
         let hover_changed = self.doc.get_hover_node_id() != hover_before;
         if hover_changed {
-            self.resolve_doc();
-            passes += 1;
+            passes += self.resolve_doc();
         }
-        self.needs_resolve = false;
+        self.needs_resolve = std::mem::take(&mut self.gutter_followup);
 
         // Issue #26: offsets restored / clamped by this resolve pushed their
         // container damage after `pending` was taken; a scrollbar whose
