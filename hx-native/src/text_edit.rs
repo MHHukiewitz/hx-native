@@ -561,15 +561,16 @@ pub fn sync_value_from_editor(
     changed
 }
 
-/// Commit a number/text field: clamp number, write canonical value, set unfocused display.
+/// Commit a number/text field: clamp number, write canonical value. The
+/// caller (`commit_text_edit`) then shows a number box's display text
+/// (`prepare_focus_display` on Enter, `apply_unfocused_display` on blur).
 pub fn commit_field(doc: &mut HtmlDocument, nid: NodeId) -> bool {
-    let (group, prev_value, limits) = {
+    let (prev_value, limits) = {
         let Some(node) = doc.get_node(nid) else {
             return false;
         };
         let is_number = is_number_input(node);
         (
-            grouping_enabled(node),
             attr(node, "value").unwrap_or_else(|| "0".into()),
             if is_number {
                 Some(numeric_limits(node))
@@ -590,11 +591,7 @@ pub fn commit_field(doc: &mut HtmlDocument, nid: NodeId) -> bool {
         display
     };
     let changed = write_value_attr(doc, nid, &canonical);
-    let shown = match limits {
-        Some(ref limits) => number_display(&canonical, limits, group),
-        None => canonical.clone(),
-    };
-    set_editor_text(doc, nid, &shown);
+    set_editor_text(doc, nid, &canonical);
     changed
 }
 
