@@ -252,3 +252,66 @@ fn swap_with_grouped_box_leaves_the_next_paint_idle() {
         "group damage must be painted in the swap frame, not the next one"
     );
 }
+
+#[test]
+fn grouped_box_and_comma_paste_rule_agree() {
+    // #41 round 3 merged into #42: the grouped display "73,480" pastes and
+    // retypes back to 73480, and a comma off the thousands grid is refused.
+    let html = wrap(
+        r#"<input id="fee" type="number" name="fee" value="73480" min="0" max="1000000" step="1" data-hx-group="on" /><input id="other" type="text" value="x" />"#,
+    );
+    let run = |edit: &dyn Fn(&mut Engine)| {
+        let mut eng = engine();
+        eng.declare_actions(&[]);
+        eng.load_html(&html).unwrap();
+        let _ = eng.paint(vp(1.0)).unwrap();
+        assert_eq!(eng.test_editor_display("fee").as_deref(), Some("73,480"));
+        eng.test_set_focus("fee");
+        key(&mut eng, "a", true);
+        edit(&mut eng);
+        let focused = eng.test_editor_display("fee").unwrap_or_default();
+        let _ = key(&mut eng, "Tab", false);
+        (
+            focused,
+            eng.attr("fee", "value").unwrap_or_default(),
+            eng.test_editor_display("fee").unwrap_or_default(),
+        )
+    };
+    let paste = |t: &'static str| {
+        run(&move |e: &mut Engine| {
+            let _ = e.input(InputEvent::Paste(t.into()));
+        })
+    };
+    let s = |a: &str, b: &str, c: &str| (a.to_string(), b.to_string(), c.to_string());
+    // (focused text after the edit, committed value, display after blur)
+    assert_eq!(
+        paste("73,480"),
+        s("73480", "73480", "73,480"),
+        "grouped paste"
+    );
+    let retyped = run(&|e| {
+        let _ = e.input(InputEvent::Text("73,480".into()));
+    });
+    assert_eq!(
+        retyped,
+        s("73480", "73480", "73,480"),
+        "retyped grouped text"
+    );
+    // A refused paste leaves the selection in place, so a following "1"
+    // replaces it; had "7,3480" landed as 73480, the "1" would append.
+    let bad = run(&|e| {
+        let _ = e.input(InputEvent::Paste("7,3480".into()));
+        let _ = e.input(InputEvent::Text("1".into()));
+    });
+    assert_eq!(bad, s("1", "1", "1"), "'7,3480' paste refused");
+    assert_eq!(
+        paste("73,48"),
+        s("73480", "73480", "73,480"),
+        "'73,48' refused"
+    );
+    assert_eq!(
+        paste("173,480"),
+        s("173480", "173480", "173,480"),
+        "valid grouped paste"
+    );
+}
