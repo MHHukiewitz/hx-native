@@ -3428,15 +3428,32 @@ impl LiveSurface {
         Some(change)
     }
 
+    fn hold_focused_number_to_commit(&mut self) {
+        let Some(nid) = self.text_edit.as_ref().map(|s| s.node_id) else {
+            return;
+        };
+        if self.doc.get_node(nid).is_some_and(is_number_input)
+            && editor_text(&mut self.doc, nid).is_some()
+        {
+            let _ = crate::text_edit::sync_value_from_editor(&mut self.doc, nid, true, true);
+        }
+    }
+
     fn revert_text_edit(&mut self) {
         let Some(session) = self.text_edit.take() else {
             return;
         };
-        let _ = crate::form_args::write_value_attr(
-            &mut self.doc,
-            session.node_id,
-            &session.value_at_focus,
-        );
+        // Esc restores the value at focus, held inside the limits as they are
+        // now: a limits refresh while focused skipped this box, and Esc also
+        // blurs, so it is the commit that applies them (Graph review of #41 r2).
+        let restored = match self.doc.get_node(session.node_id) {
+            Some(n) if is_number_input(n) && !session.value_at_focus.trim().is_empty() => {
+                let limits = crate::form_args::numeric_limits(n);
+                crate::text_edit::canonical_from_display(&session.value_at_focus, &limits, true)
+            }
+            _ => session.value_at_focus.clone(),
+        };
+        let _ = crate::form_args::write_value_attr(&mut self.doc, session.node_id, &restored);
         apply_unfocused_display(&mut self.doc, session.node_id);
         self.doc.clear_focus();
         self.focus.focused_id = None;
@@ -3490,7 +3507,9 @@ impl LiveSurface {
                     .get_node(nid)
                     .map(crate::text_edit::paste_ignore_chars)
                     .unwrap_or_default();
-                let cleaned = crate::text_edit::clean_number_paste(&filtered, &ignore);
+                let Some(cleaned) = crate::text_edit::clean_number_paste(&filtered, &ignore) else {
+                    return InputOutcome::None;
+                };
                 let (head, tail) =
                     crate::text_edit::selection_split(&mut self.doc, nid).unwrap_or_default();
                 if !crate::text_edit::number_text_valid(&format!("{head}{cleaned}{tail}"), &limits)
@@ -4378,6 +4397,11 @@ impl LiveSurface {
                     }
                     continue;
                 }
+                // A body shortcut does not blur the focused box (a click
+                // does), so hold its posted value to what Enter would commit:
+                // rounded and inside the current limits, never the raw text
+                // (Graph review of #41 round 2). Change still fires on commit.
+                self.hold_focused_number_to_commit();
                 return self.fire_on(ctx, &id, event, filter_ctx, trigger_info, None, true);
             }
             if let Some((source_id, name, reason)) = first_greyed {
