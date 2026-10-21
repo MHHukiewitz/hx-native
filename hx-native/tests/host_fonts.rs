@@ -344,20 +344,27 @@ fn host_face_tying_with_bundled_dejavu_is_rejected() {
 /// one copy of `ttf`'s table directory (table offsets shifted past the
 /// collection header).
 fn two_face_ttc(ttf: &[u8]) -> Vec<u8> {
-    const HEADER: u32 = 4 + 4 + 4 + 2 * 4;
+    ttc(ttf, 2)
+}
+
+/// A TrueType collection (`ttcf`) of `n` faces, all pointing at one copy of
+/// `ttf`'s table directory.
+fn ttc(ttf: &[u8], n: u32) -> Vec<u8> {
+    let header: u32 = 4 + 4 + 4 + 4 * n;
     let mut body = ttf.to_vec();
     let num_tables = u16::from_be_bytes([body[4], body[5]]) as usize;
     for i in 0..num_tables {
         let at = 12 + 16 * i + 8;
         let off = u32::from_be_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]);
-        body[at..at + 4].copy_from_slice(&(off + HEADER).to_be_bytes());
+        body[at..at + 4].copy_from_slice(&(off + header).to_be_bytes());
     }
     let mut out = Vec::new();
     out.extend_from_slice(b"ttcf");
     out.extend_from_slice(&0x0001_0000u32.to_be_bytes());
-    out.extend_from_slice(&2u32.to_be_bytes());
-    out.extend_from_slice(&HEADER.to_be_bytes());
-    out.extend_from_slice(&HEADER.to_be_bytes());
+    out.extend_from_slice(&n.to_be_bytes());
+    for _ in 0..n {
+        out.extend_from_slice(&header.to_be_bytes());
+    }
     out.extend_from_slice(&body);
     out
 }
@@ -369,6 +376,31 @@ fn font_collections_are_rejected() {
     match invalid(vec![FontFace::new("Host", 400, FontStyle::Normal, ttc)]) {
         EngineError::InvalidFont { reason, .. } => {
             assert!(reason.contains("collection"), "{reason}")
+        }
+        other => panic!("expected InvalidFont, got {other:?}"),
+    }
+}
+
+/// A collection is refused by its `ttcf` tag even when it holds one face.
+#[test]
+fn one_face_collection_is_rejected() {
+    let ttc: Arc<[u8]> = Arc::from(ttc(REGULAR, 1));
+    match invalid(vec![FontFace::new("Host", 400, FontStyle::Normal, ttc)]) {
+        EngineError::InvalidFont { reason, .. } => {
+            assert!(reason.contains("collection"), "{reason}")
+        }
+        other => panic!("expected InvalidFont, got {other:?}"),
+    }
+}
+
+/// The duplicate check lowercases per character like fontique, so a
+/// word-final capital sigma (`Σ` -> `σ`, not `ς`) still matches.
+#[test]
+fn duplicate_check_lowercases_like_fontique() {
+    match invalid(vec![face("ΟΔΟΣ", 400, REGULAR), face("οδοσ", 400, BOLD)]) {
+        EngineError::InvalidFont { index, reason, .. } => {
+            assert_eq!(index, 1);
+            assert!(reason.contains("duplicate"), "{reason}");
         }
         other => panic!("expected InvalidFont, got {other:?}"),
     }

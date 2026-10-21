@@ -43,11 +43,13 @@ pub enum EngineError {
     },
     /// An [`EngineConfig::fonts`](crate::EngineConfig::fonts) entry (issue
     /// #28) was rejected when the engine was built: bytes that are not a
-    /// readable single-face TTF/OTF/WOFF/WOFF2 (a collection such as `.ttc`
-    /// is rejected), an empty family, a weight outside `1..=1000`, a
-    /// duplicate of an earlier entry (same family compared
-    /// case-insensitively, same weight and style), or a face that ties with
-    /// the bundled "DejaVu Sans" 400 normal. The byte check covers the tables
+    /// readable single-face TTF/OTF/WOFF/WOFF2 (any collection, i.e. a
+    /// `ttcf` file tag even with one face, is rejected), an empty family, a
+    /// weight outside `1..=1000`, a duplicate of an earlier entry (same
+    /// family compared case-insensitively per character as fontique does,
+    /// same weight and style), or a face that ties with the bundled
+    /// "DejaVu Sans" 400 normal (width is not compared, so a condensed face
+    /// under that name is refused too). The byte check covers the tables
     /// fontique reads to register a face, not glyph outlines: a corrupt
     /// outline table passes and paints missing glyphs. `index` is the
     /// entry's position in `EngineConfig::fonts`.

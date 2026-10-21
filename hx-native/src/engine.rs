@@ -334,8 +334,9 @@ pub struct Engine {
 impl Engine {
     /// Build an engine, validating [`EngineConfig::fonts`] (issue #28) up
     /// front: bytes that are not a readable font, an empty family, a weight
-    /// outside `1..=1000`, or a duplicate (family case-insensitive, weight,
-    /// style) return [`EngineError::InvalidFont`]. Prefer this over
+    /// outside `1..=1000`, a font collection, a duplicate (family
+    /// case-insensitive, weight, style) or a tie with the bundled
+    /// "DejaVu Sans" 400 normal return [`EngineError::InvalidFont`]. Prefer this over
     /// [`Engine::new`] when the config carries host fonts.
     pub fn try_new(config: EngineConfig) -> Result<Self, EngineError> {
         let fonts = HostFonts::build(&config.fonts)?;
