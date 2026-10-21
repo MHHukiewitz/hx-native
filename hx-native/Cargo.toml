@@ -24,7 +24,8 @@ blitz-html = { version = "=0.3.0-beta.4", default-features = false }
 # `svg` (issue #23): paints inline `<svg>` and SVG images through anyrender_svg.
 # Nothing else: no blitz-net, no resvg. anyrender_svg's default image
 # decoders (png/gif/jpeg/webp) come with it and cannot be turned off from
-# here; hx-native never hands Blitz a raster image (see src/svg.rs).
+# here. They decode SVG `<image>` data: rasters, which src/svg.rs checks
+# (type, 64 KiB, 4096x4096, trial decode) before Blitz ever sees them.
 blitz-paint = { version = "=0.3.0-beta.4", default-features = false, features = ["svg"] }
 blitz-traits = { version = "=0.3.0-beta.4", default-features = false }
 

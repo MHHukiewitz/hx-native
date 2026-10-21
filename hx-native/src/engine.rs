@@ -46,7 +46,8 @@ use crate::select_ui::{
     select_damage_rects, select_row_damage_rect, select_ua_stylesheet, OpenSelect, SELECT_MAX_ROWS,
 };
 use crate::svg::{
-    classify_url, css_urls, spawn_svg_warm_up, DataSvg, DataSvgProvider, FORBIDDEN_SVG_ELEMENTS,
+    check_image_href, classify_url, css_urls, probe_decode, spawn_svg_warm_up, DataSvg,
+    DataSvgProvider, RasterImage, FORBIDDEN_SVG_ELEMENTS,
 };
 use crate::text_edit::{
     apply_group_display_all, apply_unfocused_display, backspace, caret_device_rect, commit_field,
@@ -5365,6 +5366,9 @@ fn validate_loaded_tree(
 ) -> Result<(), EngineError> {
     let root = doc.root_node().id;
     let mut stack = vec![root];
+    // #23: SVG `<image>` payloads that passed the static checks, decoded
+    // once at the end (one throwaway document for the whole tree).
+    let mut images: Vec<(String, RasterImage)> = Vec::new();
     while let Some(nid) = stack.pop() {
         let Some(node) = doc.get_node(nid) else {
             continue;
@@ -5381,7 +5385,7 @@ fn validate_loaded_tree(
             .map(|el| el.name.local.to_string())
             .unwrap_or_default();
         validate_loaded_attrs(&id_attr, &attrs, known_ids, Some(&tag))?;
-        validate_svg_content(node, &id_attr, &tag, &attrs)?;
+        validate_svg_content(node, &id_attr, &tag, &attrs, &mut images)?;
         let input_ty = attrs
             .iter()
             .find(|(k, _)| k == "type")
@@ -5398,6 +5402,17 @@ fn validate_loaded_tree(
                 }
             }
         }
+    }
+    let mut probed: Vec<&RasterImage> = Vec::new();
+    for (label, img) in &images {
+        if probed.iter().any(|p| p.data == img.data) {
+            continue;
+        }
+        probed.push(img);
+        probe_decode(std::slice::from_ref(img)).map_err(|rejection| EngineError::InvalidSvg {
+            id: label.clone(),
+            rejection,
+        })?;
     }
     Ok(())
 }
@@ -5626,6 +5641,7 @@ fn validate_svg_content(
     id_attr: &str,
     tag: &str,
     attrs: &[(String, String)],
+    images: &mut Vec<(String, RasterImage)>,
 ) -> Result<(), EngineError> {
     let label = || {
         if id_attr.is_empty() {
@@ -5643,6 +5659,18 @@ fn validate_svg_content(
                 },
             });
         }
+        // #23 (Mike, 2026-10-21): inline SVG `<image>` only with a data:
+        // href of an allowed raster type. `href` and `xlink:href` share the
+        // local name; both are checked when both are present.
+        if el.name.ns == ns!(svg) && tag == "image" {
+            for (_, href) in attrs.iter().filter(|(k, _)| k == "href") {
+                let img = check_image_href(href).map_err(|rejection| EngineError::InvalidSvg {
+                    id: label(),
+                    rejection,
+                })?;
+                images.push((label(), img));
+            }
+        }
     }
     let mut urls = Vec::new();
     for (name, value) in attrs {
@@ -5656,11 +5684,15 @@ fn validate_svg_content(
         urls.extend(css_urls(&node.text_content()));
     }
     for url in urls {
-        if let DataSvg::Rejected(rejection) = classify_url(&url) {
-            return Err(EngineError::InvalidSvg {
-                id: label(),
-                rejection,
-            });
+        match classify_url(&url) {
+            DataSvg::Rejected(rejection) => {
+                return Err(EngineError::InvalidSvg {
+                    id: label(),
+                    rejection,
+                })
+            }
+            DataSvg::Ok(_, nested) => images.extend(nested.into_iter().map(|i| (label(), i))),
+            DataSvg::NotSvg => {}
         }
     }
     Ok(())

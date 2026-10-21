@@ -364,26 +364,40 @@ fn svg_text_rejects_the_load_inline_and_data() {
     assert_rejected(&page, "text");
 }
 
-#[test]
-fn svg_image_rejects_the_load_inline_and_data() {
-    assert_rejected(
-        &inline_page("<image href='/etc/hostname' width='16' height='16'/>"),
-        "image",
+fn assert_href_rejected(html: &str) {
+    let err = engine().load_html(html).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            EngineError::InvalidSvg {
+                rejection: SvgRejection::ImageHref { .. },
+                ..
+            }
+        ),
+        "{err:?}"
     );
+}
+
+/// `<image>` itself is allowed (see tests/svg_image.rs); a path href is not,
+/// inline or inside a data: SVG. `<feImage>` stays forbidden (not painted).
+#[test]
+fn svg_image_with_a_path_href_rejects_the_load_inline_and_data() {
+    assert_href_rejected(&inline_page(
+        "<image href='/etc/hostname' width='16' height='16'/>",
+    ));
     assert_rejected(
         &inline_page("<filter id='f'><feImage href='/etc/hostname'/></filter>"),
         "feImage",
     );
-    assert_rejected(
-        &data_page("<image href='/etc/hostname' width='16' height='16'/>"),
-        "image",
-    );
+    assert_href_rejected(&data_page(
+        "<image href='/etc/hostname' width='16' height='16'/>",
+    ));
     // An <img src> data: SVG goes through the same gate.
     let img = format!(
         r#"<!DOCTYPE html><html><body><img id="im" src="data:image/svg+xml,{}"></body></html>"#,
         "%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Cimage href='x.png'/%3E%3C/svg%3E"
     );
-    assert_rejected(&img, "image");
+    assert_href_rejected(&img);
 }
 
 #[test]
@@ -554,7 +568,7 @@ fn rejected_svg_fragment_changes_nothing() {
         ("<svg xmlns='http://www.w3.org/2000/svg'><text>A</text></svg>".to_string(), "text"),
         (
             "<span style=\"background:url(&quot;data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Cimage href='a.png'/%3E%3C/svg%3E&quot;)\"></span>".to_string(),
-            "image",
+            "href",
         ),
     ] {
         let (mut e, _) = swapped(false, 1.0);
@@ -563,7 +577,11 @@ fn rejected_svg_fragment_changes_nothing() {
         let slices = Slices(HashMap::from([("hud".to_string(), 3)]));
         let err = e.sync(&slices, &mut Frags(frag.clone())).unwrap_err();
         assert!(
-            matches!(&err, EngineError::InvalidSvg { rejection: SvgRejection::ForbiddenElement { element }, .. } if element == el),
+            match &err {
+                EngineError::InvalidSvg { rejection: SvgRejection::ForbiddenElement { element }, .. } => element == el,
+                EngineError::InvalidSvg { rejection: SvgRejection::ImageHref { .. }, .. } => el == "href",
+                _ => false,
+            },
             "{frag}: {err:?}"
         );
         assert_eq!(e.serialize_html().unwrap(), before, "DOM must be unchanged");

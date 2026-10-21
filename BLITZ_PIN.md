@@ -40,7 +40,7 @@ Crates that move with the Blitz pin and must be bumped together:
 | Crate | Pin | Why |
 |-------|-----|-----|
 | `usvg` | `=0.48.1`, `default-features = false` | Same version Blitz parses with; hx-native uses it only to reject malformed `data:` SVG at validation time (empty fontdb, no text). |
-| `anyrender_svg` | `0.15.0` (via `blitz-paint/svg`) | Paints the usvg tree. Pulled with **default features** (text + PNG/GIF/JPEG/WebP decoders); blitz-paint does not let a downstream crate trim them. |
+| `anyrender_svg` | `0.15.0` (via `blitz-paint/svg`) | Paints the usvg tree, and decodes SVG `<image>` rasters with `image` 0.25 (features exactly `png`, `jpeg`, `gif`, `webp`; see `cargo tree -e features -i image`). Pulled with **default features**; blitz-paint does not let a downstream crate trim them. |
 | `data-url` | `=0.3.2` | Same version blitz-dom decodes `data:` URLs with. |
 
 Lockfile additions for #23 (no removals, no `windows-sys` move): `anyrender_svg 0.15.0`,
@@ -60,4 +60,13 @@ Load-bearing facts to re-check at every Blitz bump:
   warms it in `Engine::new` (`svg_warm_up`). If Blitz drops the scan or makes it
   configurable, the warm-up can go.
 - `draw_svg_image_layer` ignores `background-repeat`; anyrender_svg drops patterns.
+- SVG `<image>` (#23 round 2): usvg's default href resolvers read file paths
+  and parse nested SVG; hx-native's validation replaces them in its own parse
+  and checks every inline `<image>` in the DOM (`check_image_href`). Re-check
+  `usvg::parser::image::get_href_data` and the resolver signatures at every bump.
+- anyrender_svg draws a red box over an image it cannot decode and decodes on
+  every paint; `probe_decode` (a throwaway `<img>` document using blitz-dom's
+  `ImageHandler`) must keep matching its decoder (same `image` crate build).
+- The header parsers in `src/svg.rs` (PNG IHDR, GIF screen + frames, WebP
+  VP8/VP8L/VP8X, JPEG SOF) enforce `DATA_IMAGE_MAX_PIXELS` before any decode.
 - SVG children have no layout; `damage::snapshot_bounds` skips them.

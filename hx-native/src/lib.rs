@@ -42,7 +42,8 @@ pub use memory::{
 };
 pub use pending::PendingTimeout;
 pub use svg::{
-    svg_warm_up, svg_warm_up_done, SvgRejection, DATA_SVG_MAX_BYTES, FORBIDDEN_SVG_ELEMENTS,
+    svg_warm_up, svg_warm_up_done, SvgRejection, DATA_IMAGE_MAX_PIXELS, DATA_SVG_MAX_BYTES,
+    FORBIDDEN_SVG_ELEMENTS, SVG_IMAGE_MIME_TYPES,
 };
 pub use trigger::{FilterExpr, FromTarget, ParsedTrigger, TriggerEvent};
 pub use types::*;

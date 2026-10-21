@@ -14,6 +14,14 @@
 //! byte `<` (no TTF/OTF/WOFF/WOFF2/TTC starts with `<`), at most
 //! [`DATA_SVG_MAX_BYTES`], none of [`FORBIDDEN_SVG_ELEMENTS`], and a clean
 //! `usvg` parse.
+//!
+//! SVG `<image>` (Mike, 2026-10-21) is allowed only with a `data:` href of
+//! one of [`SVG_IMAGE_MIME_TYPES`]. Each image is checked here before usvg or
+//! Blitz ever decodes it: decoded size at most [`DATA_SVG_MAX_BYTES`], magic
+//! bytes matching the declared type, header dimensions read by hand and at
+//! most [`DATA_IMAGE_MAX_PIXELS`] (every frame of a GIF), and then one trial
+//! decode with Blitz's own decoder ([`probe_decode`]). Any failure rejects
+//! the whole load or swap with [`SvgRejection`]; nothing is ever fetched.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Once, OnceLock};
@@ -31,9 +39,24 @@ pub const DATA_SVG_MAX_BYTES: usize = 64 * 1024;
 /// - `text`, `tspan`, `textPath`: Blitz's usvg shapes SVG text with the
 ///   machine's system fonts (a scan downstream crates cannot turn off), so
 ///   it would not be deterministic and would break the #28 font rule.
-/// - `image`, `feImage`: usvg would load `href` file paths from disk and
-///   decode embedded raster images. Icons are paths only.
-pub const FORBIDDEN_SVG_ELEMENTS: &[&str] = &["text", "tspan", "textPath", "image", "feImage"];
+/// - `feImage`: anyrender_svg does not paint SVG filters, so an `feImage`
+///   would never show; refused rather than half-supported. (`<image>` is
+///   allowed under the rules in [`SVG_IMAGE_MIME_TYPES`].)
+pub const FORBIDDEN_SVG_ELEMENTS: &[&str] = &["text", "tspan", "textPath", "feImage"];
+
+/// The only `href` / `xlink:href` an SVG `<image>` may carry: a `data:` URL
+/// of one of these MIME types (matched case-insensitively, as usvg does).
+/// Any other href (`http(s):`, `file:`, a path, `#fragment`, `data:` of
+/// another type, including `image/svg+xml`, `image/jpg` and `text/plain`)
+/// rejects the load or swap. A nested SVG is refused because usvg would
+/// parse it with the host's options, where a bare path is read from disk.
+pub const SVG_IMAGE_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// Largest decoded image an SVG `<image>` may declare: width x height at
+/// most 4096 x 4096 (16 Mi pixels, 64 MiB RGBA), checked from the file
+/// header before any decode. For GIF the logical screen and every frame are
+/// checked. Raise only with a measured case.
+pub const DATA_IMAGE_MAX_PIXELS: u64 = 4096 * 4096;
 
 /// Why an SVG was rejected. Carried by
 /// [`EngineError::InvalidSvg`](crate::EngineError::InvalidSvg).
@@ -46,6 +69,15 @@ pub enum SvgRejection {
     TooLarge { bytes: usize, limit: usize },
     /// Not SVG markup, bad base64, or usvg could not parse it.
     Malformed { detail: String },
+    /// An `<image>` href that is not a `data:` URL of one of
+    /// [`SVG_IMAGE_MIME_TYPES`] (shortened to 80 characters).
+    ImageHref { href: String },
+    /// The image bytes are a different format from the declared MIME type.
+    ImageTypeMismatch { declared: String, actual: String },
+    /// The image header declares more than [`DATA_IMAGE_MAX_PIXELS`].
+    ImageTooLarge { width: u64, height: u64, limit: u64 },
+    /// The image header is unreadable or the decoder refused the data.
+    CorruptImage { mime: String, detail: String },
 }
 
 impl std::fmt::Display for SvgRejection {
@@ -61,6 +93,25 @@ impl std::fmt::Display for SvgRejection {
                 )
             }
             SvgRejection::Malformed { detail } => write!(f, "malformed SVG: {detail}"),
+            SvgRejection::ImageHref { href } => write!(
+                f,
+                "SVG <image> href `{href}` is not a data: URL of {}",
+                SVG_IMAGE_MIME_TYPES.join(", ")
+            ),
+            SvgRejection::ImageTypeMismatch { declared, actual } => {
+                write!(f, "SVG <image> declared {declared} but holds {actual}")
+            }
+            SvgRejection::ImageTooLarge {
+                width,
+                height,
+                limit,
+            } => write!(
+                f,
+                "SVG <image> is {width}x{height}, above the {limit}-pixel limit"
+            ),
+            SvgRejection::CorruptImage { mime, detail } => {
+                write!(f, "corrupt {mime} in SVG <image>: {detail}")
+            }
         }
     }
 }
@@ -105,8 +156,295 @@ pub(crate) fn find_forbidden_element(src: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// The full content gate for a decoded SVG payload.
-pub(crate) fn check_svg_bytes(bytes: &[u8]) -> Result<(), SvgRejection> {
+/// An SVG `<image>` payload that passed the static checks, waiting for the
+/// trial decode in [`probe_decode`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RasterImage {
+    pub(crate) mime: &'static str,
+    pub(crate) data: Arc<Vec<u8>>,
+}
+
+fn short(href: &str) -> String {
+    let mut s: String = href.chars().take(80).collect();
+    if s.len() < href.len() {
+        s.push('…');
+    }
+    s
+}
+
+/// Check one `<image>` href the way usvg reads it: `data_url::DataUrl::process`
+/// on the raw attribute value; anything that is not a data URL is a path or
+/// URL usvg would hand to its file loader, so it is refused.
+pub(crate) fn check_image_href(href: &str) -> Result<RasterImage, SvgRejection> {
+    let Ok(url) = data_url::DataUrl::process(href) else {
+        return Err(SvgRejection::ImageHref { href: short(href) });
+    };
+    let mime = format!("{}/{}", url.mime_type().type_, url.mime_type().subtype);
+    let Ok((data, _)) = url.decode_to_vec() else {
+        return Err(SvgRejection::CorruptImage {
+            mime,
+            detail: "invalid base64".into(),
+        });
+    };
+    check_raster(&mime, data).map_err(|e| match e {
+        SvgRejection::ImageHref { .. } => SvgRejection::ImageHref { href: short(href) },
+        other => other,
+    })
+}
+
+/// Static checks on decoded `<image>` bytes with their declared MIME type.
+pub(crate) fn check_raster(mime: &str, data: Vec<u8>) -> Result<RasterImage, SvgRejection> {
+    let Some(&declared) = SVG_IMAGE_MIME_TYPES.iter().find(|m| **m == mime) else {
+        return Err(SvgRejection::ImageHref {
+            href: format!("data:{mime},…"),
+        });
+    };
+    if data.len() > DATA_SVG_MAX_BYTES {
+        return Err(SvgRejection::TooLarge {
+            bytes: data.len(),
+            limit: DATA_SVG_MAX_BYTES,
+        });
+    }
+    let corrupt = |detail: &str| SvgRejection::CorruptImage {
+        mime: declared.to_string(),
+        detail: detail.to_string(),
+    };
+    let Some(actual) = sniff_image(&data) else {
+        return Err(corrupt("not a PNG, JPEG, GIF or WebP file"));
+    };
+    if actual != declared {
+        return Err(SvgRejection::ImageTypeMismatch {
+            declared: declared.to_string(),
+            actual: actual.to_string(),
+        });
+    }
+    let dims = match actual {
+        "image/png" => png_dimensions(&data).map(|d| vec![d]),
+        "image/gif" => gif_dimensions(&data),
+        "image/webp" => webp_dimensions(&data).map(|d| vec![d]),
+        _ => jpeg_dimensions(&data).map(|d| vec![d]),
+    };
+    let Some(dims) = dims else {
+        return Err(corrupt("unreadable image header"));
+    };
+    for (w, h) in dims {
+        if w == 0 || h == 0 {
+            return Err(corrupt("zero-sized image"));
+        }
+        if w * h > DATA_IMAGE_MAX_PIXELS {
+            return Err(SvgRejection::ImageTooLarge {
+                width: w,
+                height: h,
+                limit: DATA_IMAGE_MAX_PIXELS,
+            });
+        }
+    }
+    Ok(RasterImage {
+        mime: declared,
+        data: Arc::new(data),
+    })
+}
+
+/// The format the bytes really are, from their magic number.
+fn sniff_image(d: &[u8]) -> Option<&'static str> {
+    if d.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if d.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if d.starts_with(b"GIF87a") || d.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if d.len() >= 12 && &d[..4] == b"RIFF" && &d[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+fn be32(d: &[u8], i: usize) -> Option<u64> {
+    let b = d.get(i..i + 4)?;
+    Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as u64)
+}
+fn be16(d: &[u8], i: usize) -> Option<u64> {
+    let b = d.get(i..i + 2)?;
+    Some(u16::from_be_bytes([b[0], b[1]]) as u64)
+}
+fn le16(d: &[u8], i: usize) -> Option<u64> {
+    let b = d.get(i..i + 2)?;
+    Some(u16::from_le_bytes([b[0], b[1]]) as u64)
+}
+fn le24(d: &[u8], i: usize) -> Option<u64> {
+    let b = d.get(i..i + 3)?;
+    Some(b[0] as u64 | (b[1] as u64) << 8 | (b[2] as u64) << 16)
+}
+
+/// PNG: the IHDR chunk must come first.
+fn png_dimensions(d: &[u8]) -> Option<(u64, u64)> {
+    if be32(d, 8)? != 13 || d.get(12..16)? != b"IHDR" {
+        return None;
+    }
+    Some((be32(d, 16)?, be32(d, 20)?))
+}
+
+/// GIF: the logical screen and every image descriptor (frame), walking the
+/// block structure. Truncated or unknown blocks are unreadable (`None`).
+fn gif_dimensions(d: &[u8]) -> Option<Vec<(u64, u64)>> {
+    let mut out = vec![(le16(d, 6)?, le16(d, 8)?)];
+    let flags = *d.get(10)?;
+    let mut i = 13;
+    if flags & 0x80 != 0 {
+        i += 3 << ((flags & 7) + 1);
+    }
+    let skip_sub_blocks = |mut i: usize| -> Option<usize> {
+        loop {
+            let n = *d.get(i)? as usize;
+            i += 1;
+            if n == 0 {
+                return Some(i);
+            }
+            i += n;
+        }
+    };
+    loop {
+        match *d.get(i)? {
+            0x3B => return Some(out),
+            0x21 => i = skip_sub_blocks(i + 2)?,
+            0x2C => {
+                out.push((le16(d, i + 5)?, le16(d, i + 7)?));
+                let f = *d.get(i + 9)?;
+                i += 10;
+                if f & 0x80 != 0 {
+                    i += 3 << ((f & 7) + 1);
+                }
+                i = skip_sub_blocks(i + 1)?;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// WebP: the canvas of an extended (VP8X) file, else the lossy (VP8) or
+/// lossless (VP8L) frame header.
+fn webp_dimensions(d: &[u8]) -> Option<(u64, u64)> {
+    match d.get(12..16)? {
+        b"VP8X" => Some((le24(d, 24)? + 1, le24(d, 27)? + 1)),
+        b"VP8 " => {
+            if d.get(23..26)? != [0x9D, 0x01, 0x2A] {
+                return None;
+            }
+            Some((le16(d, 26)? & 0x3FFF, le16(d, 28)? & 0x3FFF))
+        }
+        b"VP8L" => {
+            if *d.get(20)? != 0x2F {
+                return None;
+            }
+            let b = d.get(21..25)?;
+            let bits = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64;
+            Some(((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1))
+        }
+        _ => None,
+    }
+}
+
+/// JPEG: the first start-of-frame marker, walking the marker segments.
+fn jpeg_dimensions(d: &[u8]) -> Option<(u64, u64)> {
+    let mut i = 2;
+    loop {
+        if *d.get(i)? != 0xFF {
+            return None;
+        }
+        let marker = *d.get(i + 1)?;
+        match marker {
+            0xFF => i += 1,
+            0xD8 | 0x01 | 0xD0..=0xD7 => i += 2,
+            0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => {
+                return Some((be16(d, i + 7)?, be16(d, i + 5)?));
+            }
+            0xD9 | 0xDA => return None,
+            _ => i += 2 + be16(d, i + 2)? as usize,
+        }
+    }
+}
+
+/// Trial-decode every image with Blitz's own decoder (the same `image`
+/// crate build anyrender_svg paints with) in a throwaway document whose
+/// only resource source is these bytes. A corrupt image is rejected here so
+/// it never reaches paint, where anyrender_svg would draw a half-transparent
+/// red box over it. Animated GIF and WebP: both decoders take the first
+/// frame only; memory is bounded by [`DATA_IMAGE_MAX_PIXELS`].
+pub(crate) fn probe_decode(images: &[RasterImage]) -> Result<(), SvgRejection> {
+    if images.is_empty() {
+        return Ok(());
+    }
+    let mut unique: Vec<&RasterImage> = Vec::new();
+    for img in images {
+        if !unique.iter().any(|u| u.data == img.data) {
+            unique.push(img);
+        }
+    }
+    let mut html = String::from("<!DOCTYPE html><html><body>");
+    for i in 0..unique.len() {
+        html.push_str(&format!("<img id=\"p{i}\" src=\"hx-probe:{i}\">"));
+    }
+    html.push_str("</body></html>");
+    let provider = Arc::new(ProbeProvider(
+        unique.iter().map(|u| Arc::clone(&u.data)).collect(),
+    ));
+    let mut doc = blitz_html::HtmlDocument::from_html(
+        &html,
+        blitz_dom::DocumentConfig {
+            viewport: Some(blitz_traits::shell::Viewport::new(
+                4,
+                4,
+                1.0,
+                blitz_traits::shell::ColorScheme::Light,
+            )),
+            html_parser_provider: Some(Arc::new(blitz_html::HtmlProvider)),
+            net_provider: Some(provider as Arc<dyn NetProvider>),
+            style_threading: blitz_dom::StyleThreading::Sequential,
+            ..Default::default()
+        },
+    );
+    doc.resolve(0.0);
+    doc.resolve(0.0);
+    for (i, img) in unique.iter().enumerate() {
+        let decoded = doc
+            .get_element_by_id(&format!("p{i}"))
+            .and_then(|nid| doc.get_node(nid))
+            .and_then(|n| n.element_data())
+            .is_some_and(|el| el.raster_image_data().is_some());
+        if !decoded {
+            return Err(SvgRejection::CorruptImage {
+                mime: img.mime.to_string(),
+                detail: "the decoder refused the image data".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Serves `hx-probe:<n>` from the probe's own byte list and nothing else.
+struct ProbeProvider(Vec<Arc<Vec<u8>>>);
+
+impl NetProvider for ProbeProvider {
+    fn fetch(&self, _doc_id: usize, request: Request, handler: Box<dyn NetHandler>) {
+        let url = request.url.as_str();
+        let Some(data) = url
+            .strip_prefix("hx-probe:")
+            .and_then(|n| n.parse::<usize>().ok())
+            .and_then(|n| self.0.get(n))
+        else {
+            return;
+        };
+        handler.bytes(url.to_string(), Bytes::from(data.as_ref().clone()));
+    }
+    fn is_noop(&self) -> bool {
+        true
+    }
+}
+
+/// The full content gate for a decoded SVG payload. Returns the `<image>`
+/// payloads usvg found, already statically checked, for [`probe_decode`].
+pub(crate) fn check_svg_bytes(bytes: &[u8]) -> Result<Vec<RasterImage>, SvgRejection> {
     if bytes.len() > DATA_SVG_MAX_BYTES {
         return Err(SvgRejection::TooLarge {
             bytes: bytes.len(),
@@ -125,13 +463,36 @@ pub(crate) fn check_svg_bytes(bytes: &[u8]) -> Result<(), SvgRejection> {
         });
     }
     // An empty font database: never the system font scan, and with text
-    // already refused above nothing here needs a font.
-    usvg::Tree::from_data(body, &usvg::Options::default()).map_err(|e| {
-        SvgRejection::Malformed {
-            detail: e.to_string(),
+    // already refused above nothing here needs a font. The image resolvers
+    // replace usvg's defaults (which read paths from disk and parse nested
+    // SVG): every `<image>` usvg converts, also through `<use>`, is checked
+    // and recorded, never loaded.
+    let found: std::sync::Mutex<Vec<Result<RasterImage, SvgRejection>>> =
+        std::sync::Mutex::new(Vec::new());
+    let record = |r| {
+        if let Ok(mut v) = found.lock() {
+            v.push(r);
         }
+    };
+    let opts = usvg::Options {
+        image_href_resolver: usvg::ImageHrefResolver {
+            resolve_data: Box::new(|mime: &str, data: Arc<Vec<u8>>, _: &usvg::Options| {
+                record(check_raster(mime, data.as_ref().clone()));
+                None
+            }),
+            resolve_string: Box::new(|href: &str, _: &usvg::Options| {
+                record(Err(SvgRejection::ImageHref { href: short(href) }));
+                None
+            }),
+        },
+        ..usvg::Options::default()
+    };
+    usvg::Tree::from_data(body, &opts).map_err(|e| SvgRejection::Malformed {
+        detail: e.to_string(),
     })?;
-    Ok(())
+    drop(opts);
+    let found = found.into_inner().unwrap_or_default();
+    found.into_iter().collect()
 }
 
 /// What a URL string is to the SVG gate.
@@ -140,8 +501,9 @@ pub(crate) enum DataSvg {
     /// Not a `data:image/svg+xml` URL (another scheme, another MIME type, or
     /// not a URL). The provider drops it; validation ignores it.
     NotSvg,
-    /// A `data:image/svg+xml` URL that passes the gate, with its body.
-    Ok(Vec<u8>),
+    /// A `data:image/svg+xml` URL that passes the gate, with its body and
+    /// the `<image>` payloads still to be trial-decoded.
+    Ok(Vec<u8>, Vec<RasterImage>),
     /// A `data:image/svg+xml` URL that fails the gate.
     Rejected(SvgRejection),
 }
@@ -171,7 +533,7 @@ pub(crate) fn classify_url(url: &str) -> DataSvg {
         }
     };
     match check_svg_bytes(&body) {
-        Ok(()) => DataSvg::Ok(body),
+        Ok(images) => DataSvg::Ok(body, images),
         Err(r) => DataSvg::Rejected(r),
     }
 }
@@ -307,7 +669,7 @@ impl DataSvgProvider {
 impl NetProvider for DataSvgProvider {
     fn fetch(&self, _doc_id: usize, request: Request, handler: Box<dyn NetHandler>) {
         match classify_url(request.url.as_str()) {
-            DataSvg::Ok(body) => {
+            DataSvg::Ok(body, _) => {
                 self.served.fetch_add(1, Ordering::Relaxed);
                 handler.bytes(request.url.to_string(), Bytes::from(body));
             }
@@ -441,7 +803,7 @@ mod tests {
         );
         assert_eq!(
             find_forbidden_element(b"<svg><image href='/etc/x'/></svg>"),
-            Some("image")
+            None
         );
         assert_eq!(
             find_forbidden_element(b"<svg><feImage/></svg>"),
@@ -459,7 +821,7 @@ mod tests {
 
     #[test]
     fn classify() {
-        assert!(matches!(classify_url(WARN), DataSvg::Ok(_)));
+        assert!(matches!(classify_url(WARN), DataSvg::Ok(..)));
         assert_eq!(classify_url("file:///etc/hostname"), DataSvg::NotSvg);
         assert_eq!(classify_url("http://example.com/a.svg"), DataSvg::NotSvg);
         assert_eq!(classify_url("data:text/css,a{}"), DataSvg::NotSvg);
@@ -494,7 +856,7 @@ mod tests {
             " ".repeat(pad)
         );
         assert_eq!(ok.len(), DATA_SVG_MAX_BYTES);
-        assert_eq!(check_svg_bytes(ok.as_bytes()), Ok(()));
+        assert_eq!(check_svg_bytes(ok.as_bytes()), Ok(vec![]));
         let big = format!("{ok} ");
         assert!(matches!(
             check_svg_bytes(big.as_bytes()),
