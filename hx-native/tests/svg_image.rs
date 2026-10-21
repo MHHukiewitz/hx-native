@@ -187,32 +187,21 @@ fn scheme_and_mime_case_variants_paint() {
     }
 }
 
+/// Round 3 (Graph HOLD on #52): `<use>` is forbidden, so an `<image>`
+/// reached through `<use>` now rejects the load as `ForbiddenElement`, with
+/// a good href or a bad one. (Round 2 painted the good one.)
 #[test]
-fn image_reached_through_use_is_checked_and_paints() {
+fn image_reached_through_use_is_refused_with_the_use() {
     let ok = uri("image/png", RED_PNG);
-    let body = format!(
-        "<defs><image id='im' href='{ok}' width='16' height='16'/></defs><use href='#im'/>"
-    );
-    assert_fill(
-        &render(&inline_svg(&body), 1.0),
-        1.0,
-        RED,
-        0,
-        "inline <use>",
-    );
-    assert_fill(&render(&data_svg(&body), 1.0), 1.0, RED, 0, "data: <use>");
-    for bad in ["file:///etc/hostname", "a.png"] {
+    for href in [ok.as_str(), "file:///etc/hostname", "a.png"] {
         let body = format!(
-            "<defs><image id='im' href='{bad}' width='16' height='16'/></defs><use href='#im'/>"
+            "<defs><image id='im' href='{href}' width='16' height='16'/></defs><use href='#im'/>"
         );
-        assert!(
-            matches!(reject(&inline_svg(&body)), SvgRejection::ImageHref { .. }),
-            "inline <use> {bad}"
-        );
-        assert!(
-            matches!(reject(&data_svg(&body)), SvgRejection::ImageHref { .. }),
-            "data: <use> {bad}"
-        );
+        let want = SvgRejection::ForbiddenElement {
+            element: "use".into(),
+        };
+        assert_eq!(reject(&inline_svg(&body)), want, "inline <use> {href:.30}");
+        assert_eq!(reject(&data_svg(&body)), want, "data: <use> {href:.30}");
     }
 }
 
@@ -336,12 +325,22 @@ fn declared_type_must_match_the_bytes() {
         assert_eq!(reject(&inline_image("href", &u)), want);
         assert_eq!(reject(&data_svg_image(&u)), want);
     }
-    // SVG markup behind a raster type: not a raster at all.
-    let u = uri("image/png", b"<svg xmlns='http://www.w3.org/2000/svg'/>");
-    assert!(matches!(
-        reject(&inline_image("href", &u)),
-        SvgRejection::CorruptImage { .. }
-    ));
+    // SVG markup behind any raster type is sniffed as SVG and refused as a
+    // mismatch, never parsed (round 3).
+    for declared in SVG_IMAGE_MIME_TYPES {
+        for svg in [
+            "<svg xmlns='http://www.w3.org/2000/svg'/>",
+            "\u{FEFF} \n<?xml version='1.0'?><svg xmlns='http://www.w3.org/2000/svg'><text>x</text></svg>",
+        ] {
+            let want = SvgRejection::ImageTypeMismatch {
+                declared: declared.to_string(),
+                actual: "image/svg+xml".into(),
+            };
+            let u = uri(declared, svg.as_bytes());
+            assert_eq!(reject(&inline_image("href", &u)), want);
+            assert_eq!(reject(&data_svg_image(&u)), want);
+        }
+    }
 }
 
 #[test]

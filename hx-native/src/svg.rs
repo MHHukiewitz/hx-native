@@ -22,6 +22,13 @@
 //! most [`DATA_IMAGE_MAX_PIXELS`] (every frame of a GIF), and then one trial
 //! decode with Blitz's own decoder ([`probe_decode`]). Any failure rejects
 //! the whole load or swap with [`SvgRejection`]; nothing is ever fetched.
+//!
+//! Round 3 (Graph HOLD on #52): a `data:` SVG is scanned for nesting depth
+//! without recursion ([`xml_depth_over`]), parsed once with usvg's own
+//! roxmltree options, and every element is checked by namespace-independent
+//! local name, every attribute for hrefs and [`FORBIDDEN_SVG_PROPERTIES`]
+//! ([`check_xml_tree`]) before usvg converts that same tree. Inline SVG gets
+//! the same element, attribute, property and depth rules in the DOM.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Once, OnceLock};
@@ -30,7 +37,9 @@ use std::time::{Duration, Instant};
 use blitz_traits::net::{Bytes, NetHandler, NetProvider, Request};
 
 /// Largest decoded `data:image/svg+xml` payload hx-native accepts, per URL
-/// (64 KiB). Mainnet's icons are about 500 bytes. Raise only with a measured
+/// (64 KiB). Measured on the decoded bytes, after base64 or percent
+/// decoding, never on the encoded URL; the same cap applies to each
+/// `<image>` raster after its own base64 decoding. Mainnet's icons are about 500 bytes. Raise only with a measured
 /// case (decision on #23, 2026-10-21).
 pub const DATA_SVG_MAX_BYTES: usize = 64 * 1024;
 
@@ -42,7 +51,25 @@ pub const DATA_SVG_MAX_BYTES: usize = 64 * 1024;
 /// - `feImage`: anyrender_svg does not paint SVG filters, so an `feImage`
 ///   would never show; refused rather than half-supported. (`<image>` is
 ///   allowed under the rules in [`SVG_IMAGE_MIME_TYPES`].)
-pub const FORBIDDEN_SVG_ELEMENTS: &[&str] = &["text", "tspan", "textPath", "feImage"];
+/// - `use`: one kilobyte of nested `<use>` fans out to 1e5 nodes (1.6 s to
+///   load in release, Graph on #52). Mainnet's icons do not use it.
+///
+/// Names are matched on the local part (after any `prefix:`), ASCII
+/// case-insensitively, in every namespace: `<é:text>`, `<svg:text>`,
+/// `<TEXT>` and a `<text>` under `<foreignObject>` are all refused.
+pub const FORBIDDEN_SVG_ELEMENTS: &[&str] = &["text", "tspan", "textPath", "feImage", "use"];
+
+/// SVG properties that make an SVG invalid, as an attribute, in a `style`
+/// attribute or in a `<style>` sheet. A 147-byte `stroke-dasharray="0.01"`
+/// over a 1e7-long path makes the paint try to allocate 7.5 GB and aborts
+/// the process (Graph on #52); Mainnet uses no dashes.
+pub const FORBIDDEN_SVG_PROPERTIES: &[&str] = &["stroke-dasharray", "stroke-dashoffset"];
+
+/// Deepest element nesting an SVG may have, counted from its root `<svg>`
+/// (which is depth 1). Checked by a non-recursive scan before the XML parse,
+/// again on the parsed tree (entities can add elements), and on inline SVG
+/// in the DOM, so usvg's recursive conversion never sees a deep tree.
+pub const SVG_MAX_DEPTH: usize = 64;
 
 /// The only `href` / `xlink:href` an SVG `<image>` may carry: a `data:` URL
 /// of one of these MIME types (matched case-insensitively, as usvg does).
@@ -65,6 +92,14 @@ pub const DATA_IMAGE_MAX_PIXELS: u64 = 4096 * 4096;
 pub enum SvgRejection {
     /// The SVG contains one of [`FORBIDDEN_SVG_ELEMENTS`].
     ForbiddenElement { element: String },
+    /// The SVG sets one of [`FORBIDDEN_SVG_PROPERTIES`].
+    ForbiddenProperty { property: String },
+    /// Elements nest deeper than [`SVG_MAX_DEPTH`].
+    TooDeep { depth: usize, limit: usize },
+    /// An `href` / `xlink:href` on an element other than `<image>` that is
+    /// not a `data:` URL (shortened to 80 characters). Every non-data href
+    /// is refused, `#fragment` references included.
+    ExternalHref { element: String, href: String },
     /// The decoded `data:` payload is larger than [`DATA_SVG_MAX_BYTES`].
     TooLarge { bytes: usize, limit: usize },
     /// Not SVG markup, bad base64, or usvg could not parse it.
@@ -85,6 +120,18 @@ impl std::fmt::Display for SvgRejection {
         match self {
             SvgRejection::ForbiddenElement { element } => {
                 write!(f, "SVG contains a forbidden <{element}> element")
+            }
+            SvgRejection::ForbiddenProperty { property } => {
+                write!(f, "SVG sets the forbidden property {property}")
+            }
+            SvgRejection::TooDeep { depth, limit } => {
+                write!(
+                    f,
+                    "SVG nests {depth} elements deep, above the limit of {limit}"
+                )
+            }
+            SvgRejection::ExternalHref { element, href } => {
+                write!(f, "SVG <{element}> href `{href}` is not a data: URL")
             }
             SvgRejection::TooLarge { bytes, limit } => {
                 write!(
@@ -117,9 +164,11 @@ impl std::fmt::Display for SvgRejection {
 }
 
 /// First forbidden element name in raw SVG/XML text, if any. Matches
-/// `<name` and `<prefix:name` followed by whitespace, `/` or `>`. Text in
-/// comments or CDATA that looks like such a tag also matches: the gate fails
-/// closed.
+/// `<name` and `<prefix:name` followed by whitespace, `/` or `>`, with any
+/// byte >= 0x80 counted as a name character (`<é:text>`) and the name
+/// compared case-insensitively. Text in comments or CDATA that looks like
+/// such a tag also matches: the gate fails closed. A first layer only; the
+/// namespace-aware check is [`check_xml_tree`].
 pub(crate) fn find_forbidden_element(src: &[u8]) -> Option<&'static str> {
     let mut i = 0;
     while i < src.len() {
@@ -130,7 +179,9 @@ pub(crate) fn find_forbidden_element(src: &[u8]) -> Option<&'static str> {
         let start = i + 1;
         let mut end = start;
         while end < src.len()
-            && (src[end].is_ascii_alphanumeric() || matches!(src[end], b':' | b'_' | b'-' | b'.'))
+            && (src[end].is_ascii_alphanumeric()
+                || src[end] >= 0x80
+                || matches!(src[end], b':' | b'_' | b'-' | b'.'))
         {
             end += 1;
         }
@@ -146,7 +197,7 @@ pub(crate) fn find_forbidden_element(src: &[u8]) -> Option<&'static str> {
             };
             if let Some(hit) = FORBIDDEN_SVG_ELEMENTS
                 .iter()
-                .find(|f| f.as_bytes() == local)
+                .find(|f| f.as_bytes().eq_ignore_ascii_case(local))
             {
                 return Some(hit);
             }
@@ -154,6 +205,205 @@ pub(crate) fn find_forbidden_element(src: &[u8]) -> Option<&'static str> {
         i = end.max(start);
     }
     None
+}
+
+/// The forbidden element an element name stands for: the local part after
+/// the last `:`, compared ASCII case-insensitively.
+pub(crate) fn forbidden_element(name: &str) -> Option<&'static str> {
+    let local = name.rsplit(':').next().unwrap_or(name);
+    FORBIDDEN_SVG_ELEMENTS
+        .iter()
+        .find(|f| f.eq_ignore_ascii_case(local))
+        .copied()
+}
+
+/// The forbidden property a CSS text sets or mentions, if any. Comments are
+/// dropped, escapes decoded and case folded first, so `STROKE-DASH\61rray`
+/// and `stroke-/**/dasharray` are caught; any mention fails closed.
+pub(crate) fn css_forbidden_property(css: &str) -> Option<&'static str> {
+    let bytes = css.as_bytes();
+    let mut norm = Vec::with_capacity(bytes.len());
+    let mut j = 0;
+    while j < bytes.len() {
+        if bytes[j] == b'/' && bytes.get(j + 1) == Some(&b'*') {
+            j += 2;
+            while j < bytes.len() && !(bytes[j] == b'*' && bytes.get(j + 1) == Some(&b'/')) {
+                j += 1;
+            }
+            j += 2;
+        } else if bytes[j] == b'\\' {
+            j += 1;
+            read_css_escape(bytes, &mut j, &mut norm);
+        } else {
+            norm.push(bytes[j]);
+            j += 1;
+        }
+    }
+    let norm = String::from_utf8_lossy(&norm).to_ascii_lowercase();
+    FORBIDDEN_SVG_PROPERTIES
+        .iter()
+        .find(|p| norm.contains(**p))
+        .copied()
+}
+
+/// One attribute of an SVG element (in a `data:` SVG or inline in the DOM),
+/// by its name as written (`href`, `xlink:href`, `é:href`, `HREF`). Refuses
+/// [`FORBIDDEN_SVG_PROPERTIES`] as attributes or inside `style`, and every
+/// href that is not a `data:` URL. An `<image>` href must also pass
+/// [`check_image_href`]; the checked raster is returned for the trial decode.
+pub(crate) fn check_svg_attribute(
+    element: &str,
+    attr: &str,
+    value: &str,
+) -> Result<Option<RasterImage>, SvgRejection> {
+    let local = attr.rsplit(':').next().unwrap_or(attr);
+    if let Some(p) = FORBIDDEN_SVG_PROPERTIES
+        .iter()
+        .find(|p| p.eq_ignore_ascii_case(local))
+    {
+        return Err(SvgRejection::ForbiddenProperty {
+            property: p.to_string(),
+        });
+    }
+    if local.eq_ignore_ascii_case("style") {
+        if let Some(p) = css_forbidden_property(value) {
+            return Err(SvgRejection::ForbiddenProperty {
+                property: p.to_string(),
+            });
+        }
+    }
+    if !local.eq_ignore_ascii_case("href") {
+        return Ok(None);
+    }
+    let el_local = element.rsplit(':').next().unwrap_or(element);
+    if el_local.eq_ignore_ascii_case("image") {
+        return check_image_href(value).map(Some);
+    }
+    if data_url::DataUrl::process(value).is_ok() {
+        return Ok(None);
+    }
+    Err(SvgRejection::ExternalHref {
+        element: element.to_string(),
+        href: short(value),
+    })
+}
+
+/// Deepest element nesting in raw XML, scanned without recursion and
+/// without parsing: comments, CDATA, processing instructions and the
+/// DOCTYPE (with its internal subset) are skipped, quoted attribute values
+/// are honoured, `/>` does not nest. Stops as soon as `limit` is passed and
+/// returns that depth; `None` when the text stays within it.
+pub(crate) fn xml_depth_over(src: &[u8], limit: usize) -> Option<usize> {
+    let find = |from: usize, pat: &[u8]| {
+        src.get(from..)
+            .and_then(|rest| rest.windows(pat.len()).position(|w| w == pat))
+            .map(|p| from + p + pat.len())
+    };
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < src.len() {
+        if src[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let rest = &src[i..];
+        if rest.starts_with(b"<!--") {
+            i = find(i + 4, b"-->").unwrap_or(src.len());
+        } else if rest.starts_with(b"<![CDATA[") {
+            i = find(i + 9, b"]]>").unwrap_or(src.len());
+        } else if rest.starts_with(b"<?") {
+            i = find(i + 2, b"?>").unwrap_or(src.len());
+        } else if rest.starts_with(b"<!") {
+            // DOCTYPE: skip to the `>` outside quotes and `[...]`.
+            let (mut j, mut bracket, mut quote) = (i + 2, 0usize, 0u8);
+            while j < src.len() {
+                let b = src[j];
+                if quote != 0 {
+                    if b == quote {
+                        quote = 0;
+                    }
+                } else if b == b'"' || b == b'\'' {
+                    quote = b;
+                } else if b == b'[' {
+                    bracket += 1;
+                } else if b == b']' {
+                    bracket = bracket.saturating_sub(1);
+                } else if b == b'>' && bracket == 0 {
+                    break;
+                }
+                j += 1;
+            }
+            i = j + 1;
+        } else if rest.starts_with(b"</") {
+            depth = depth.saturating_sub(1);
+            i = find(i + 2, b">").unwrap_or(src.len());
+        } else {
+            let (mut j, mut quote) = (i + 1, 0u8);
+            while j < src.len() {
+                let b = src[j];
+                if quote != 0 {
+                    if b == quote {
+                        quote = 0;
+                    }
+                } else if b == b'"' || b == b'\'' {
+                    quote = b;
+                } else if b == b'>' {
+                    break;
+                }
+                j += 1;
+            }
+            if j >= src.len() || src[j - 1] != b'/' {
+                depth += 1;
+                if depth > limit {
+                    return Some(depth);
+                }
+            }
+            i = j + 1;
+        }
+    }
+    None
+}
+
+/// The namespace-aware gate on a parsed `data:` SVG (the same roxmltree
+/// parse usvg then converts): every element at any depth, in any namespace
+/// and under any prefix, entity expansions included. Returns the `<image>`
+/// rasters it checked.
+pub(crate) fn check_xml_tree(
+    doc: &usvg::roxmltree::Document,
+) -> Result<Vec<RasterImage>, SvgRejection> {
+    let mut images = Vec::new();
+    for node in doc.descendants() {
+        if node.is_text() {
+            if let Some(p) = node.text().and_then(css_forbidden_property) {
+                return Err(SvgRejection::ForbiddenProperty {
+                    property: p.to_string(),
+                });
+            }
+            continue;
+        }
+        if !node.is_element() {
+            continue;
+        }
+        let depth = node.ancestors().filter(|n| n.is_element()).count();
+        if depth > SVG_MAX_DEPTH {
+            return Err(SvgRejection::TooDeep {
+                depth,
+                limit: SVG_MAX_DEPTH,
+            });
+        }
+        let name = node.tag_name().name();
+        if let Some(element) = forbidden_element(name) {
+            return Err(SvgRejection::ForbiddenElement {
+                element: element.to_string(),
+            });
+        }
+        for a in node.attributes() {
+            if let Some(img) = check_svg_attribute(name, a.name(), a.value())? {
+                images.push(img);
+            }
+        }
+    }
+    Ok(images)
 }
 
 /// An SVG `<image>` payload that passed the static checks, waiting for the
@@ -255,6 +505,16 @@ fn sniff_image(d: &[u8]) -> Option<&'static str> {
         Some("image/gif")
     } else if d.len() >= 12 && &d[..4] == b"RIFF" && &d[8..12] == b"WEBP" {
         Some("image/webp")
+    } else if d
+        .strip_prefix(b"\xEF\xBB\xBF")
+        .unwrap_or(d)
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        == Some(&b'<')
+    {
+        // SVG or other XML behind a raster label: refused as a mismatch,
+        // never parsed.
+        Some("image/svg+xml")
     } else {
         None
     }
@@ -457,11 +717,30 @@ pub(crate) fn check_svg_bytes(bytes: &[u8]) -> Result<Vec<RasterImage>, SvgRejec
             detail: "payload does not start with `<`".into(),
         });
     }
+    if let Some(depth) = xml_depth_over(body, SVG_MAX_DEPTH) {
+        return Err(SvgRejection::TooDeep {
+            depth,
+            limit: SVG_MAX_DEPTH,
+        });
+    }
     if let Some(element) = find_forbidden_element(body) {
         return Err(SvgRejection::ForbiddenElement {
             element: element.to_string(),
         });
     }
+    let malformed = |detail: String| SvgRejection::Malformed { detail };
+    let text = std::str::from_utf8(body).map_err(|_| malformed("not UTF-8".into()))?;
+    // The same roxmltree parse usvg does (DTD allowed), checked by
+    // namespace and local name before usvg converts it.
+    let xml = usvg::roxmltree::Document::parse_with_options(
+        text,
+        usvg::roxmltree::ParsingOptions {
+            allow_dtd: true,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| malformed(format!("SVG data parsing failed cause {e}")))?;
+    let mut checked = check_xml_tree(&xml)?;
     // An empty font database: never the system font scan, and with text
     // already refused above nothing here needs a font. The image resolvers
     // replace usvg's defaults (which read paths from disk and parse nested
@@ -487,12 +766,16 @@ pub(crate) fn check_svg_bytes(bytes: &[u8]) -> Result<Vec<RasterImage>, SvgRejec
         },
         ..usvg::Options::default()
     };
-    usvg::Tree::from_data(body, &opts).map_err(|e| SvgRejection::Malformed {
-        detail: e.to_string(),
-    })?;
+    usvg::Tree::from_xmltree(&xml, &opts).map_err(|e| malformed(e.to_string()))?;
     drop(opts);
     let found = found.into_inner().unwrap_or_default();
-    found.into_iter().collect()
+    for r in found {
+        let img = r?;
+        if !checked.contains(&img) {
+            checked.push(img);
+        }
+    }
+    Ok(checked)
 }
 
 /// What a URL string is to the SVG gate.
@@ -816,6 +1099,177 @@ mod tests {
         assert_eq!(
             find_forbidden_element(b"<svg><g class='text'/></svg>"),
             None
+        );
+    }
+
+    #[test]
+    fn forbidden_scan_prefixes_and_case() {
+        assert_eq!(
+            find_forbidden_element("<svg><é:text>".as_bytes()),
+            Some("text")
+        );
+        assert_eq!(
+            find_forbidden_element("<svg><a·b:text/>".as_bytes()),
+            Some("text")
+        );
+        assert_eq!(find_forbidden_element(b"<svg><TEXT>"), Some("text"));
+        assert_eq!(
+            find_forbidden_element(b"<svg><use href='#a'/>"),
+            Some("use")
+        );
+        assert_eq!(find_forbidden_element("<svg><é:image/>".as_bytes()), None);
+        assert_eq!(forbidden_element("é:TextPath"), Some("textPath"));
+        assert_eq!(forbidden_element("svg:use"), Some("use"));
+        assert_eq!(forbidden_element("image"), None);
+    }
+
+    #[test]
+    fn tree_check_is_namespace_aware() {
+        let parse = |s: &'static str| {
+            usvg::roxmltree::Document::parse_with_options(
+                s,
+                usvg::roxmltree::ParsingOptions {
+                    allow_dtd: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        let doc = parse("<svg xmlns='http://www.w3.org/2000/svg' xmlns:é='http://www.w3.org/2000/svg'><é:text>x</é:text></svg>");
+        assert_eq!(
+            check_xml_tree(&doc),
+            Err(SvgRejection::ForbiddenElement {
+                element: "text".into()
+            })
+        );
+        let doc = parse("<!DOCTYPE svg [<!ENTITY t \"<tspan/>\">]><svg xmlns='http://www.w3.org/2000/svg'>&t;</svg>");
+        assert_eq!(
+            check_xml_tree(&doc),
+            Err(SvgRejection::ForbiddenElement {
+                element: "tspan".into()
+            })
+        );
+        let doc = parse(
+            "<svg xmlns='http://www.w3.org/2000/svg'><style>a{stroke-dashoffset:1}</style></svg>",
+        );
+        assert_eq!(
+            check_xml_tree(&doc),
+            Err(SvgRejection::ForbiddenProperty {
+                property: "stroke-dashoffset".into()
+            })
+        );
+        let doc = parse("<svg xmlns='http://www.w3.org/2000/svg' xmlns:é='http://www.w3.org/2000/svg'><é:image href='/tmp/x.png'/></svg>");
+        assert_eq!(
+            check_xml_tree(&doc),
+            Err(SvgRejection::ImageHref {
+                href: "/tmp/x.png".into()
+            })
+        );
+        let doc = parse("<svg xmlns='http://www.w3.org/2000/svg'><g><g><rect/></g></g></svg>");
+        assert_eq!(check_xml_tree(&doc), Ok(vec![]));
+        let deep = format!(
+            "<svg xmlns='http://www.w3.org/2000/svg'>{}{}</svg>",
+            "<g>".repeat(SVG_MAX_DEPTH),
+            "</g>".repeat(SVG_MAX_DEPTH)
+        );
+        let doc = usvg::roxmltree::Document::parse(&deep).unwrap();
+        assert_eq!(
+            check_xml_tree(&doc),
+            Err(SvgRejection::TooDeep {
+                depth: SVG_MAX_DEPTH + 1,
+                limit: SVG_MAX_DEPTH
+            })
+        );
+    }
+
+    #[test]
+    fn depth_scan() {
+        let deep = |n: usize| format!("<svg>{}{}</svg>", "<g>".repeat(n), "</g>".repeat(n));
+        assert_eq!(
+            xml_depth_over(deep(SVG_MAX_DEPTH - 1).as_bytes(), SVG_MAX_DEPTH),
+            None
+        );
+        assert_eq!(
+            xml_depth_over(deep(SVG_MAX_DEPTH).as_bytes(), SVG_MAX_DEPTH),
+            Some(SVG_MAX_DEPTH + 1)
+        );
+        assert_eq!(xml_depth_over(b"<a><b/><b/><b/><c></c></a>", 2), None);
+        assert_eq!(xml_depth_over(b"<a><b><c/></b></a>", 2), None);
+        assert_eq!(xml_depth_over(b"<a><b><c></c></b></a>", 2), Some(3));
+        assert_eq!(
+            xml_depth_over(b"<!DOCTYPE a [<!ENTITY e '<b><c>'>]><?x <q>?><a><!-- <b><c> --><![CDATA[<b><c>]]><b k='>'/></a>", 1),
+            None
+        );
+        assert_eq!(xml_depth_over(b"<a k='/'><b k=\"/\">", 1), Some(2));
+    }
+
+    #[test]
+    fn css_and_attribute_checks() {
+        for css in [
+            "stroke-dasharray:1",
+            "STROKE-DASHOFFSET:1",
+            r"stroke-dash\61rray:1",
+            r"stroke-da\shoffset:1",
+            "stroke-/**/dasharray:1",
+        ] {
+            assert!(css_forbidden_property(css).is_some(), "{css}");
+        }
+        assert_eq!(css_forbidden_property("stroke:red;stroke-width:2"), None);
+        let attr = |e, a, v| check_svg_attribute(e, a, v).map(|o| o.is_some());
+        assert!(matches!(
+            attr("path", "stroke-dasharray", "1"),
+            Err(SvgRejection::ForbiddenProperty { .. })
+        ));
+        assert!(matches!(
+            attr("path", "x:Stroke-DashOffset", "1"),
+            Err(SvgRejection::ForbiddenProperty { .. })
+        ));
+        assert!(matches!(
+            attr("path", "style", "fill:red;stroke-dasharray:1"),
+            Err(SvgRejection::ForbiddenProperty { .. })
+        ));
+        assert_eq!(attr("path", "class", "stroke-dasharray"), Ok(false));
+        assert!(matches!(
+            attr("linearGradient", "href", "#g"),
+            Err(SvgRejection::ExternalHref { .. })
+        ));
+        assert!(matches!(
+            attr("a", "é:HREF", "https://x"),
+            Err(SvgRejection::ExternalHref { .. })
+        ));
+        assert_eq!(attr("a", "href", "data:,x"), Ok(false));
+        assert!(matches!(
+            attr("svg:image", "href", "/tmp/x.png"),
+            Err(SvgRejection::ImageHref { .. })
+        ));
+    }
+
+    fn png_header(w: u32, h: u32) -> Vec<u8> {
+        let mut v = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        v.extend_from_slice(&w.to_be_bytes());
+        v.extend_from_slice(&h.to_be_bytes());
+        v.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0, 0]);
+        v
+    }
+
+    #[test]
+    fn pixel_cap_boundary_and_svg_sniff() {
+        assert!(check_raster("image/png", png_header(4096, 4096)).is_ok());
+        assert!(check_raster("image/png", png_header(16_777_216, 1)).is_ok());
+        assert_eq!(
+            check_raster("image/png", png_header(4097, 4096)),
+            Err(SvgRejection::ImageTooLarge {
+                width: 4097,
+                height: 4096,
+                limit: DATA_IMAGE_MAX_PIXELS
+            })
+        );
+        assert_eq!(
+            check_raster("image/gif", b" <svg/>".to_vec()),
+            Err(SvgRejection::ImageTypeMismatch {
+                declared: "image/gif".into(),
+                actual: "image/svg+xml".into()
+            })
         );
     }
 

@@ -39,7 +39,7 @@ Crates that move with the Blitz pin and must be bumped together:
 
 | Crate | Pin | Why |
 |-------|-----|-----|
-| `usvg` | `=0.48.1`, `default-features = false` | Same version Blitz parses with; hx-native uses it only to reject malformed `data:` SVG at validation time (empty fontdb, no text). |
+| `usvg` | `=0.48.1`, `default-features = false` | Same version Blitz parses with; hx-native uses it only to validate `data:` SVG (empty fontdb, no text), and its `usvg::roxmltree` re-export (roxmltree 0.21.1, already in the lock) for the namespace-aware element check. |
 | `anyrender_svg` | `0.15.0` (via `blitz-paint/svg`) | Paints the usvg tree, and decodes SVG `<image>` rasters with `image` 0.25 (features exactly `png`, `jpeg`, `gif`, `webp`; see `cargo tree -e features -i image`). Pulled with **default features**; blitz-paint does not let a downstream crate trim them. |
 | `data-url` | `=0.3.2` | Same version blitz-dom decodes `data:` URLs with. |
 
@@ -64,6 +64,16 @@ Load-bearing facts to re-check at every Blitz bump:
   and parse nested SVG; hx-native's validation replaces them in its own parse
   and checks every inline `<image>` in the DOM (`check_image_href`). Re-check
   `usvg::parser::image::get_href_data` and the resolver signatures at every bump.
+- Round 3 (#52): `src/svg.rs` parses `data:` SVG with `usvg::roxmltree` using
+  usvg's own options (`allow_dtd: true`) and converts with
+  `usvg::Tree::from_xmltree`, so the checked tree is the converted one.
+  Inline SVG is checked in the DOM by local name because blitz-dom's
+  `svg_source` serialises `data.name.local` (`svg:text` stays `svg:text`).
+  Re-check `usvg::parser::from_str`, `svgtree::parse_tag_name` (namespace
+  `None | SVG`) and `svg_source` at every bump.
+- anyrender_svg has no raster decode cache: every paint of an SVG with an
+  `<image>` decodes it again (4096² costs about 247 ms per paint in release).
+  Re-measure with a bump; a cache upstream would remove the cost.
 - anyrender_svg draws a red box over an image it cannot decode and decodes on
   every paint; `probe_decode` (a throwaway `<img>` document using blitz-dom's
   `ImageHandler`) must keep matching its decoder (same `image` crate build).

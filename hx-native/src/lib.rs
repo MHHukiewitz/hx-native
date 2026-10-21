@@ -43,7 +43,7 @@ pub use memory::{
 pub use pending::PendingTimeout;
 pub use svg::{
     svg_warm_up, svg_warm_up_done, SvgRejection, DATA_IMAGE_MAX_PIXELS, DATA_SVG_MAX_BYTES,
-    FORBIDDEN_SVG_ELEMENTS, SVG_IMAGE_MIME_TYPES,
+    FORBIDDEN_SVG_ELEMENTS, FORBIDDEN_SVG_PROPERTIES, SVG_IMAGE_MIME_TYPES, SVG_MAX_DEPTH,
 };
 pub use trigger::{FilterExpr, FromTarget, ParsedTrigger, TriggerEvent};
 pub use types::*;

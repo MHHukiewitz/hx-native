@@ -46,8 +46,9 @@ use crate::select_ui::{
     select_damage_rects, select_row_damage_rect, select_ua_stylesheet, OpenSelect, SELECT_MAX_ROWS,
 };
 use crate::svg::{
-    check_image_href, classify_url, css_urls, probe_decode, spawn_svg_warm_up, DataSvg,
-    DataSvgProvider, RasterImage, FORBIDDEN_SVG_ELEMENTS,
+    check_svg_attribute, classify_url, css_forbidden_property, css_urls, forbidden_element,
+    probe_decode, spawn_svg_warm_up, DataSvg, DataSvgProvider, RasterImage, SvgRejection,
+    SVG_MAX_DEPTH,
 };
 use crate::text_edit::{
     apply_group_display_all, apply_unfocused_display, backspace, caret_device_rect, commit_field,
@@ -5385,7 +5386,7 @@ fn validate_loaded_tree(
             .map(|el| el.name.local.to_string())
             .unwrap_or_default();
         validate_loaded_attrs(&id_attr, &attrs, known_ids, Some(&tag))?;
-        validate_svg_content(node, &id_attr, &tag, &attrs, &mut images)?;
+        validate_svg_content(doc, node, &id_attr, &tag, &attrs, &mut images)?;
         let input_ty = attrs
             .iter()
             .find(|(k, _)| k == "type")
@@ -5632,11 +5633,35 @@ fn node_id_attr(doc: &HtmlDocument, nid: NodeId) -> Option<String> {
     node_attr(doc, nid, "id").filter(|s| !s.is_empty())
 }
 
-/// Issue #23 SVG gate on one element of loaded HTML or a swap fragment: an
-/// SVG-namespace element named in [`FORBIDDEN_SVG_ELEMENTS`], or a
-/// `data:image/svg+xml` URL (in `<style>` text, a `style` attribute, or a
-/// `src` / `href`) that fails the gate, rejects the whole load or swap.
+/// Elements from `node` up to and including its outermost SVG-namespace
+/// ancestor (`node` itself counts), or `None` when `node` is not inside an
+/// inline `<svg>`. Walks parents without recursion.
+fn inline_svg_depth(doc: &HtmlDocument, node: &blitz_dom::Node) -> Option<usize> {
+    let mut depth = 0;
+    let mut svg_depth = None;
+    let mut cur = Some(node);
+    while let Some(n) = cur {
+        if let Some(el) = n.element_data() {
+            depth += 1;
+            if el.name.ns == ns!(svg) {
+                svg_depth = Some(depth);
+            }
+        }
+        cur = n.parent.and_then(|p| doc.get_node(p));
+    }
+    svg_depth
+}
+
+/// Issue #23 SVG gate on one element of loaded HTML or a swap fragment.
+/// Inside an inline `<svg>` (any element, in any namespace, under any
+/// prefix, because Blitz serialises the subtree by local name for usvg):
+/// a name in [`FORBIDDEN_SVG_ELEMENTS`](crate::FORBIDDEN_SVG_ELEMENTS),
+/// nesting past [`SVG_MAX_DEPTH`], a forbidden property, or a non-`data:`
+/// href rejects the load or swap; an `<image>` href must pass the raster
+/// rules. Anywhere: a `data:image/svg+xml` URL (in `<style>` text, a
+/// `style` attribute, or a `src` / `href`) that fails the gate rejects it.
 fn validate_svg_content(
+    doc: &HtmlDocument,
     node: &blitz_dom::Node,
     id_attr: &str,
     tag: &str,
@@ -5650,25 +5675,36 @@ fn validate_svg_content(
             id_attr.to_string()
         }
     };
-    if let Some(el) = node.element_data() {
-        if el.name.ns == ns!(svg) && FORBIDDEN_SVG_ELEMENTS.contains(&tag) {
-            return Err(EngineError::InvalidSvg {
-                id: label(),
-                rejection: crate::svg::SvgRejection::ForbiddenElement {
-                    element: tag.to_string(),
-                },
-            });
+    let reject = |rejection: SvgRejection| EngineError::InvalidSvg {
+        id: label(),
+        rejection,
+    };
+    if let Some(depth) = inline_svg_depth(doc, node) {
+        if depth > SVG_MAX_DEPTH {
+            return Err(reject(SvgRejection::TooDeep {
+                depth,
+                limit: SVG_MAX_DEPTH,
+            }));
         }
-        // #23 (Mike, 2026-10-21): inline SVG `<image>` only with a data:
-        // href of an allowed raster type. `href` and `xlink:href` share the
-        // local name; both are checked when both are present.
-        if el.name.ns == ns!(svg) && tag == "image" {
-            for (_, href) in attrs.iter().filter(|(k, _)| k == "href") {
-                let img = check_image_href(href).map_err(|rejection| EngineError::InvalidSvg {
-                    id: label(),
-                    rejection,
-                })?;
+        if let Some(element) = forbidden_element(tag) {
+            return Err(reject(SvgRejection::ForbiddenElement {
+                element: element.to_string(),
+            }));
+        }
+        // #23 (Mike, 2026-10-21): `<image>` only with a data: href of an
+        // allowed raster type; every other href must be data: too. `href`,
+        // `xlink:href` and prefixed spellings share the local name; all are
+        // checked when several are present.
+        for (name, value) in attrs {
+            if let Some(img) = check_svg_attribute(tag, name, value).map_err(reject)? {
                 images.push((label(), img));
+            }
+        }
+        if tag.eq_ignore_ascii_case("style") {
+            if let Some(p) = css_forbidden_property(&node.text_content()) {
+                return Err(reject(SvgRejection::ForbiddenProperty {
+                    property: p.to_string(),
+                }));
             }
         }
     }
