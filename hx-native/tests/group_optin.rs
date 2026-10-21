@@ -294,7 +294,7 @@ fn grouped_box_and_comma_paste_rule_agree() {
     });
     assert_eq!(
         retyped,
-        s("73480", "73480", "73,480"),
+        s("73,480", "73480", "73,480"),
         "retyped grouped text"
     );
     // A refused paste leaves the selection in place, so a following "1"

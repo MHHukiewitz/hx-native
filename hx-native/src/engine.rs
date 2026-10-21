@@ -3395,7 +3395,7 @@ impl LiveSurface {
     ) -> Option<InputOutcome> {
         self.ensure_text_edit_prepared();
         let session = self.text_edit.take()?;
-        let _ = commit_field(&mut self.doc, session.node_id);
+        let _ = commit_field(&mut self.doc, session.node_id, &session.value_at_focus);
         self.mark_dom_dirty();
         self.queue_text_field_damage(session.node_id);
         let value_now = self.attr(&session.id, "value").unwrap_or_default();
@@ -3429,13 +3429,18 @@ impl LiveSurface {
     }
 
     fn hold_focused_number_to_commit(&mut self) {
-        let Some(nid) = self.text_edit.as_ref().map(|s| s.node_id) else {
+        let Some((nid, fallback)) = self
+            .text_edit
+            .as_ref()
+            .map(|s| (s.node_id, s.value_at_focus.clone()))
+        else {
             return;
         };
         if self.doc.get_node(nid).is_some_and(is_number_input)
             && editor_text(&mut self.doc, nid).is_some()
         {
-            let _ = crate::text_edit::sync_value_from_editor(&mut self.doc, nid, true, true);
+            let _ =
+                crate::text_edit::sync_value_from_editor(&mut self.doc, nid, true, true, &fallback);
         }
     }
 
@@ -3518,7 +3523,7 @@ impl LiveSurface {
                 }
                 cleaned
             } else {
-                // Commas accepted and ignored (not inserted while focused).
+                // Commas are kept while typing; commit judges them (#51).
                 filter_number_insert(&existing, &filtered, &limits)
             };
             if filtered.is_empty() {
@@ -3528,7 +3533,13 @@ impl LiveSurface {
         } else {
             insert_text(&mut self.doc, nid, &filtered);
         }
-        let _ = sync_value_from_editor(&mut self.doc, nid, is_number, false);
+        let _ = sync_value_from_editor(
+            &mut self.doc,
+            nid,
+            is_number,
+            false,
+            &session.value_at_focus,
+        );
         self.reset_caret_blink();
         self.mark_dom_dirty();
         self.queue_text_field_damage(nid);
@@ -3556,7 +3567,13 @@ impl LiveSurface {
                 .doc
                 .get_node(session.node_id)
                 .is_some_and(is_number_input);
-            let _ = sync_value_from_editor(&mut self.doc, session.node_id, is_number, false);
+            let _ = sync_value_from_editor(
+                &mut self.doc,
+                session.node_id,
+                is_number,
+                false,
+                &session.value_at_focus,
+            );
             self.reset_caret_blink();
             self.mark_dom_dirty();
             self.queue_text_field_damage(session.node_id);
@@ -3612,7 +3629,13 @@ impl LiveSurface {
             _ => return None,
         }
         let is_number = self.doc.get_node(nid).is_some_and(is_number_input);
-        let _ = sync_value_from_editor(&mut self.doc, nid, is_number, false);
+        let _ = sync_value_from_editor(
+            &mut self.doc,
+            nid,
+            is_number,
+            false,
+            &session.value_at_focus,
+        );
         self.reset_caret_blink();
         self.mark_dom_dirty();
         self.queue_text_field_damage(nid);
