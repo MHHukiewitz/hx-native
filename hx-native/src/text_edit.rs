@@ -559,7 +559,7 @@ pub fn sync_value_from_editor(
     let display = editor_text(doc, nid).unwrap_or_default();
     let mut selection = None;
     doc.with_text_input(nid, |driver| {
-        selection = Some(driver.editor.raw_selection().clone());
+        selection = Some(*driver.editor.raw_selection());
     });
     let canonical = if is_number {
         let limits = doc
