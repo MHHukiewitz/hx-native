@@ -31,3 +31,33 @@ must update `local_transform_device` in `hx-native/src/damage.rs`.
 
 Public helpers: `element_border_box_css`, `element_border_box_device`
 (also used by form range geometry and, after #18 rebases, select control rects).
+
+## SVG (issue #23)
+
+`blitz-paint` is built with `default-features = false, features = ["svg"]`.
+Crates that move with the Blitz pin and must be bumped together:
+
+| Crate | Pin | Why |
+|-------|-----|-----|
+| `usvg` | `=0.48.1`, `default-features = false` | Same version Blitz parses with; hx-native uses it only to reject malformed `data:` SVG at validation time (empty fontdb, no text). |
+| `anyrender_svg` | `0.15.0` (via `blitz-paint/svg`) | Paints the usvg tree. Pulled with **default features** (text + PNG/GIF/JPEG/WebP decoders); blitz-paint does not let a downstream crate trim them. |
+| `data-url` | `=0.3.2` | Same version blitz-dom decodes `data:` URLs with. |
+
+Lockfile additions for #23 (no removals, no `windows-sys` move): `anyrender_svg 0.15.0`,
+`color_quant 1.1.0`, `gif 0.14.2`, `image-webp 0.2.4`, `quick-error 2.0.1`,
+`weezl 0.1.12`, `zune-core 0.5.3`, `zune-jpeg 0.5.15`.
+
+Load-bearing facts to re-check at every Blitz bump:
+
+- `NetProvider::fetch` carries no resource kind (image vs stylesheet vs font).
+  `DataSvgProvider` (`hx-native/src/svg.rs`) gates on URL scheme + MIME +
+  payload; if Blitz starts routing fonts or stylesheets differently, re-run
+  `tests/svg.rs` (`data_font_face_is_never_served`,
+  `data_css_link_is_ignored_and_never_blocks_paint`).
+- `is_noop() == true` keeps `<link>` from becoming pending-critical.
+- A loaded image is applied at the next `resolve` (hence `resolve_with_data_images`).
+- `blitz_dom::util::FONT_DB` scans system fonts on the first SVG parse; hx-native
+  warms it in `Engine::new` (`svg_warm_up`). If Blitz drops the scan or makes it
+  configurable, the warm-up can go.
+- `draw_svg_image_layer` ignores `background-repeat`; anyrender_svg drops patterns.
+- SVG children have no layout; `damage::snapshot_bounds` skips them.

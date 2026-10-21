@@ -37,6 +37,9 @@ use crate::select_ui::{
     collect_select_nids, control_rect_of, list_row_at, open_select_state, paint_select_overlays,
     select_damage_rects, select_row_damage_rect, select_ua_stylesheet, OpenSelect, SELECT_MAX_ROWS,
 };
+use crate::svg::{
+    classify_url, css_urls, spawn_svg_warm_up, DataSvg, DataSvgProvider, FORBIDDEN_SVG_ELEMENTS,
+};
 use crate::text_edit::{
     apply_unfocused_display, backspace, caret_device_rect, commit_field, delete_forward,
     delete_selection, editor_text, filter_number_insert, has_selection, insert_text, is_disabled,
@@ -175,6 +178,8 @@ struct LiveSurface {
     /// Issue #28: this engine's validated host fonts (shared Blobs), used by
     /// the ellipsis shaper so truncation measures with the same faces.
     fonts: Arc<HostFonts>,
+    /// Issue #23: this document's only resource source (`data:` SVGs).
+    svg_provider: Arc<DataSvgProvider>,
     bindings: HashMap<String, ElementBinding>,
     /// section_id -> subscribed slice names
     sections: HashMap<String, Vec<String>>,
@@ -356,6 +361,9 @@ impl Engine {
         config: EngineConfig,
         fonts: Result<Arc<HostFonts>, EngineError>,
     ) -> Self {
+        // Issue #23: pay the one-time first-SVG system font scan off the
+        // host's thread, once per process.
+        spawn_svg_warm_up();
         let (fonts, font_error) = match fonts {
             Ok(f) => (f, None),
             Err(e) => (Arc::new(HostFonts::default()), Some(e)),
@@ -1282,6 +1290,15 @@ impl Engine {
     /// the default surface so far. Must not grow on an edit that keeps the
     /// same changed/unchanged state (flip-only mutation).
     #[doc(hidden)]
+    /// Test helper (issue #23): `(served, refused)` resource requests on the
+    /// default surface's `data:` SVG provider.
+    pub fn test_data_svg_counts(&self) -> (u64, u64) {
+        self.live(SurfaceId::DEFAULT)
+            .map(|l| (l.svg_provider.served(), l.svg_provider.refused()))
+            .unwrap_or((0, 0))
+    }
+
+    #[doc(hidden)]
     pub fn test_hx_changed_write_count(&self) -> u64 {
         self.live(SurfaceId::DEFAULT)
             .map(|l| l.hx_changed_write_count)
@@ -1418,7 +1435,14 @@ impl LiveSurface {
     ) -> Result<Self, EngineError> {
         let layout_viewport = (size.width, size.height);
         let layout_scale = size.scale;
-        let mut doc = parse_html_document_scaled(html, layout_viewport, layout_scale, fonts);
+        let svg_provider = DataSvgProvider::new();
+        let mut doc = parse_html_document_scaled(
+            html,
+            layout_viewport,
+            layout_scale,
+            fonts,
+            Some(Arc::clone(&svg_provider)),
+        );
 
         // HTML contract §2: strict dialect on loaded HTML, then index bindings.
         let known_ids = collect_element_ids(&doc);
@@ -1426,7 +1450,7 @@ impl LiveSurface {
         let (bindings, sections) = index_bindings(declared_actions, &doc)?;
 
         doc.add_user_agent_stylesheet(select_ua_stylesheet());
-        doc.resolve(0.0);
+        let passes = resolve_with_data_images(&mut doc, &svg_provider);
         let select_nids = collect_select_nids(&doc);
         let applied_control_nids = collect_applied_control_nids(&doc);
         Ok(Self {
@@ -1464,7 +1488,8 @@ impl LiveSurface {
             ellipsis_cache: EllipsisCache::default(),
             ellipsis_shaper: None,
             fonts: Arc::clone(fonts),
-            resolve_count: 1,
+            svg_provider,
+            resolve_count: passes,
             fail_next_paint: false,
             panic_next_paint: false,
             text_edit: None,
@@ -1474,8 +1499,8 @@ impl LiveSurface {
     }
 
     fn resolve_doc(&mut self) {
-        self.doc.resolve(0.0);
-        self.resolve_count = self.resolve_count.saturating_add(1);
+        let passes = resolve_with_data_images(&mut self.doc, &self.svg_provider);
+        self.resolve_count = self.resolve_count.saturating_add(passes);
     }
 
     /// Mark the DOM dirty without re-evaluating greying (issue #15). Used by
@@ -1578,6 +1603,7 @@ impl LiveSurface {
     ) -> Result<(), EngineError> {
         // Validation-only parse (ids / dialect); never laid out or painted,
         // so it does not need the host fonts.
+        // No resource provider: validation never fetches or decodes images.
         let frag_doc = parse_html_document(html, self.layout_viewport, &HostFonts::default());
         let mut known_ids = collect_element_ids(&self.doc);
         for id in ids_removed_by_swap(&self.doc, target_nid, swap) {
@@ -4791,6 +4817,7 @@ fn validate_loaded_tree(
             .map(|el| el.name.local.to_string())
             .unwrap_or_default();
         validate_loaded_attrs(&id_attr, &attrs, known_ids, Some(&tag))?;
+        validate_svg_content(node, &id_attr, &tag, &attrs)?;
         let input_ty = attrs
             .iter()
             .find(|(k, _)| k == "type")
@@ -4865,17 +4892,38 @@ fn index_bindings(
     Ok((bindings, sections))
 }
 
+/// Validation-only parse: no resource provider at all.
 fn parse_html_document(html: &str, layout_viewport: (u32, u32), fonts: &HostFonts) -> HtmlDocument {
-    parse_html_document_scaled(html, layout_viewport, 1.0, fonts)
+    parse_html_document_scaled(html, layout_viewport, 1.0, fonts, None)
 }
 
-/// `net_provider: None`: CSS `@font-face` (and every other resource) is
-/// never fetched (issue #28); host fonts come only from `EngineConfig::fonts`.
+/// Resolve, and when the pass handed out a `data:` SVG (issue #23) resolve
+/// once more so Blitz takes the loaded image in before this paint. Blitz
+/// only ingests a load at the start of the next `resolve`, and its
+/// per-document image cache means the extra pass happens only on a URL's
+/// first use in a document. Returns the passes run (1 or 2).
+fn resolve_with_data_images(doc: &mut HtmlDocument, provider: &DataSvgProvider) -> u64 {
+    let before = provider.served();
+    doc.resolve(0.0);
+    if provider.served() != before {
+        doc.resolve(0.0);
+        2
+    } else {
+        1
+    }
+}
+
+/// The only resource provider is [`DataSvgProvider`] (issue #23): it answers
+/// `data:image/svg+xml` URLs that pass the SVG gate and drops everything
+/// else, so CSS `@font-face` is never served (issue #28) and host fonts come
+/// only from `EngineConfig::fonts`. `None` (validation parses) fetches
+/// nothing at all.
 fn parse_html_document_scaled(
     html: &str,
     layout_viewport: (u32, u32),
     scale: f64,
     fonts: &HostFonts,
+    svg_provider: Option<Arc<DataSvgProvider>>,
 ) -> HtmlDocument {
     let font_ctx = bundled_font_context(fonts);
     let (w, h) = layout_viewport;
@@ -4887,7 +4935,7 @@ fn parse_html_document_scaled(
             font_ctx: Some(font_ctx),
             style_threading: StyleThreading::Sequential,
             incremental: Some(true),
-            net_provider: None,
+            net_provider: svg_provider.map(|p| p as Arc<dyn blitz_traits::net::NetProvider>),
             ..Default::default()
         },
     )
@@ -5003,6 +5051,55 @@ fn node_attr(doc: &HtmlDocument, nid: NodeId, name: &str) -> Option<String> {
 /// Stable `id` attribute of node `nid`, if any (non-empty).
 fn node_id_attr(doc: &HtmlDocument, nid: NodeId) -> Option<String> {
     node_attr(doc, nid, "id").filter(|s| !s.is_empty())
+}
+
+/// Issue #23 SVG gate on one element of loaded HTML or a swap fragment: an
+/// SVG-namespace element named in [`FORBIDDEN_SVG_ELEMENTS`], or a
+/// `data:image/svg+xml` URL (in `<style>` text, a `style` attribute, or a
+/// `src` / `href`) that fails the gate, rejects the whole load or swap.
+fn validate_svg_content(
+    node: &blitz_dom::Node,
+    id_attr: &str,
+    tag: &str,
+    attrs: &[(String, String)],
+) -> Result<(), EngineError> {
+    let label = || {
+        if id_attr.is_empty() {
+            format!("<{tag}>")
+        } else {
+            id_attr.to_string()
+        }
+    };
+    if let Some(el) = node.element_data() {
+        if el.name.ns == ns!(svg) && FORBIDDEN_SVG_ELEMENTS.contains(&tag) {
+            return Err(EngineError::InvalidSvg {
+                id: label(),
+                rejection: crate::svg::SvgRejection::ForbiddenElement {
+                    element: tag.to_string(),
+                },
+            });
+        }
+    }
+    let mut urls = Vec::new();
+    for (name, value) in attrs {
+        match name.as_str() {
+            "style" => urls.extend(css_urls(value)),
+            "src" | "href" => urls.push(value.clone()),
+            _ => {}
+        }
+    }
+    if tag == "style" {
+        urls.extend(css_urls(&node.text_content()));
+    }
+    for url in urls {
+        if let DataSvg::Rejected(rejection) = classify_url(&url) {
+            return Err(EngineError::InvalidSvg {
+                id: label(),
+                rejection,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn element_id_and_attrs(node: &blitz_dom::Node) -> (String, Vec<(String, String)>) {

@@ -19,6 +19,11 @@ fn main() {
             || pkg.starts_with("mainnet")
             || pkg == "graph_bridge"
             || pkg == "blitz-net"
+            // #23: SVG stays offline and text-free: no resvg (its own
+            // rasterizer + font loading) and no HTTP client.
+            || pkg == "resvg"
+            || pkg == "reqwest"
+            || pkg == "ureq"
         {
             bad.push(pkg.to_string());
         }
@@ -27,5 +32,5 @@ fn main() {
         eprintln!("A13 banned dependencies present: {bad:?}");
         std::process::exit(1);
     }
-    println!("A13 ok: no wgpu / mainnet / graph_bridge / blitz-net");
+    println!("A13 ok: no wgpu / mainnet / graph_bridge / blitz-net / resvg / reqwest / ureq");
 }

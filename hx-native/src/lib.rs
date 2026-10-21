@@ -21,6 +21,7 @@ mod paint;
 mod pending;
 mod select_ui;
 mod stylo_text_style;
+mod svg;
 mod text_edit;
 mod trigger;
 mod types;
@@ -39,6 +40,9 @@ pub use memory::{
     DOCUMENT_ESTIMATE_BASE_BYTES, DOCUMENT_ESTIMATE_PER_HTML_BYTE, RGBA_BYTES_PER_PIXEL,
 };
 pub use pending::PendingTimeout;
+pub use svg::{
+    svg_warm_up, svg_warm_up_done, SvgRejection, DATA_SVG_MAX_BYTES, FORBIDDEN_SVG_ELEMENTS,
+};
 pub use trigger::{FilterExpr, FromTarget, ParsedTrigger, TriggerEvent};
 pub use types::*;
 pub use worker::{

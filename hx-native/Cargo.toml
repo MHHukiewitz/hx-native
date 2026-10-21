@@ -21,7 +21,11 @@ default = []
 # Blitz HTML/CSS surface (pinned; no blitz-net; no wgpu in default features)
 blitz-dom = { version = "=0.3.0-beta.4", default-features = false, features = ["svg", "woff", "accessibility"] }
 blitz-html = { version = "=0.3.0-beta.4", default-features = false }
-blitz-paint = { version = "=0.3.0-beta.4", default-features = false }
+# `svg` (issue #23): paints inline `<svg>` and SVG images through anyrender_svg.
+# Nothing else: no blitz-net, no resvg. anyrender_svg's default image
+# decoders (png/gif/jpeg/webp) come with it and cannot be turned off from
+# here; hx-native never hands Blitz a raster image (see src/svg.rs).
+blitz-paint = { version = "=0.3.0-beta.4", default-features = false, features = ["svg"] }
 blitz-traits = { version = "=0.3.0-beta.4", default-features = false }
 
 # anyrender + vello_cpu path compatible with Blitz 0.3.0-beta.4 (anyrender ^0.14)
@@ -43,6 +47,14 @@ parley = { version = "0.12", default-features = false, features = ["std"] }
 # Bump this pin together with any Blitz bump that moves stylo — see the pin-
 # sensitivity list in `src/ellipsis.rs`.
 style = { package = "stylo", version = "=0.22.0" }
+# Already pulled by Blitz (issue #23): direct so fragment validation can parse
+# a `data:` SVG with an empty font database before it is ever swapped in.
+# Bump with any Blitz bump (BLITZ_PIN.md).
+usvg = { version = "=0.48.1", default-features = false }
+# Already pulled by Blitz/stylo (issue #23): decodes `data:` URLs for the
+# offline SVG provider.
+data-url = "=0.3.2"
+
 # Already pulled by Blitz/stylo; direct so we can clear ElementState::FOCUS for
 # caret blink-off paint without snapshot_node_and (Graph HOLD #19).
 style_dom = { package = "stylo_dom", version = "=0.22.0" }
