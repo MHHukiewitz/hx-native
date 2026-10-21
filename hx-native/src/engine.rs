@@ -2745,6 +2745,16 @@ impl LiveSurface {
                 }
             }
         }
+        // A new `step` alone changes what the box shows (the step's decimals,
+        // Designer lock, #49 round 2): step 1 -> 0.01 shows `4.00`, 0.01 -> 1
+        // shows `4.1`, even when the value did not move (Graph review of #49 r2).
+        if changed && is_number && !focused_number {
+            let before = editor_text(&mut self.doc, nid);
+            apply_unfocused_display(&mut self.doc, nid);
+            if editor_text(&mut self.doc, nid) != before {
+                self.queue_text_field_damage(nid);
+            }
+        }
         changed
     }
 
