@@ -807,6 +807,26 @@ mod tests {
     use super::*;
     use crate::form_args::NumericLimits;
 
+    /// Graph review of #49 r2: `step="any"` never pads, whatever `step`
+    /// value the limits carry (markup maps `any` to 1, the guard does not
+    /// rely on that).
+    #[test]
+    fn pad_to_step_leaves_step_any_alone() {
+        let any = NumericLimits {
+            min: None,
+            max: None,
+            step: 0.01,
+            unconstrained: true,
+        };
+        assert_eq!(pad_to_step("4.1", &any), "4.1");
+        let fee = NumericLimits {
+            unconstrained: false,
+            ..any
+        };
+        assert_eq!(pad_to_step("4.1", &fee), "4.10");
+        assert_eq!(pad_to_step("-4", &fee), "-4.00");
+    }
+
     #[test]
     fn groups_integer_and_keeps_fraction() {
         assert_eq!(format_grouped("180000"), "180,000");

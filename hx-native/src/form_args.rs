@@ -353,7 +353,13 @@ pub(crate) fn step_precise(current: f64, dir: i32, limits: &NumericLimits) -> f6
     // stepUp/stepDown with an off-grid max: it lands on the highest grid
     // value at or below `max` (max 99.996, step 0.01: 99.99). If that would
     // move the value against the arrow (already past it), nothing changes.
-    let grid_max = round_decimal(base + ((max - base) / step + 1e-7).floor() * step, decimals);
+    let mut grid_max = round_decimal(base + ((max - base) / step + 1e-7).floor() * step, decimals);
+    // The `1e-7` slack absorbs float error in the division, but a max within
+    // 1e-7 steps below a grid value (max 4.99999999, step 1) would round up
+    // past it: step back once (Graph review of #49 r2).
+    if grid_max > max {
+        grid_max = round_decimal(grid_max - step, decimals);
+    }
     let grid_max = if grid_max < min { min } else { grid_max };
     let next = round_decimal(base + n * step, decimals).clamp(min, grid_max);
     if (dir > 0 && next < current) || (dir < 0 && next > current) {
@@ -768,6 +774,35 @@ mod tests {
         // 0.14 + 1 is 1.1400000000000001 in f64.
         assert_eq!(super::step_precise(0.14, 1, &any), 1.14);
         assert_eq!(super::step_precise(1234567.89, 1, &any), 1234568.89);
+    }
+
+    /// Graph review of #49 r2: the `-0` guard and the off-grid max guard,
+    /// seen on the `f64` itself (the engine's formatter hides `-0`).
+    #[test]
+    fn step_precise_never_returns_negative_zero_or_passes_max() {
+        let lim = NumericLimits {
+            min: Some(-0.9),
+            max: None,
+            step: 0.3,
+            unconstrained: false,
+        };
+        let v = super::step_precise(-0.3, 1, &lim);
+        assert_eq!(v, 0.0);
+        assert!(v.is_sign_positive(), "-0.0 stored");
+        for (max, step, from, want) in [
+            (4.99999999, 1.0, 4.0, 4.0),
+            (99.9999999999, 0.01, 99.99, 99.99),
+            (0.3, 0.1, 0.2, 0.3),
+            (9.7, 1.0, 8.5, 9.5),
+        ] {
+            let lim = NumericLimits {
+                min: Some(if step == 1.0 && from == 8.5 { 0.5 } else { 0.0 }),
+                max: Some(max),
+                step,
+                unconstrained: false,
+            };
+            assert_eq!(super::step_precise(from, 1, &lim), want, "max {max}");
+        }
     }
 
     /// Blocker 2 (PR27 round 2): no `i64` cast, so values at/near the safe
