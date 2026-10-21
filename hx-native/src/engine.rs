@@ -20,7 +20,7 @@ use crate::error::EngineError;
 use crate::focus::{focusable_ids, ids_in_document_order, step_focus};
 use crate::fonts::{bundled_font_context, HostFonts};
 use crate::form_args::{
-    capture_applied_controls, capture_form_controls, clamp_snap_value, closest_form,
+    capture_applied_controls, capture_form_controls, clamp_snap_value, clamp_value, closest_form,
     collect_action_args, collect_applied_control_nids, format_numeric, is_number_input,
     is_numeric_input, parse_f64, set_range_value_from_x, step_numeric_value, write_value_attr,
     NumericLimits, MAX_SAFE_NUMBER,
@@ -42,7 +42,8 @@ use crate::text_edit::{
     delete_selection, editor_text, filter_number_insert, has_selection, insert_text, is_disabled,
     is_editable_input, move_end, move_home, move_left, move_right, place_caret_at,
     prepare_focus_display, resolve_step_target, select_all, selected_text, step_and_regroup,
-    step_direction, sync_value_from_editor, TextEditSession, CARET_BLINK_HALF_PERIOD,
+    step_direction, sync_value_from_editor, text_outside_selection, TextEditSession,
+    CARET_BLINK_HALF_PERIOD,
 };
 use crate::trigger::{
     filter_ctx_from_key, keydown_repeat_allowed, FilterCtx, FromTarget, TriggerEvent,
@@ -2401,7 +2402,14 @@ impl LiveSurface {
         let is_empty_number = is_number && value_attr.as_deref().unwrap_or("").trim().is_empty();
         if !is_empty_number {
             let current = value_attr.and_then(|s| parse_f64(&s)).unwrap_or(limits.min);
-            let clamped_s = format_numeric(clamp_snap_value(current, &clamp_limits));
+            // Number inputs hold typed values, which clamp to [min, max] but
+            // never snap to the step grid (issue #39); ranges keep the snap.
+            let clamped = if is_number {
+                clamp_value(current, &clamp_limits)
+            } else {
+                clamp_snap_value(current, &clamp_limits)
+            };
+            let clamped_s = format_numeric(clamped);
             if write_value_attr(&mut self.doc, nid, &clamped_s) {
                 changed = true;
                 let focused_here = self.text_edit.as_ref().is_some_and(|s| s.node_id == nid);
@@ -3428,7 +3436,10 @@ impl LiveSurface {
             return InputOutcome::None;
         }
         if is_number {
-            let existing = editor_text(&mut self.doc, nid).unwrap_or_default();
+            // Judge the insert against what survives the selection it
+            // replaces, not the old buffer (issue #38: pasting "3.45" over a
+            // selected "6.12" dropped the new '.').
+            let existing = text_outside_selection(&mut self.doc, nid).unwrap_or_default();
             let limits = self
                 .doc
                 .get_node(nid)

@@ -11,7 +11,7 @@ use blitz_html::HtmlDocument;
 
 use crate::damage::{snap_outward, IntRect};
 use crate::form_args::{
-    clamp_snap_value, format_numeric, is_number_input, is_text_input, numeric_limits, parse_f64,
+    clamp_value, format_numeric, is_number_input, is_text_input, numeric_limits, parse_f64,
     write_value_attr, NumericLimits,
 };
 
@@ -124,11 +124,9 @@ pub fn canonical_from_display(text: &str, limits: &NumericLimits, clamp: bool) -
     }
     match parse_f64(t) {
         Some(v) => {
-            let v = if clamp {
-                clamp_snap_value(v, limits)
-            } else {
-                v
-            };
+            // Typed commit clamps to [min, max] only; it never snaps to the
+            // step grid (Designer lock, issue #39). Arrows/spin still step.
+            let v = if clamp { clamp_value(v, limits) } else { v };
             format_numeric(v)
         }
         None => t.to_string(),
@@ -229,6 +227,25 @@ pub fn editor_text(doc: &mut HtmlDocument, nid: NodeId) -> Option<String> {
     let mut out = None;
     doc.with_text_input(nid, |driver| {
         out = Some(driver.editor.text().to_string());
+    });
+    out
+}
+
+/// The editor text as it will be once the current selection is replaced:
+/// the buffer with the selected range removed (the whole buffer when nothing
+/// is selected). Number filters must look at this, not the old buffer, so
+/// a paste that replaces a selection containing `.` (or a sign) is judged
+/// against what actually survives (issue #38).
+pub fn text_outside_selection(doc: &mut HtmlDocument, nid: NodeId) -> Option<String> {
+    let mut out = None;
+    doc.with_text_input(nid, |driver| {
+        let text = driver.editor.text().to_string();
+        let range = driver.editor.raw_selection().text_range();
+        let kept = match (text.get(..range.start), text.get(range.end..)) {
+            (Some(head), Some(tail)) if range.start <= range.end => format!("{head}{tail}"),
+            _ => text,
+        };
+        out = Some(kept);
     });
     out
 }

@@ -420,7 +420,18 @@ fn clamp_snap(value: f64, limits: &NumericLimits) -> f64 {
     clamp_safe_number(stepped.clamp(min, max))
 }
 
-/// Public clamp+snap for text-edit commit.
+/// Clamp to `[min, max]` with no step-grid snap. Used for typed number
+/// commits and for re-clamping number inputs when limits change: a typed
+/// `151234` with `step=1000` stays `151234` (issue #39).
+pub(crate) fn clamp_value(value: f64, limits: &NumericLimits) -> f64 {
+    let value = clamp_safe_number(value);
+    let min = limits.min.unwrap_or(-MAX_SAFE_NUMBER);
+    let max = limits.max.unwrap_or(MAX_SAFE_NUMBER);
+    let max = max.max(min);
+    clamp_safe_number(value.clamp(min, max))
+}
+
+/// Clamp + step-grid snap (range inputs).
 pub(crate) fn clamp_snap_value(value: f64, limits: &NumericLimits) -> f64 {
     clamp_snap(value, limits)
 }
