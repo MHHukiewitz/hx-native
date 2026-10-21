@@ -54,10 +54,13 @@ fn step_any_keeps_the_values_decimals_with_a_decimal_min() {
 fn arrow_to_zero_never_writes_negative_zero() {
     // -0.9 + 3 × 0.3 rounds to -0.0 in f64.
     let mut eng = boot(r#"min="-0.9" step="0.3""#, "-0.3");
+    // Designer lock (#49 round 2): stored and posted as the plain `0`; the
+    // box shows the step's decimals, `0.0`.
     assert_eq!(
         up(&mut eng, "ArrowUp"),
-        (Some("0.0".into()), Some("0.0".into()))
+        (Some("0".into()), Some("0".into()))
     );
+    assert_eq!(eng.test_editor_display("n").as_deref(), Some("0.0"));
     for (min, step) in [
         ("-1.8", "0.3"),
         ("-6.9", "0.3"),

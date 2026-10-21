@@ -83,8 +83,9 @@ pub fn grouping_enabled(node: &blitz_dom::node::Node) -> bool {
     attr(node, "data-hx-group").as_deref() == Some("on")
 }
 
-/// Show grouped text in every unfocused opt-in number input whose editor
-/// does not already show it. Returns the inputs that changed.
+/// Show the display text (step decimals, opt-in grouping) in every unfocused
+/// number input whose editor does not already show it. Returns the inputs
+/// that changed.
 pub fn apply_group_display_all(doc: &mut HtmlDocument, focused: Option<NodeId>) -> Vec<NodeId> {
     let root = doc.root_node().id;
     let mut changed = Vec::new();
@@ -95,10 +96,7 @@ pub fn apply_group_display_all(doc: &mut HtmlDocument, focused: Option<NodeId>) 
         let Some(node) = doc.get_node(nid) else {
             continue;
         };
-        if !grouping_enabled(node) {
-            continue;
-        }
-        let want = format_grouped(&attr(node, "value").unwrap_or_default());
+        let want = unfocused_display(node);
         match editor_text(doc, nid) {
             Some(shown) if shown != want => {
                 set_editor_text(doc, nid, &want);
@@ -565,13 +563,12 @@ pub fn sync_value_from_editor(
 
 /// Commit a number/text field: clamp number, write canonical value, set unfocused display.
 pub fn commit_field(doc: &mut HtmlDocument, nid: NodeId) -> bool {
-    let (is_number, group, prev_value, limits) = {
+    let (group, prev_value, limits) = {
         let Some(node) = doc.get_node(nid) else {
             return false;
         };
         let is_number = is_number_input(node);
         (
-            is_number,
             grouping_enabled(node),
             attr(node, "value").unwrap_or_else(|| "0".into()),
             if is_number {
@@ -593,10 +590,9 @@ pub fn commit_field(doc: &mut HtmlDocument, nid: NodeId) -> bool {
         display
     };
     let changed = write_value_attr(doc, nid, &canonical);
-    let shown = if is_number && group {
-        format_grouped(&canonical)
-    } else {
-        canonical.clone()
+    let shown = match limits {
+        Some(ref limits) => number_display(&canonical, limits, group),
+        None => canonical.clone(),
     };
     set_editor_text(doc, nid, &shown);
     changed
@@ -608,23 +604,88 @@ pub fn prepare_focus_display(doc: &mut HtmlDocument, nid: NodeId) {
         return;
     };
     let value = attr(node, "value").unwrap_or_default();
-    set_editor_text(doc, nid, &value);
+    // A focused number box shows the step's decimals too (never grouping).
+    let shown = if is_number_input(node) {
+        pad_to_step(&value, &numeric_limits(node))
+    } else {
+        value
+    };
+    set_editor_text(doc, nid, &shown);
     // Place caret at end so typed text appends.
     doc.with_text_input(nid, |mut driver| {
         driver.move_to_text_end();
     });
 }
 
-/// After load / blur styling: show grouped text for unfocused number inputs.
+/// After load / blur / clamp: show an unfocused number input's display text
+/// (the step's decimals, then opt-in grouping).
 pub fn apply_unfocused_display(doc: &mut HtmlDocument, nid: NodeId) {
     let Some(node) = doc.get_node(nid) else {
         return;
     };
-    if !grouping_enabled(node) {
+    if !is_number_input(node) {
         return;
     }
+    let want = unfocused_display(node);
+    if editor_text(doc, nid).as_deref() != Some(want.as_str()) {
+        set_editor_text(doc, nid, &want);
+    }
+}
+
+/// What an unfocused number input shows for its `value`: the step's decimal
+/// places, then `,` grouping when opted in.
+pub fn unfocused_display(node: &blitz_dom::node::Node) -> String {
     let value = attr(node, "value").unwrap_or_default();
-    set_editor_text(doc, nid, &format_grouped(&value));
+    number_display(&value, &numeric_limits(node), grouping_enabled(node))
+}
+
+/// The step's decimals, then grouping when `group` is set.
+pub fn number_display(canonical: &str, limits: &NumericLimits, group: bool) -> String {
+    let padded = pad_to_step(canonical, limits);
+    if group {
+        format_grouped(&padded)
+    } else {
+        padded
+    }
+}
+
+/// Designer lock (Floor, 2026-10-21; Designer's HTML_CONTRACT): a number box
+/// always shows the grid's decimal places (those of `step` and `min`), so the
+/// fee box (`step="0.01"`) shows `4.10` and `100.00`, never `4.1` / `100`.
+/// The `value` attribute and action args keep the plain number (`4.1`).
+/// `step="any"` has no grid and keeps the value's own decimals. Pure string
+/// padding (zeros appended), so no float maths and no noise; a value with
+/// more decimals than the grid, or anything that is not a plain decimal
+/// (`1e5`, empty), is shown as written.
+pub fn pad_to_step(canonical: &str, limits: &NumericLimits) -> String {
+    if limits.unconstrained {
+        return canonical.to_string();
+    }
+    let want = crate::form_args::result_decimals(limits, 0.0);
+    if want == 0 {
+        return canonical.to_string();
+    }
+    let body = canonical.strip_prefix('-').unwrap_or(canonical);
+    let (int, frac) = match body.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (body, None),
+    };
+    let plain = !int.is_empty()
+        && int.chars().all(|c| c.is_ascii_digit())
+        && frac.is_none_or(|f| f.chars().all(|c| c.is_ascii_digit()));
+    if !plain {
+        return canonical.to_string();
+    }
+    let have = frac.map_or(0, str::len);
+    if have >= want {
+        return canonical.to_string();
+    }
+    let mut out = canonical.to_string();
+    if frac.is_none() {
+        out.push('.');
+    }
+    out.extend(std::iter::repeat_n('0', want - have));
+    out
 }
 
 pub fn is_editable_input(node: &blitz_dom::node::Node) -> bool {
@@ -721,7 +782,7 @@ fn number_inputs_under(doc: &HtmlDocument, root: NodeId) -> Vec<(NodeId, Option<
 
 /// Step a number input by `dir`, write canonical value, regroup display if enabled.
 pub fn step_and_regroup(doc: &mut HtmlDocument, nid: NodeId, dir: i32) -> bool {
-    use crate::form_args::{format_numeric_for_step, step_precise};
+    use crate::form_args::step_precise;
 
     let Some(node) = doc.get_node(nid) else {
         return false;
@@ -735,14 +796,9 @@ pub fn step_and_regroup(doc: &mut HtmlDocument, nid: NodeId, dir: i32) -> bool {
         .and_then(|s| parse_f64(&s))
         .unwrap_or(limits.min.unwrap_or(0.0));
     let next = step_precise(current, dir, &limits);
-    let canonical = format_numeric_for_step(next, &limits);
+    let canonical = format_numeric(next);
     let changed = write_value_attr(doc, nid, &canonical);
-    let shown = if group {
-        format_grouped(&canonical)
-    } else {
-        canonical.clone()
-    };
-    set_editor_text(doc, nid, &shown);
+    set_editor_text(doc, nid, &number_display(&canonical, &limits, group));
     changed
 }
 

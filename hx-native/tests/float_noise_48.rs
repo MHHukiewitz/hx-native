@@ -94,13 +94,14 @@ fn fee_box_typed_4_10_stores_exactly_4_1_and_shows_it_clean() {
         assert_eq!(stored.parse::<f64>().unwrap(), 4.1);
         assert_eq!(arg(&out, "fee"), Some("4.1"), "args{group}");
         let _ = key(&mut eng, "Tab", false);
-        assert_eq!(eng.test_editor_display("fee").as_deref(), Some("4.1"));
-        // Arrows keep the step's precision (current rules): 4.09 → 4.10.
+        // Designer lock (#49 round 2): the box shows the step's decimals.
+        assert_eq!(eng.test_editor_display("fee").as_deref(), Some("4.10"));
+        // Arrows store the plain number too (4.09 ↑ → 4.1) and show 4.10.
         let _ = type_commit(&mut eng, "fee", "4.09");
         let _ = key(&mut eng, "ArrowUp", false);
         let stepped = eng.attr("fee", "value").unwrap();
-        assert_eq!(stepped, "4.10", "arrow step keeps step precision{group}");
-        assert_eq!(stepped.parse::<f64>().unwrap(), 4.1);
+        assert_eq!(stepped, "4.1", "arrow step stores the plain number{group}");
+        assert_eq!(eng.test_editor_display("fee").as_deref(), Some("4.10"));
     }
 }
 
@@ -163,7 +164,8 @@ fn large_values_step_clean_by_0_01_both_ways() {
     let _ = key(&mut eng, "ArrowUp", false);
     assert_eq!(eng.attr("s", "value").as_deref(), Some("1234567.89"));
     let _ = key(&mut eng, "ArrowUp", false);
-    assert_eq!(eng.attr("s", "value").as_deref(), Some("1234567.90"));
+    assert_eq!(eng.attr("s", "value").as_deref(), Some("1234567.9"));
+    assert_eq!(eng.test_editor_display("s").as_deref(), Some("1234567.90"));
     let _ = key(&mut eng, "ArrowDown", false);
     assert_eq!(eng.attr("s", "value").as_deref(), Some("1234567.89"));
     let _ = key(&mut eng, "Tab", false);
@@ -356,7 +358,7 @@ fn arrow_results_are_clean_end_to_end() {
     assert_eq!(arrow(&mut eng, "n", "n", "ArrowUp"), s("524288.16"));
     // Arrows on the fee box over many steps stay on the 2-place grid.
     let mut eng = num_box(r#"min="0" max="100.00" step="0.01""#, "4.05");
-    for want in ["4.06", "4.07", "4.08", "4.09", "4.10", "4.11"] {
+    for want in ["4.06", "4.07", "4.08", "4.09", "4.1", "4.11"] {
         assert_eq!(arrow(&mut eng, "n", "n", "ArrowUp").0, v(want));
     }
 }

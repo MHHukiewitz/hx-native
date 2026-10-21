@@ -2596,7 +2596,10 @@ html,body{margin:0}
             eng.complete(request, Ok(()));
         }
     }
-    assert_eq!(eng.attr("fee", "value").as_deref(), Some("5.00"));
+    // Designer lock (#49 round 2): `value` is the plain number, the box
+    // shows the step's decimals.
+    assert_eq!(eng.attr("fee", "value").as_deref(), Some("5"));
+    assert_eq!(eng.test_editor_display("fee").as_deref(), Some("5.00"));
     // Down steps back
     if let InputOutcome::Action { request, .. } = click(&mut eng, 100.0, 18.0) {
         eng.complete(request, Ok(()));

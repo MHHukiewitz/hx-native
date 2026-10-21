@@ -253,7 +253,7 @@ pub fn step_numeric_value(doc: &mut HtmlDocument, id: &str, dir: i32) -> bool {
         .and_then(|s| parse_f64(&s))
         .unwrap_or(limits.min.unwrap_or(0.0));
     let next = step_precise(current, dir, &limits);
-    write_value_attr(doc, nid, &format_numeric_for_step(next, &limits))
+    write_value_attr(doc, nid, &format_numeric(next))
 }
 
 fn clamp_safe_number(v: f64) -> f64 {
@@ -377,28 +377,6 @@ pub(crate) fn step_decimal_places(step: f64) -> usize {
         return 0;
     }
     decimals_of(step)
-}
-
-/// Arrow / spin results keep the grid's precision ("2.20" with step 0.01).
-pub(crate) fn format_numeric_for_step(v: f64, limits: &NumericLimits) -> String {
-    // `step="any"` has no grid precision to keep: a decimal `min` must not
-    // cut the result to min's decimals (Graph review of #49: min="0.5"
-    // step="any" from 0.75 wrote "1.8", not "1.75").
-    if limits.unconstrained {
-        return format_numeric(v);
-    }
-    let v = no_negative_zero(v);
-    // Grid decimals ("2.20" with step 0.01), or more when the value is an
-    // off-grid one an arrow left alone (typed 99.996 under max 99.996 stays
-    // "99.996", never "100.00"; #49 round 2).
-    let decimals = result_decimals(limits, 0.0).max(decimals_of(v));
-    if decimals == 0 {
-        return format_numeric(v);
-    }
-    let s = format!("{v:.decimals$}");
-    // Trim only trailing zeros beyond the step's natural decimals? Keep step precision.
-    // "2.20" with step 0.01 stays "2.20"; "2.00" → "2.00" is fine for fee displays.
-    s
 }
 
 /// Set a range control's value from pointer `x` (document coordinates).
@@ -778,7 +756,7 @@ mod tests {
             unconstrained: false,
         };
         assert_eq!(format_numeric(clamp_snap(0.016, &off)), "0.015");
-        assert_eq!(super::format_numeric_for_step(0.015, &off), "0.015");
+        assert_eq!(format_numeric(super::step_precise(0.005, 1, &off)), "0.015");
         // step="any": the operand's own decimals survive the step.
         let any = NumericLimits {
             min: None,
