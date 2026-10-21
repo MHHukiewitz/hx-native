@@ -119,7 +119,9 @@ pub fn parse_number_display(text: &str) -> Option<f64> {
 pub fn canonical_from_display(text: &str, limits: &NumericLimits, clamp: bool) -> String {
     let stripped: String = text.chars().filter(|c| *c != ',').collect();
     let t = stripped.trim();
-    if t.is_empty() || t == "-" || t == "+" {
+    // A bare point or sign is no number: commit keeps the old value instead
+    // of storing "." (reachable in whole-number boxes since round 2).
+    if t.is_empty() || t == "-" || t == "+" || t == "." || t == "-." || t == "+." {
         return String::new();
     }
     match parse_f64(t) {
@@ -279,12 +281,38 @@ pub fn paste_ignore_chars(node: &blitz_dom::node::Node) -> String {
 /// A pasted number as it would be inserted: characters listed in
 /// `data-hx-paste-ignore` removed (nothing else is cleaned up, no trimming),
 /// then grouping commas dropped exactly as typed `,` is (accepted, never
-/// stored while focused).
-pub fn clean_number_paste(paste: &str, ignore: &str) -> String {
-    paste
+/// stored while focused). `None` when a comma is not thousands grouping
+/// ("3,5", "1,2,3", "12,34"): dropping it would commit a different number
+/// (35, 123, 1234), so the paste is refused (Graph review of #41 round 2).
+pub fn clean_number_paste(paste: &str, ignore: &str) -> Option<String> {
+    // ',' is judged as grouping even when listed: listing it means "allow
+    // grouping commas", not "glue any digits together".
+    let kept: String = paste
         .chars()
-        .filter(|c| !ignore.contains(*c) && *c != ',')
-        .collect()
+        .filter(|c| *c == ',' || !ignore.contains(*c))
+        .collect();
+    if !commas_are_grouping(&kept) {
+        return None;
+    }
+    Some(kept.chars().filter(|c| *c != ',').collect())
+}
+
+/// Commas only between thousands groups of the whole part: "1,234",
+/// "-151,234.5". No comma at all is fine.
+fn commas_are_grouping(s: &str) -> bool {
+    if !s.contains(',') {
+        return true;
+    }
+    let body = s.strip_prefix(['-', '+']).unwrap_or(s);
+    let (whole, frac) = body.split_once('.').unwrap_or((body, ""));
+    if frac.contains(',') {
+        return false;
+    }
+    let mut groups = whole.split(',');
+    let first = groups.next().unwrap_or("");
+    (1..=3).contains(&first.len())
+        && first.chars().all(|c| c.is_ascii_digit())
+        && groups.all(|g| g.len() == 3 && g.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// Whether `text` (commas ignored) is a number the typing rules could have
