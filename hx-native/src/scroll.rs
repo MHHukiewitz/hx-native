@@ -226,7 +226,12 @@ pub(crate) fn intersect(a: ControlRect, b: ControlRect) -> ControlRect {
 /// instead, so an invisible row never takes a click.
 pub(crate) fn visible_element_from_point(doc: &HtmlDocument, x: f32, y: f32) -> Option<NodeId> {
     let hit = doc.element_from_point(x, y)?;
-    if !clipped_at(doc, hit, x, y) {
+    // Blitz can also return a scroll container itself for a point in its
+    // scrolled-away content area (outside its own box) where no child is.
+    let self_outside = is_scroll_container(doc, hit)
+        && element_border_box_css(doc, hit)
+            .is_some_and(|(bx, by, bw, bh)| !(x >= bx && y >= by && x < bx + bw && y < by + bh));
+    if !self_outside && !clipped_at(doc, hit, x, y) {
         return Some(hit);
     }
     // Blitz returned scrolled-away content. Find the last element in document
@@ -420,7 +425,7 @@ pub(crate) fn bar_hit(doc: &HtmlDocument, x: f32, y: f32) -> Option<(BarGeom, Ba
 /// Whether the topmost element at `(x, y)` is `nid` or inside it, i.e. no
 /// later-painted element (a dialog, a tooltip) covers the bar there.
 pub(crate) fn bar_unoccluded(doc: &HtmlDocument, nid: NodeId, x: f32, y: f32) -> bool {
-    let Some(mut cur) = doc.element_from_point(x, y) else {
+    let Some(mut cur) = visible_element_from_point(doc, x, y) else {
         return true;
     };
     loop {
