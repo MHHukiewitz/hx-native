@@ -5000,7 +5000,11 @@ impl LiveSurface {
             }
         };
 
-        self.paint_dirty = false;
+        // #34 round 5: a gutter chain longer than the per-frame pass cap
+        // left a reserve follow-up (`resolve_and_plan_damage` moved it into
+        // `needs_resolve`); keep the surface dirty so the next paint finishes
+        // it without waiting for input.
+        self.paint_dirty = self.needs_resolve;
         self.force_full_repaint = false;
         self.cached_rgba = Some(rgba);
         Ok(RenderResult {

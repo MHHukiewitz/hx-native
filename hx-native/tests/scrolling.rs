@@ -1258,3 +1258,117 @@ fn dialog_over_a_scrollbar_takes_the_click() {
     let _ = eng.input(up(x, 100.0));
     assert!(top(&eng, "box") > 0.0);
 }
+
+// ---------------------------------------------------------------------------
+// Round 5 (Graph re-check of 553e145, comment 6322331600).
+
+/// Graph's r4a: two lists stacked on one surface, the lower one scrolled so
+/// its hidden rows sit in its scrolled-away content area over the upper
+/// list's bar strip. Blitz returns the lower scroller itself there; a press
+/// on the upper bar must page the upper list, never press / click the
+/// lower one (patch 06: a scroll-container hit outside its own border box
+/// counts as clipped, and occlusion uses the visible hit).
+#[test]
+fn a_lower_scrolled_list_never_takes_a_press_on_the_upper_lists_bar() {
+    let html = gpage(
+        "#a{top:10px;height:100px;width:200px} #b{top:120px;height:100px;width:200px}",
+        &format!(
+            r#"<div id="a" class="sc">{}</div><div id="b" class="sc">{}</div>"#,
+            rows("a", 30),
+            rows("b", 30)
+        ),
+    );
+    let mut eng = boot_with(&html, small_vp());
+    let _ = eng.input(wheel(100.0, 170.0, -300.0, WheelUnit::Pixel));
+    let _ = frame(&mut eng, small_vp());
+    let b_top = top(&eng, "b");
+    assert!(b_top >= 200.0, "lower list scrolled");
+    let bar = eng.test_scrollbar("a").expect("bar a").2;
+    let (x, y) = (bar.0 + 8.0, 80.0);
+    let d = eng.input(down(x, y));
+    assert_eq!(d, scrolled("a"), "the upper bar takes the press");
+    assert_eq!(top(&eng, "a"), 80.0, "one page of the upper list");
+    let u = eng.input(up(x, y));
+    assert_eq!(u, InputOutcome::None, "a bar press never clicks");
+    assert_eq!(top(&eng, "b"), b_top, "lower list untouched");
+}
+
+/// Graph's r4f: the clipped-hit fallback skips a later `pointer-events:none`
+/// decoration over a header, so the header still takes the click.
+#[test]
+fn clipped_hit_fallback_skips_a_pointer_events_none_decoration() {
+    let html = gpage(
+        "#box{top:40px;height:120px;width:180px}",
+        &format!(
+            r#"<button id="above" hx-post="act.do" hx-trigger="click" style="position:absolute;left:10px;top:0;width:180px;height:30px">Above</button><div id="box" class="sc">{}</div><div id="deco" style="position:absolute;left:10px;top:0;width:180px;height:30px;pointer-events:none"></div>"#,
+            rows("b", 30)
+        ),
+    );
+    let mut eng = boot_with(&html, small_vp());
+    let _ = eng.input(wheel(100.0, 100.0, -200.0, WheelUnit::Pixel));
+    let _ = frame(&mut eng, small_vp());
+    let out = click(&mut eng, 100.0, 15.0);
+    assert_eq!(act(&out), Some("act.do"), "{out:?}");
+    assert!(
+        matches!(&out, InputOutcome::Action { source_id, .. } if source_id == "above"),
+        "{out:?}"
+    );
+}
+
+/// Graph's r4e: a chain of six gutters (outer + five nested second-order
+/// ones) is longer than the per-frame cap of 3 extra passes. Frame 1 stays
+/// bounded; the follow-up keeps the surface dirty, so later paints finish
+/// the chain with no input at all, then the surface settles.
+#[test]
+fn a_gutter_chain_beyond_the_pass_cap_finishes_on_later_paints_without_input() {
+    let lvl = |w: u32| -> String {
+        (0..2)
+            .map(|_| format!(r#"<div style="width:{w}px;height:20px;background:#88f"></div>"#))
+            .collect()
+    };
+    let ws = [100, 92, 84, 76, 68];
+    let mut inner = String::new();
+    for (k, w) in ws.iter().enumerate().rev() {
+        let h = 20 * (5 - k as u32);
+        inner = format!(
+            r#"<div id="i{k}" style="height:{h}px;overflow-y:auto"><div style="display:flex;flex-wrap:wrap">{}</div>{inner}</div>"#,
+            lvl(*w)
+        );
+    }
+    let html = gpage(
+        "#outer{height:100px}",
+        &format!(r#"<div id="outer" class="sc">{inner}<div style="height:300px">tail</div></div>"#),
+    );
+    let mut eng = Engine::new(cfg());
+    eng.declare_actions(ACTIONS);
+    eng.load_html(&html).unwrap();
+    let p0 = eng.style_layout_pass_count();
+    let o1 = eng.paint(small_vp()).unwrap();
+    assert!(!o1.skipped);
+    let f1 = eng.style_layout_pass_count() - p0;
+    assert!(f1 <= 4, "frame 1 bounded: {f1} passes");
+    assert!(
+        content_w(&eng, "i4") > 104.0,
+        "the chain is longer than one frame's cap"
+    );
+    // No input from here on: the pending follow-up alone drives the paints.
+    let mut frames = 0;
+    while !eng.paint(small_vp()).unwrap().skipped {
+        frames += 1;
+        assert!(frames <= 4, "settles");
+    }
+    assert!(frames >= 1, "a follow-up frame ran without input");
+    let widths: Vec<f32> = (0..5).map(|k| content_w(&eng, &format!("i{k}"))).collect();
+    assert_eq!(content_w(&eng, "outer"), 184.0);
+    assert_eq!(
+        widths,
+        vec![168.0, 152.0, 136.0, 120.0, 104.0],
+        "all six gutters"
+    );
+    let p1 = eng.style_layout_pass_count();
+    assert!(eng.paint(small_vp()).unwrap().skipped);
+    assert_eq!(eng.style_layout_pass_count(), p1, "idle once settled");
+    let part = eng.last_frame().unwrap().clone();
+    let full = full_frame(&mut eng, small_vp());
+    assert_eq!(part.pixels, full.pixels, "partial == full after the chain");
+}
