@@ -3881,6 +3881,11 @@ impl LiveSurface {
             _ => session.value_at_focus.clone(),
         };
         let _ = crate::form_args::write_value_attr(&mut self.doc, session.node_id, &restored);
+        // The value attribute may already hold the restored value (a refused
+        // comma text such as "3,5" never reached it, #51), in which case the
+        // write above leaves the editor alone: rewrite it so the typed text
+        // does not stay on screen after Esc.
+        crate::text_edit::set_editor_text(&mut self.doc, session.node_id, &restored);
         apply_unfocused_display(&mut self.doc, session.node_id);
         self.doc.clear_focus();
         self.focus.focused_id = None;

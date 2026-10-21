@@ -303,6 +303,11 @@ fn enter_blur_esc_and_body_shortcut_all_apply_the_comma_check() {
     let mut e = form_typed("3,5");
     let _ = key(&mut e, "Escape", false);
     assert_eq!(val(&e, "u"), "950000", "Esc");
+    assert_eq!(
+        disp(&mut e, "u"),
+        "950000",
+        "Esc also clears the typed text"
+    );
     // from:body posts the value the commit would keep; the box keeps its text.
     let mut e = form_typed("3,5");
     let out = key(&mut e, "F2", false);
