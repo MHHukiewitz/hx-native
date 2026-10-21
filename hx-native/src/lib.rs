@@ -19,6 +19,7 @@ mod form_controls;
 mod memory;
 mod paint;
 mod pending;
+mod scroll;
 mod select_ui;
 mod stylo_text_style;
 mod text_edit;
