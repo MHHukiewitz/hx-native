@@ -108,9 +108,22 @@ fn host_family_differs_and_unknown_family_falls_back_to_dejavu() {
         "a registered host family must change the pixels"
     );
 
+    // Fixed expectation first (Graph review of #30): comparing two engines
+    // alone would pass when both lose the fallback (both paint nothing).
+    let named_dejavu = paint_with(
+        fonts(),
+        &format!("<p style=\"font-family:'DejaVu Sans'\">{text}</p>"),
+    );
+    assert!(ink(&named_dejavu) > 0, "bundled DejaVu must paint ink");
     for family in ["'MS Sans Serif'", "sans-serif"] {
         let body = format!("<p style=\"font-family:{family}\">{text}</p>");
         let with_host = paint_with(fonts(), &body);
+        assert!(ink(&with_host) > 0, "{family} must paint ink");
+        assert_eq!(
+            diff(&with_host, &named_dejavu),
+            0,
+            "{family} must paint the bundled DejaVu face"
+        );
         let without = paint_with(Vec::new(), &body);
         assert_eq!(
             diff(&with_host, &without),
@@ -300,4 +313,63 @@ fn ellipsis_truncation_uses_the_host_face() {
         ink(&host_ellipsis) > ink(&dejavu_ellipsis),
         "the bold host face must paint heavier truncated text"
     );
+}
+
+/// Crate-owner decision (Graph review of #30): a host face that ties with
+/// the bundled "DejaVu Sans" 400 normal is rejected (the bundled face counts
+/// as an earlier entry in the duplicate check); the same family at another
+/// weight or style is allowed and becomes, e.g., the real bold.
+#[test]
+fn host_face_tying_with_bundled_dejavu_is_rejected() {
+    for family in ["DejaVu Sans", "dejavu sans", "  DEJAVU SANS "] {
+        match invalid(vec![face(family, 400, BOLD)]) {
+            EngineError::InvalidFont { index, reason, .. } => {
+                assert_eq!(index, 0);
+                assert!(reason.contains("bundled"), "{family:?}: {reason}");
+            }
+            other => panic!("{family:?}: expected InvalidFont, got {other:?}"),
+        }
+    }
+    assert!(Engine::try_new(cfg(vec![face("DejaVu Sans", 700, BOLD)])).is_ok());
+    assert!(Engine::try_new(cfg(vec![FontFace::new(
+        "DejaVu Sans",
+        400,
+        FontStyle::Italic,
+        Arc::<[u8]>::from(REGULAR),
+    )]))
+    .is_ok());
+}
+
+/// Build a two-face TrueType collection (`ttcf`) whose faces both point at
+/// one copy of `ttf`'s table directory (table offsets shifted past the
+/// collection header).
+fn two_face_ttc(ttf: &[u8]) -> Vec<u8> {
+    const HEADER: u32 = 4 + 4 + 4 + 2 * 4;
+    let mut body = ttf.to_vec();
+    let num_tables = u16::from_be_bytes([body[4], body[5]]) as usize;
+    for i in 0..num_tables {
+        let at = 12 + 16 * i + 8;
+        let off = u32::from_be_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]);
+        body[at..at + 4].copy_from_slice(&(off + HEADER).to_be_bytes());
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(b"ttcf");
+    out.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+    out.extend_from_slice(&2u32.to_be_bytes());
+    out.extend_from_slice(&HEADER.to_be_bytes());
+    out.extend_from_slice(&HEADER.to_be_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+/// Only single-face files are accepted: a font collection gives InvalidFont.
+#[test]
+fn font_collections_are_rejected() {
+    let ttc: Arc<[u8]> = Arc::from(two_face_ttc(REGULAR));
+    match invalid(vec![FontFace::new("Host", 400, FontStyle::Normal, ttc)]) {
+        EngineError::InvalidFont { reason, .. } => {
+            assert!(reason.contains("collection"), "{reason}")
+        }
+        other => panic!("expected InvalidFont, got {other:?}"),
+    }
 }

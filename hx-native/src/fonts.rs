@@ -8,6 +8,7 @@
 //! `FontFaceOverrides`: `Collection::register_fonts` with a
 //! `FontInfoOverride` carrying the host's family, weight and style.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 
@@ -21,6 +22,14 @@ use crate::types::{FontFace, FontStyle};
 
 /// DejaVu Sans (bundled). License: see `assets/fonts/LICENSE-DejaVu.txt`.
 pub const FONT_REGULAR: &[u8] = include_bytes!("../../assets/fonts/DejaVuSans.ttf");
+
+/// Family, weight and style of the bundled face as fontique registers it.
+/// It counts as an implicit entry in the host duplicate check (issue #28,
+/// crate-owner decision): a host face that ties with it would be silently
+/// shadowed (fontique keeps the first face registered), so it is rejected.
+pub(crate) const BUNDLED_FAMILY: &str = "DejaVu Sans";
+pub(crate) const BUNDLED_WEIGHT: u16 = 400;
+pub(crate) const BUNDLED_STYLE: FontStyle = FontStyle::Normal;
 
 /// One decoded DejaVu face shared across all ellipsis shapers / documents.
 fn decoded_font_bytes() -> Arc<Vec<u8>> {
@@ -82,8 +91,19 @@ pub(crate) struct HostFonts {
 impl HostFonts {
     /// Validate and decode `faces` in order. Never panics: every rejection is
     /// an [`EngineError::InvalidFont`] naming the entry.
+    ///
+    /// The byte check probe-registers the face with fontique, so it
+    /// validates the tables fontique reads to register a face (the font
+    /// header, names, weight/style metadata) but **not glyph outlines**: a
+    /// file with a corrupt `glyf`/`CFF` table passes and paints missing
+    /// glyphs. Only single-face files are accepted; a collection (`.ttc` /
+    /// `.otc`) or any file fontique reads as more than one face is rejected,
+    /// because one host family/weight/style override would apply to all of
+    /// its faces.
     pub(crate) fn build(faces: &[FontFace]) -> Result<Arc<Self>, EngineError> {
         let mut seen: HashSet<(String, u16, FontStyle)> = HashSet::new();
+        // The bundled face is an implicit earlier entry (see BUNDLED_FAMILY).
+        seen.insert((BUNDLED_FAMILY.to_lowercase(), BUNDLED_WEIGHT, BUNDLED_STYLE));
         let mut out = Vec::with_capacity(faces.len());
         for (index, f) in faces.iter().enumerate() {
             let fail = |reason: &str| EngineError::InvalidFont {
@@ -98,17 +118,28 @@ impl HostFonts {
             if !(1..=1000).contains(&f.weight) {
                 return Err(fail("weight must be in 1..=1000"));
             }
-            if !seen.insert((family.to_lowercase(), f.weight, f.style)) {
-                return Err(fail(
-                    "duplicate of an earlier face (same family, case-insensitive, weight and style)",
-                ));
+            let key = (family.to_lowercase(), f.weight, f.style);
+            let is_bundled = key == (BUNDLED_FAMILY.to_lowercase(), BUNDLED_WEIGHT, BUNDLED_STYLE);
+            if !seen.insert(key) {
+                return Err(fail(if is_bundled {
+                    "ties with the bundled DejaVu Sans 400 normal face, which it would never \
+                     replace; register DejaVu Sans only at another weight or style"
+                } else {
+                    "duplicate of an earlier face (same family, case-insensitive, weight and style)"
+                }));
             }
-            let decoded = decode_font_bytes(&f.bytes).into_owned();
+            // TTF/OTF bytes are used as they are: the Blob shares the host's
+            // `Arc<[u8]>` (no copy). Only WOFF/WOFF2 are decompressed, once
+            // per engine.
+            let blob = match decode_font_bytes(&f.bytes) {
+                Cow::Borrowed(_) => Blob::new(Arc::new(Arc::clone(&f.bytes)) as Arc<_>),
+                Cow::Owned(decoded) => Blob::new(Arc::new(decoded) as Arc<_>),
+            };
             let face = HostFace {
                 family: family.to_string(),
                 weight: f.weight,
                 style: f.style,
-                blob: Blob::new(Arc::new(decoded) as Arc<_>),
+                blob,
             };
             // Probe-register into a scratch collection: fontique returns no
             // families for bytes it cannot read (garbage, a WOFF/WOFF2 that
@@ -118,8 +149,15 @@ impl HostFonts {
                 system_fonts: false,
             });
             let registered = probe.register_fonts(face.blob.clone(), Some(face.info_override()));
-            if registered.iter().all(|(_, infos)| infos.is_empty()) {
+            let face_count: usize = registered.iter().map(|(_, infos)| infos.len()).sum();
+            if face_count == 0 {
                 return Err(fail("bytes are not a readable TTF/OTF/WOFF/WOFF2 font"));
+            }
+            if face_count > 1 {
+                return Err(fail(
+                    "font collections (.ttc/.otc) and other multi-face files are not supported; \
+                     pass one single-face file per FontFace",
+                ));
             }
             out.push(face);
         }
@@ -157,4 +195,42 @@ pub(crate) fn bundled_font_context(host: &HostFonts) -> FontContext {
             .register_fonts(face.blob.clone(), Some(face.info_override()));
     }
     ctx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bundled-face constants used by the duplicate check must match
+    /// what fontique reads from the bundled file.
+    #[test]
+    fn bundled_face_constants_match_the_bundled_file() {
+        let mut c = Collection::new(CollectionOptions {
+            shared: false,
+            system_fonts: false,
+        });
+        let reg = c.register_fonts(shared_font_blob(), None);
+        assert_eq!(reg.len(), 1);
+        let (id, infos) = &reg[0];
+        assert_eq!(c.family_name(*id), Some(BUNDLED_FAMILY));
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].weight().value(), BUNDLED_WEIGHT as f32);
+        assert_eq!(infos[0].style(), parley::fontique::FontStyle::Normal);
+        assert_eq!(BUNDLED_STYLE, FontStyle::Normal);
+    }
+
+    /// A plain TTF is not copied: the face's Blob reads the host's
+    /// `Arc<[u8]>` allocation (Graph review of #30).
+    #[test]
+    fn plain_ttf_bytes_are_shared_not_copied() {
+        let bytes: Arc<[u8]> = Arc::from(FONT_REGULAR);
+        let fonts = HostFonts::build(&[FontFace::new(
+            "Shared Host",
+            400,
+            FontStyle::Normal,
+            Arc::clone(&bytes),
+        )])
+        .expect("valid face");
+        assert_eq!(fonts.faces[0].blob.data().as_ptr(), bytes.as_ptr());
+    }
 }

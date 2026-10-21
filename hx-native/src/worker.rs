@@ -945,12 +945,6 @@ const _: () = {
 };
 
 impl PaintWorker {
-    /// Spawn a worker thread that creates and owns the [`Engine`].
-    ///
-    /// Returns as soon as the thread is started; the [`Engine`] is created on
-    /// the worker. Setup that follows ([`Self::declare_actions`],
-    /// [`Self::open_surface`], [`Self::load_html`], …) is fire-and-forget —
-    /// check [`Self::poll_error`] after setup or call [`Self::flush`] once.
     /// Like [`PaintWorker::spawn`], but validates [`EngineConfig::fonts`]
     /// (issue #28) on the calling thread first and returns
     /// [`EngineError::InvalidFont`] instead of starting a worker. The
@@ -961,9 +955,16 @@ impl PaintWorker {
         Ok(Self::spawn_inner(config, Some(fonts)))
     }
 
-    /// Spawn the paint thread. With invalid [`EngineConfig::fonts`] the
-    /// worker's engine reports [`EngineError::InvalidFont`] from the first
-    /// `load_html` / `open_surface` (as a `WorkerError::Engine`); use
+    /// Spawn a worker thread that creates and owns the [`Engine`].
+    ///
+    /// Returns as soon as the thread is started; the [`Engine`] is created on
+    /// the worker. Setup that follows ([`Self::declare_actions`],
+    /// [`Self::open_surface`], [`Self::load_html`], …) is fire-and-forget —
+    /// check [`Self::poll_error`] after setup or call [`Self::flush`] once.
+    ///
+    /// With invalid [`EngineConfig::fonts`] (issue #28) the worker's engine
+    /// reports [`EngineError::InvalidFont`] from the first `load_html` /
+    /// `open_surface` (as a `WorkerError::Engine`); use
     /// [`PaintWorker::try_spawn`] to get it up front.
     pub fn spawn(config: EngineConfig) -> Self {
         Self::spawn_inner(config, None)

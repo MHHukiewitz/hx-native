@@ -56,9 +56,11 @@ pub enum FontStyle {
 
 /// One host-supplied font face (issue #28), registered under `family`,
 /// `weight` and `style` regardless of the names inside the font file.
-/// `bytes` is a TTF, OTF, WOFF or WOFF2 file; `Arc<[u8]>` lets a host share
-/// one `include_bytes!` buffer (`Arc::from(BYTES as &[u8])`) or bytes loaded
-/// at runtime across engines without copying.
+/// `bytes` is one single-face TTF, OTF, WOFF or WOFF2 file (collections such
+/// as `.ttc` are rejected). `Arc<[u8]>` lets a host share one buffer
+/// (`Arc::from(BYTES as &[u8])` once at startup, or bytes loaded at runtime)
+/// across engines: for TTF/OTF every engine uses that same allocation, no
+/// copy; a WOFF/WOFF2 is decompressed once per engine at build time.
 ///
 /// `#[non_exhaustive]`: build one with [`FontFace::new`].
 #[non_exhaustive]
