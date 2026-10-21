@@ -4,6 +4,39 @@
 
 **Status:** requirements locked 2026-10-19 ([docs/REQUIREMENTS.md](docs/REQUIREMENTS.md)). Crate `hx-native` (lib `hx_native`) implements the Layer 1 headless engine (dialect, triggers, pending/`hx-sync`, `vello_cpu` paint). Mainnet G1 upload + chrome wiring are tracked separately in [issue #1](https://github.com/MHHukiewitz/hx-native/issues/1).
 
+## Fonts
+
+The engine never loads system fonts or CSS `@font-face` files. It bundles
+DejaVu Sans at 400 and 700 (normal style) as the fallback for every unknown
+family and for `sans-serif`, `serif`, `monospace` and `system-ui`. Blitz
+does not paint synthetic bold, so a weight only paints bold if a real face for
+it is registered.
+
+Hosts should pass their own regular **and** bold faces in
+`EngineConfig::fonts`, under the family name their CSS uses:
+
+```rust
+use std::sync::Arc;
+use hx_native::{EngineConfig, FontFace, FontStyle};
+
+const REGULAR: &[u8] = include_bytes!("assets/fonts/my_ui.ttf");
+const BOLD: &[u8] = include_bytes!("assets/fonts/my_ui_bold.ttf");
+
+let config = EngineConfig {
+    fonts: vec![
+        FontFace::new("My UI", 400, FontStyle::Normal, Arc::from(REGULAR)),
+        FontFace::new("My UI", 700, FontStyle::Normal, Arc::from(BOLD)),
+    ],
+    ..EngineConfig::default()
+};
+```
+
+With only the regular face, `font-weight: 700` in that family paints the
+regular face. With neither, text falls back to DejaVu Sans, and bold then
+paints in DejaVu Sans Bold. A host face named `"DejaVu Sans"` at 400 or 700
+normal is refused (`EngineError::InvalidFont`), since the bundled face would
+shadow it.
+
 ## License
 
 Licensed under either of

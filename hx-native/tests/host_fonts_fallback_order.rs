@@ -17,7 +17,7 @@ use std::sync::Arc;
 use hx_native::*;
 
 const REGULAR: &[u8] = include_bytes!("../../assets/fonts/DejaVuSans.ttf");
-const BOLD: &[u8] = include_bytes!("fonts/DejaVuSans-Bold.ttf");
+const BOLD: &[u8] = include_bytes!("../../assets/fonts/DejaVuSans-Bold.ttf");
 
 fn vp() -> Viewport {
     Viewport {
@@ -135,28 +135,35 @@ fn host_face_in_the_bundled_family_does_not_replace_the_fallback() {
     }
 }
 
-/// The bundled family can still be extended at a weight it does not have:
-/// a host "DejaVu Sans" 700 face is what `<b>` in `sans-serif` now uses
-/// (real bold instead of synthetic emboldening), in either registration
-/// position.
+/// Issue #56 (replaces the #30 "extend the bundled family at 700" test): the
+/// bundled family already has a real 700 face, so `<b>` in `sans-serif`
+/// with no host fonts paints exactly DejaVu Sans Bold (the pixels of that
+/// face registered under a host name), and a host "DejaVu Sans" 700 is
+/// refused because the bundled bold would shadow it.
 #[test]
-fn host_face_can_extend_the_bundled_family_at_another_weight() {
+fn bundled_family_bold_is_the_real_bold_face() {
     let body = format!("<p style=\"font-family:sans-serif\"><b>{TEXT}</b></p>");
-    let synthetic = paint(Vec::new(), &body);
-    let real = paint(vec![face("DejaVu Sans", 700, BOLD)], &body);
+    let bundled = paint(Vec::new(), &body);
     let host_named = paint(
         vec![face("Bold Host", 700, BOLD)],
         &format!("<p style=\"font-family:'Bold Host'\"><b>{TEXT}</b></p>"),
     );
-    eprintln!(
-        "synthetic vs real diff={} real vs host_named diff={}",
-        diff(&synthetic, &real),
-        diff(&real, &host_named)
-    );
     assert_eq!(
-        diff(&real, &host_named),
+        diff(&bundled, &host_named),
         0,
-        "sans-serif <b> must use the host 700 face registered in the bundled family"
+        "sans-serif <b> must paint the bundled DejaVu Sans Bold"
+    );
+    let regular = paint(
+        Vec::new(),
+        &format!("<p style=\"font-family:sans-serif\">{TEXT}</p>"),
+    );
+    assert!(
+        ink(&bundled) > ink(&regular),
+        "bold is heavier than regular"
+    );
+    assert!(
+        try_paint(vec![face("DejaVu Sans", 700, BOLD)], &body).is_none(),
+        "a host DejaVu Sans 700 ties with the bundled bold and is refused"
     );
     let _ = REGULAR;
 }

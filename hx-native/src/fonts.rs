@@ -23,15 +23,22 @@ use crate::types::{FontFace, FontStyle};
 /// DejaVu Sans (bundled). License: see `assets/fonts/LICENSE-DejaVu.txt`.
 pub const FONT_REGULAR: &[u8] = include_bytes!("../../assets/fonts/DejaVuSans.ttf");
 
-/// Family, weight and style of the bundled face as fontique registers it.
-/// It counts as an implicit entry in the host duplicate check (issue #28,
-/// crate-owner decision): a host face that ties with it would be silently
-/// shadowed (fontique keeps the first face registered), so it is rejected.
-/// The check compares family, weight and style only, **not width**: a
-/// condensed (or expanded) face registered as `"DejaVu Sans"` 400 normal is
-/// refused too, even though fontique would keep it as a separate face.
+/// DejaVu Sans Bold (bundled, issue #56), same licence. Blitz 0.3.0-beta.4
+/// never paints parley's synthetic bold, so without a real 700 face every
+/// `font-weight: bold` in the fallback family painted regular. With it, bold
+/// text in an unknown family or a generic family resolves to a real bold.
+pub const FONT_BOLD: &[u8] = include_bytes!("../../assets/fonts/DejaVuSans-Bold.ttf");
+
+/// Family, weights and style of the bundled faces as fontique registers
+/// them. Each counts as an implicit entry in the host duplicate check (issue
+/// #28, crate-owner decision; bold added by #56): a host face that ties with
+/// one would be silently shadowed (fontique keeps the first face
+/// registered), so it is rejected. The check compares family, weight and
+/// style only, **not width**: a condensed (or expanded) face registered as
+/// `"DejaVu Sans"` 400 or 700 normal is refused too, even though fontique
+/// would keep it as a separate face.
 pub(crate) const BUNDLED_FAMILY: &str = "DejaVu Sans";
-pub(crate) const BUNDLED_WEIGHT: u16 = 400;
+pub(crate) const BUNDLED_WEIGHTS: [u16; 2] = [400, 700];
 pub(crate) const BUNDLED_STYLE: FontStyle = FontStyle::Normal;
 
 /// `InvalidFont` reason for a font collection (a `ttcf` tag on the decoded
@@ -61,6 +68,14 @@ fn decoded_font_bytes() -> Arc<Vec<u8>> {
 fn shared_font_blob() -> Blob<u8> {
     static BLOB: OnceLock<Blob<u8>> = OnceLock::new();
     BLOB.get_or_init(|| Blob::new(decoded_font_bytes() as Arc<_>))
+        .clone()
+}
+
+/// One parley [`Blob`] for the bundled bold face (issue #56). The TTF is used
+/// in place (no decode, no copy); one Blob id process-wide like the regular.
+fn shared_bold_blob() -> Blob<u8> {
+    static BLOB: OnceLock<Blob<u8>> = OnceLock::new();
+    BLOB.get_or_init(|| Blob::new(Arc::new(FONT_BOLD) as Arc<_>))
         .clone()
 }
 
@@ -123,8 +138,10 @@ impl HostFonts {
     /// ignores width: a condensed `"DejaVu Sans"` 400 normal is refused too.
     pub(crate) fn build(faces: &[FontFace]) -> Result<Arc<Self>, EngineError> {
         let mut seen: HashSet<(String, u16, FontStyle)> = HashSet::new();
-        // The bundled face is an implicit earlier entry (see BUNDLED_FAMILY).
-        seen.insert((family_key(BUNDLED_FAMILY), BUNDLED_WEIGHT, BUNDLED_STYLE));
+        // The bundled faces are implicit earlier entries (see BUNDLED_FAMILY).
+        for w in BUNDLED_WEIGHTS {
+            seen.insert((family_key(BUNDLED_FAMILY), w, BUNDLED_STYLE));
+        }
         let mut out = Vec::with_capacity(faces.len());
         for (index, f) in faces.iter().enumerate() {
             let fail = |reason: &str| EngineError::InvalidFont {
@@ -140,11 +157,13 @@ impl HostFonts {
                 return Err(fail("weight must be in 1..=1000"));
             }
             let key = (family_key(family), f.weight, f.style);
-            let is_bundled = key == (family_key(BUNDLED_FAMILY), BUNDLED_WEIGHT, BUNDLED_STYLE);
+            let is_bundled = key.0 == family_key(BUNDLED_FAMILY)
+                && BUNDLED_WEIGHTS.contains(&key.1)
+                && key.2 == BUNDLED_STYLE;
             if !seen.insert(key) {
                 return Err(fail(if is_bundled {
-                    "ties with the bundled DejaVu Sans 400 normal face, which it would never \
-                     replace; register DejaVu Sans only at another weight or style"
+                    "ties with a bundled DejaVu Sans face (400 or 700 normal), which it would \
+                     never replace; register DejaVu Sans only at another weight or style"
                 } else {
                     "duplicate of an earlier face (same family, case-insensitive, weight and style)"
                 }));
@@ -192,8 +211,8 @@ impl HostFonts {
     }
 }
 
-/// Build a FontContext with system fonts disabled, the bundled DejaVu face
-/// registered as every generic family, then `host`'s faces in
+/// Build a FontContext with system fonts disabled, the bundled DejaVu faces
+/// (400 and, issue #56, 700) registered as every generic family, then `host`'s faces in
 /// `EngineConfig::fonts` order under their host family / weight / style.
 ///
 /// Font bytes and Blob ids are shared across every call (documents +
@@ -206,8 +225,14 @@ pub(crate) fn bundled_font_context(host: &HostFonts) -> FontContext {
             system_fonts: false,
         }),
     };
-    let registered = ctx.collection.register_fonts(shared_font_blob(), None);
-    let family_ids: Vec<_> = registered.iter().map(|(id, _)| *id).collect();
+    let mut family_ids: Vec<_> = Vec::new();
+    for blob in [shared_font_blob(), shared_bold_blob()] {
+        for (id, _) in ctx.collection.register_fonts(blob, None) {
+            if !family_ids.contains(&id) {
+                family_ids.push(id);
+            }
+        }
+    }
     for generic in [
         GenericFamily::SansSerif,
         GenericFamily::Serif,
@@ -229,20 +254,26 @@ mod tests {
     use super::*;
 
     /// The bundled-face constants used by the duplicate check must match
-    /// what fontique reads from the bundled file.
+    /// what fontique reads from the bundled files: one family, regular then
+    /// bold, both normal style.
     #[test]
-    fn bundled_face_constants_match_the_bundled_file() {
+    fn bundled_face_constants_match_the_bundled_files() {
         let mut c = Collection::new(CollectionOptions {
             shared: false,
             system_fonts: false,
         });
-        let reg = c.register_fonts(shared_font_blob(), None);
-        assert_eq!(reg.len(), 1);
-        let (id, infos) = &reg[0];
-        assert_eq!(c.family_name(*id), Some(BUNDLED_FAMILY));
-        assert_eq!(infos.len(), 1);
-        assert_eq!(infos[0].weight().value(), BUNDLED_WEIGHT as f32);
-        assert_eq!(infos[0].style(), parley::fontique::FontStyle::Normal);
+        for (blob, weight) in [
+            (shared_font_blob(), BUNDLED_WEIGHTS[0]),
+            (shared_bold_blob(), BUNDLED_WEIGHTS[1]),
+        ] {
+            let reg = c.register_fonts(blob, None);
+            assert_eq!(reg.len(), 1);
+            let (id, infos) = &reg[0];
+            assert_eq!(c.family_name(*id), Some(BUNDLED_FAMILY));
+            assert_eq!(infos.len(), 1);
+            assert_eq!(infos[0].weight().value(), weight as f32);
+            assert_eq!(infos[0].style(), parley::fontique::FontStyle::Normal);
+        }
         assert_eq!(BUNDLED_STYLE, FontStyle::Normal);
     }
 
