@@ -1,6 +1,7 @@
 //! Public types from the locked API sketch.
 
 use std::fmt;
+use std::sync::Arc;
 
 /// Engine configuration: offline, no network, no JS.
 #[derive(Clone, Debug)]
@@ -17,6 +18,16 @@ pub struct EngineConfig {
     /// [`Engine::set_visible`](crate::Engine::set_visible)). Defaults to
     /// [`DEFAULT_HIDDEN_SURFACE_BUDGET_BYTES`].
     pub hidden_surface_budget_bytes: u64,
+    /// Host-supplied font faces (issue #28). Empty by default, which keeps
+    /// the bundled-DejaVu-only behaviour. Faces are registered in this
+    /// order, after bundled DejaVu Sans, under the family / weight / style
+    /// given here (not the names inside the font file). DejaVu stays the
+    /// generic (`sans-serif`, `serif`, `monospace`, `system-ui`) and
+    /// unknown-family fallback. CSS `@font-face` rules stay ignored: the
+    /// engine never fetches resources. Invalid entries fail
+    /// [`Engine::try_new`](crate::Engine::try_new) with
+    /// [`EngineError::InvalidFont`](crate::EngineError::InvalidFont).
+    pub fonts: Vec<FontFace>,
 }
 
 impl Default for EngineConfig {
@@ -26,7 +37,65 @@ impl Default for EngineConfig {
             pending_timeout_frames: 120,
             paint_mode: PaintMode::Exact,
             hidden_surface_budget_bytes: DEFAULT_HIDDEN_SURFACE_BUDGET_BYTES,
+            fonts: Vec::new(),
         }
+    }
+}
+
+/// Font style of a host-supplied [`FontFace`] (issue #28). Crate-owned so no
+/// Blitz / fontique type leaks into the public API; maps onto CSS
+/// `font-style: normal | italic | oblique`.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum FontStyle {
+    #[default]
+    Normal,
+    Italic,
+    Oblique,
+}
+
+/// One host-supplied font face (issue #28), registered under `family`,
+/// `weight` and `style` regardless of the names inside the font file.
+/// `bytes` is a TTF, OTF, WOFF or WOFF2 file; `Arc<[u8]>` lets a host share
+/// one `include_bytes!` buffer (`Arc::from(BYTES as &[u8])`) or bytes loaded
+/// at runtime across engines without copying.
+///
+/// `#[non_exhaustive]`: build one with [`FontFace::new`].
+#[non_exhaustive]
+#[derive(Clone)]
+pub struct FontFace {
+    /// CSS family name the face answers to (`font-family: <family>`).
+    pub family: String,
+    /// CSS weight, `1..=1000` (400 regular, 700 bold).
+    pub weight: u16,
+    pub style: FontStyle,
+    pub bytes: Arc<[u8]>,
+}
+
+impl FontFace {
+    pub fn new(
+        family: impl Into<String>,
+        weight: u16,
+        style: FontStyle,
+        bytes: impl Into<Arc<[u8]>>,
+    ) -> Self {
+        Self {
+            family: family.into(),
+            weight,
+            style,
+            bytes: bytes.into(),
+        }
+    }
+}
+
+impl fmt::Debug for FontFace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FontFace")
+            .field("family", &self.family)
+            .field("weight", &self.weight)
+            .field("style", &self.style)
+            .field("bytes_len", &self.bytes.len())
+            .finish()
     }
 }
 

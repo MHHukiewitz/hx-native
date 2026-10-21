@@ -951,7 +951,28 @@ impl PaintWorker {
     /// the worker. Setup that follows ([`Self::declare_actions`],
     /// [`Self::open_surface`], [`Self::load_html`], …) is fire-and-forget —
     /// check [`Self::poll_error`] after setup or call [`Self::flush`] once.
+    /// Like [`PaintWorker::spawn`], but validates [`EngineConfig::fonts`]
+    /// (issue #28) on the calling thread first and returns
+    /// [`EngineError::InvalidFont`] instead of starting a worker. The
+    /// validated faces are handed to the worker's engine, so nothing is
+    /// decoded twice.
+    pub fn try_spawn(config: EngineConfig) -> Result<Self, EngineError> {
+        let fonts = crate::fonts::HostFonts::build(&config.fonts)?;
+        Ok(Self::spawn_inner(config, Some(fonts)))
+    }
+
+    /// Spawn the paint thread. With invalid [`EngineConfig::fonts`] the
+    /// worker's engine reports [`EngineError::InvalidFont`] from the first
+    /// `load_html` / `open_surface` (as a `WorkerError::Engine`); use
+    /// [`PaintWorker::try_spawn`] to get it up front.
     pub fn spawn(config: EngineConfig) -> Self {
+        Self::spawn_inner(config, None)
+    }
+
+    fn spawn_inner(
+        config: EngineConfig,
+        fonts: Option<std::sync::Arc<crate::fonts::HostFonts>>,
+    ) -> Self {
         let mailbox = Arc::new(Mailbox::new());
         let shared = Arc::new(SharedState::new());
         shared.bump_progress();
@@ -959,7 +980,7 @@ impl PaintWorker {
         let sh = Arc::clone(&shared);
         let join = thread::Builder::new()
             .name("hx-native-paint".into())
-            .spawn(move || worker_main(config, mb, sh))
+            .spawn(move || worker_main(config, fonts, mb, sh))
             .expect("spawn hx-native paint worker");
         Self {
             mailbox,
@@ -1274,9 +1295,19 @@ impl Drop for PaintWorker {
     }
 }
 
-fn worker_main(config: EngineConfig, mailbox: Arc<Mailbox>, shared: Arc<SharedState>) {
+fn worker_main(
+    config: EngineConfig,
+    fonts: Option<Arc<crate::fonts::HostFonts>>,
+    mailbox: Arc<Mailbox>,
+    shared: Arc<SharedState>,
+) {
     let result = catch_unwind(AssertUnwindSafe(|| {
-        let mut eng = Engine::new(config);
+        // Issue #28: the host fonts reach the worker's own engine, either
+        // pre-validated by `try_spawn` or validated here from `config.fonts`.
+        let mut eng = match fonts {
+            Some(f) => Engine::with_fonts(config, Ok(f)),
+            None => Engine::new(config),
+        };
         let mut generations: HashMap<SurfaceId, u64> = HashMap::new();
         shared.bump_progress();
         while let Some(batch) = mailbox.recv_batch() {

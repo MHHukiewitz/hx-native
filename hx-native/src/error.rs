@@ -41,6 +41,17 @@ pub enum EngineError {
         input: String,
         reason: String,
     },
+    /// An [`EngineConfig::fonts`](crate::EngineConfig::fonts) entry (issue
+    /// #28) was rejected when the engine was built: bytes that are not a
+    /// readable TTF/OTF/WOFF/WOFF2 face, an empty family, a weight outside
+    /// `1..=1000`, or a duplicate of an earlier entry (same family compared
+    /// case-insensitively, same weight and style). `index` is the entry's
+    /// position in `EngineConfig::fonts`.
+    InvalidFont {
+        index: usize,
+        family: String,
+        reason: String,
+    },
     /// Paint / layout failure.
     Paint(String),
     /// Engine used before `load_html`.
@@ -76,6 +87,11 @@ impl fmt::Display for EngineError {
                 f,
                 "input_limits names unknown input `{input}` for action `{action}`"
             ),
+            EngineError::InvalidFont {
+                index,
+                family,
+                reason,
+            } => write!(f, "invalid host font #{index} (`{family}`): {reason}"),
             EngineError::InvalidInputLimits {
                 action,
                 input,

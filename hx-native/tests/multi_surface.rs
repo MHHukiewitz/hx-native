@@ -8,6 +8,7 @@ fn make_eng(budget: u64) -> Engine {
         pending_timeout_frames: 120,
         paint_mode: PaintMode::Exact,
         hidden_surface_budget_bytes: budget,
+        fonts: Vec::new(),
     });
     e.declare_actions(&["act.do", "time.set_speed"]);
     e
