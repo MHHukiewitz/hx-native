@@ -182,7 +182,8 @@ pub fn canonical_from_display(text: &str, limits: &NumericLimits, clamp: bool) -
 }
 
 /// Whether `ch` may be inserted into a number field (before rounding/clamp).
-/// Commas are accepted by the caller as a no-op insert (not stored while focused).
+/// Commas are always accepted while typing; commit judges where they sit
+/// (issue #51).
 pub fn number_char_allowed(existing: &str, ch: char, limits: &NumericLimits) -> bool {
     if ch == ',' {
         return true;
@@ -214,9 +215,6 @@ pub fn filter_number_insert(existing: &str, insert: &str, limits: &NumericLimits
     let mut out = String::new();
     let mut probe = existing.to_string();
     for ch in insert.chars() {
-        if ch == ',' {
-            continue; // accepted, ignored in stored text while focused
-        }
         if number_char_allowed(&probe, ch, limits) {
             out.push(ch);
             probe.push(ch);
@@ -314,27 +312,41 @@ pub fn paste_ignore_chars(node: &blitz_dom::node::Node) -> String {
 }
 
 /// A pasted number as it would be inserted: characters listed in
-/// `data-hx-paste-ignore` removed (nothing else is cleaned up, no trimming),
-/// then grouping commas dropped exactly as typed `,` is (accepted, never
-/// stored while focused). `None` when a comma is not thousands grouping
-/// ("3,5", "1,2,3", "12,34"): dropping it would commit a different number
-/// (35, 123, 1234), so the paste is refused (Graph review of #41 round 2).
+/// `data-hx-paste-ignore` removed only outside the number itself, that is
+/// before its first digit or point (leading spaces, a `$` after a sign) and
+/// after its last one, never between two digits, so with `"$ "` a pasted
+/// `"3 5"` keeps its space and is refused (issue #51). Nothing else is
+/// cleaned up. Grouping commas are kept, like typed ones, and commit judges
+/// them with the rest of the box (issue #51). `None` when a comma in the
+/// pasted text is not thousands grouping ("3,5", "1,2,3", "12,34"): dropping
+/// it would commit a different number (35, 123, 1234), so the paste is
+/// refused (Graph review of #41 round 2).
 pub fn clean_number_paste(paste: &str, ignore: &str) -> Option<String> {
+    let chars: Vec<char> = paste.chars().collect();
+    let in_number = |c: &char| c.is_ascii_digit() || *c == '.';
+    let first = chars.iter().position(in_number).unwrap_or(chars.len());
+    let last = chars.iter().rposition(in_number).unwrap_or(0);
     // ',' is judged as grouping even when listed: listing it means "allow
     // grouping commas", not "glue any digits together".
-    let kept: String = paste
-        .chars()
-        .filter(|c| *c == ',' || !ignore.contains(*c))
+    let kept: String = chars
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| **c == ',' || (*i > first && *i < last) || !ignore.contains(**c))
+        .map(|(_, c)| *c)
         .collect();
     if !commas_are_grouping(&kept) {
         return None;
     }
-    Some(kept.chars().filter(|c| *c != ',').collect())
+    // Commas stay, like typed ones (issue #51): commit judges the whole box,
+    // so a paste next to typed text is judged on what the box really shows.
+    Some(kept)
 }
 
 /// Commas only between thousands groups of the whole part: "1,234",
-/// "-151,234.5". No comma at all is fine.
-fn commas_are_grouping(s: &str) -> bool {
+/// "-151,234.5". No comma at all is fine. Paste and commit (Enter, blur, a
+/// `from:body` shortcut) use the same check, so a typed `3,5` is refused
+/// exactly like a pasted one (issue #51).
+pub fn commas_are_grouping(s: &str) -> bool {
     if !s.contains(',') {
         return true;
     }
@@ -534,13 +546,22 @@ pub fn caret_device_rect(
 
 /// Sync the value attribute from the editor buffer (canonical, no grouping).
 /// Restores the focused display text in the editor afterwards.
+///
+/// A number whose commas are not thousands grouping ("3,5", "7,3480") is no
+/// number: the value becomes `fallback` (the value at focus, held in the
+/// limits), the same as a refused paste leaves it (issue #51).
 pub fn sync_value_from_editor(
     doc: &mut HtmlDocument,
     nid: NodeId,
     is_number: bool,
     clamp: bool,
+    fallback: &str,
 ) -> bool {
     let display = editor_text(doc, nid).unwrap_or_default();
+    let mut selection = None;
+    doc.with_text_input(nid, |driver| {
+        selection = Some(*driver.editor.raw_selection());
+    });
     let canonical = if is_number {
         let limits = doc
             .get_node(nid)
@@ -551,20 +572,43 @@ pub fn sync_value_from_editor(
                 step: 1.0,
                 unconstrained: false,
             });
-        canonical_from_display(&display, &limits, clamp)
+        if commas_are_grouping(display.trim()) {
+            canonical_from_display(&display, &limits, clamp)
+        } else {
+            fallback_value(fallback, &limits, clamp)
+        }
     } else {
         display.clone()
     };
     let changed = write_value_attr(doc, nid, &canonical);
-    // set_attribute also writes the editor to canonical — restore display.
+    // set_attribute also writes the editor to canonical — restore display,
+    // and the caret with it: the canonical text can be shorter than the
+    // display ("151,379" vs "151379"), which would pull the caret back and
+    // make the next key land mid-number (issue #51 keeps typed commas).
     set_editor_text(doc, nid, &display);
+    if let Some(sel) = selection {
+        doc.with_text_input(nid, |mut driver| {
+            driver.set_selection(sel);
+        });
+    }
     changed
+}
+
+/// The value a refused number text falls back to: the focus-time value,
+/// clamped (and rounded) to the limits as they are now, like Esc.
+fn fallback_value(fallback: &str, limits: &NumericLimits, clamp: bool) -> String {
+    if fallback.trim().is_empty() {
+        return fallback.to_string();
+    }
+    canonical_from_display(fallback, limits, clamp)
 }
 
 /// Commit a number/text field: clamp number, write canonical value. The
 /// caller (`commit_text_edit`) then shows a number box's display text
 /// (`prepare_focus_display` on Enter, `apply_unfocused_display` on blur).
-pub fn commit_field(doc: &mut HtmlDocument, nid: NodeId) -> bool {
+/// A number whose commas are not thousands grouping commits `fallback`
+/// (the value at focus) instead, see [`sync_value_from_editor`].
+pub fn commit_field(doc: &mut HtmlDocument, nid: NodeId, fallback: &str) -> bool {
     let (prev_value, limits) = {
         let Some(node) = doc.get_node(nid) else {
             return false;
@@ -581,11 +625,15 @@ pub fn commit_field(doc: &mut HtmlDocument, nid: NodeId) -> bool {
     };
     let display = editor_text(doc, nid).unwrap_or_default();
     let canonical = if let Some(ref limits) = limits {
-        let parsed = canonical_from_display(&display, limits, true);
-        if parsed.is_empty() {
-            prev_value
+        if !commas_are_grouping(display.trim()) {
+            fallback_value(fallback, limits, true)
         } else {
-            parsed
+            let parsed = canonical_from_display(&display, limits, true);
+            if parsed.is_empty() {
+                prev_value
+            } else {
+                parsed
+            }
         }
     } else {
         display

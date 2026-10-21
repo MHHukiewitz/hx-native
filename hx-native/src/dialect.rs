@@ -19,9 +19,11 @@ pub const ATTR_HX_STEP_FOR: &str = "data-hx-step-for";
 pub const ATTR_HX_GROUP: &str = "data-hx-group";
 
 /// Opt-in paste cleanup on `<input type=number>` (Designer call, #41 round 2):
-/// every character listed in the value is removed from pasted text before it
-/// is judged, e.g. `data-hx-paste-ignore="$,"` turns a pasted `$1,234` into
-/// `1234`. Default (absent / empty): nothing is removed. A `,` is never
+/// characters listed in the value are removed from pasted text before it is
+/// judged, but only around the number (start, end, or between a leading sign
+/// or currency character and the first digit), never between two digits
+/// (issue #51): `data-hx-paste-ignore="$ "` turns a pasted ` $1,234 ` into
+/// `1234` and refuses `3 5`. Default (absent / empty): nothing is removed. A `,` is never
 /// glued away: wherever it comes from, it must sit between thousands groups
 /// of the whole part ("1,234", "151,379,336"), or the paste is refused, so
 /// "3,5" never commits 35 (Graph review of #41 round 2). Listing `,` here
