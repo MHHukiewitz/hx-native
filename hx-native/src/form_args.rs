@@ -296,12 +296,24 @@ pub(crate) fn step_precise(current: f64, dir: i32, limits: &NumericLimits) -> f6
 
     let decimals = step_decimal_places(limits.step);
     let step = limits.step;
-    let mut next = round_decimal(current + dir as f64 * step, decimals).clamp(min, max);
-    if step > 0.0 {
-        let base = limits.min.unwrap_or(0.0);
-        let n = ((next - base) / step).round();
-        next = round_decimal(base + n * step, decimals).clamp(min, max);
+    if step <= 0.0 {
+        return clamp_safe_number(current.clamp(min, max));
     }
+    // HTML stepUp/stepDown: from a value on the grid, move one step; from an
+    // off-grid value (now common, since typed values are not snapped, #39),
+    // land on the nearest grid value in the arrow's direction, so 151234
+    // with step 1000 goes up to 152000 and down to 151000 (Graph review of #41).
+    let base = limits.min.unwrap_or(0.0);
+    let k = (current - base) / step;
+    let on_grid = (k - k.round()).abs() < 1e-7;
+    let n = if on_grid {
+        k.round() + dir as f64
+    } else if dir > 0 {
+        k.ceil()
+    } else {
+        k.floor()
+    };
+    let next = round_decimal(base + n * step, decimals).clamp(min, max);
     clamp_safe_number(next)
 }
 
@@ -420,7 +432,24 @@ fn clamp_snap(value: f64, limits: &NumericLimits) -> f64 {
     clamp_safe_number(stepped.clamp(min, max))
 }
 
-/// Public clamp+snap for text-edit commit.
+/// True for a whole-number box: an integer `step` (not `step="any"`).
+/// Typed values there round to an integer on commit (#41 round 2).
+pub(crate) fn whole_number_step(limits: &NumericLimits) -> bool {
+    !limits.unconstrained && (limits.step - limits.step.round()).abs() < 1e-12
+}
+
+/// Clamp to `[min, max]` with no step-grid snap. Used for typed number
+/// commits and for re-clamping number inputs when limits change: a typed
+/// `151234` with `step=1000` stays `151234` (issue #39).
+pub(crate) fn clamp_value(value: f64, limits: &NumericLimits) -> f64 {
+    let value = clamp_safe_number(value);
+    let min = limits.min.unwrap_or(-MAX_SAFE_NUMBER);
+    let max = limits.max.unwrap_or(MAX_SAFE_NUMBER);
+    let max = max.max(min);
+    clamp_safe_number(value.clamp(min, max))
+}
+
+/// Clamp + step-grid snap (range inputs).
 pub(crate) fn clamp_snap_value(value: f64, limits: &NumericLimits) -> f64 {
     clamp_snap(value, limits)
 }
