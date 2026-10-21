@@ -286,7 +286,7 @@ fn grouped_box_and_comma_paste_rule_agree() {
     // (focused text after the edit, committed value, display after blur)
     assert_eq!(
         paste("73,480"),
-        s("73480", "73480", "73,480"),
+        s("73,480", "73480", "73,480"),
         "grouped paste"
     );
     let retyped = run(&|e| {
@@ -311,7 +311,7 @@ fn grouped_box_and_comma_paste_rule_agree() {
     );
     assert_eq!(
         paste("173,480"),
-        s("173480", "173480", "173,480"),
+        s("173,480", "173480", "173,480"),
         "valid grouped paste"
     );
 }

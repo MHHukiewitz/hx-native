@@ -360,3 +360,25 @@ fn paste_ignore_strips_only_around_the_number() {
     assert_eq!(paste_commit(&fee(""), "f", "3 5"), "6.12");
     assert_eq!(paste_commit(&fee(""), "f", " 12.5"), "6.12");
 }
+
+#[test]
+fn a_paste_next_to_typed_text_is_judged_on_the_whole_box() {
+    // Graph review of #59: pasted grouping commas used to be dropped while
+    // typed ones stay, so "1," + paste "234,567" was refused and
+    // "1" + paste "234,567" glued a misplaced comma into 1234567.
+    for (head, p, want) in [
+        ("1,", "234,567", "1234567"),
+        ("1", "234,567", "150000"),
+        ("7", "348,000", "150000"),
+        ("1,2", "34", "1234"),
+        ("", "1,234", "1234"),
+    ] {
+        let mut e = boot(&up(""), &[]);
+        e.test_set_focus("u");
+        select_all(&mut e);
+        typ(&mut e, head);
+        paste(&mut e, p);
+        let _ = key(&mut e, "Enter", false);
+        assert_eq!(val(&e, "u"), want, "typed {head:?} + paste {p:?}");
+    }
+}

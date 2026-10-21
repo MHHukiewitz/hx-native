@@ -316,10 +316,11 @@ pub fn paste_ignore_chars(node: &blitz_dom::node::Node) -> String {
 /// before its first digit or point (leading spaces, a `$` after a sign) and
 /// after its last one, never between two digits, so with `"$ "` a pasted
 /// `"3 5"` keeps its space and is refused (issue #51). Nothing else is
-/// cleaned up. Grouping commas are then dropped. `None` when a comma is not
-/// thousands grouping ("3,5", "1,2,3", "12,34"): dropping it would commit a
-/// different number (35, 123, 1234), so the paste is refused (Graph review
-/// of #41 round 2).
+/// cleaned up. Grouping commas are kept, like typed ones, and commit judges
+/// them with the rest of the box (issue #51). `None` when a comma in the
+/// pasted text is not thousands grouping ("3,5", "1,2,3", "12,34"): dropping
+/// it would commit a different number (35, 123, 1234), so the paste is
+/// refused (Graph review of #41 round 2).
 pub fn clean_number_paste(paste: &str, ignore: &str) -> Option<String> {
     let chars: Vec<char> = paste.chars().collect();
     let in_number = |c: &char| c.is_ascii_digit() || *c == '.';
@@ -336,7 +337,9 @@ pub fn clean_number_paste(paste: &str, ignore: &str) -> Option<String> {
     if !commas_are_grouping(&kept) {
         return None;
     }
-    Some(kept.chars().filter(|c| *c != ',').collect())
+    // Commas stay, like typed ones (issue #51): commit judges the whole box,
+    // so a paste next to typed text is judged on what the box really shows.
+    Some(kept)
 }
 
 /// Commas only between thousands groups of the whole part: "1,234",
