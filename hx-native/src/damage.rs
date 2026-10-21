@@ -246,7 +246,11 @@ fn local_transform_device(node: &blitz_dom::Node, scale: f64, doc_scale: f64) ->
 /// (origin at the border-box top-left, before its own transform) to device
 /// pixels. Walks the containing-block chain (same as `absolute_position`) and
 /// multiplies each ancestor's layout translation by its CSS transform.
-fn document_affine_device(doc: &HtmlDocument, nid: NodeId, scale: f64) -> Option<Affine> {
+pub(crate) fn document_affine_device(
+    doc: &HtmlDocument,
+    nid: NodeId,
+    scale: f64,
+) -> Option<Affine> {
     let mut chain = Vec::new();
     let mut cur = Some(nid);
     while let Some(id) = cur {
@@ -370,6 +374,16 @@ pub(crate) fn ink_box_device(
             x1 = x1.max(ow + sx + pad);
             y1 = y1.max(oh + sy + pad);
         }
+    }
+
+    // Issue #57: text-shadow (painted by `text_shadow.rs`) moves text ink by
+    // each shadow offset, so a shadow that appears, moves or goes away stays
+    // inside this element's damage.
+    if let Some((l, t, r, b)) = crate::text_shadow::text_shadow_ink_pad(doc, nid, scale) {
+        x0 -= l;
+        y0 -= t;
+        x1 += r;
+        y1 += b;
     }
 
     let xf = document_affine_device(doc, nid, scale)?;

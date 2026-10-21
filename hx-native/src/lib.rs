@@ -23,6 +23,7 @@ mod scroll;
 mod select_ui;
 mod stylo_text_style;
 mod text_edit;
+mod text_shadow;
 mod trigger;
 mod types;
 pub mod worker;

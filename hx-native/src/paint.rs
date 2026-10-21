@@ -14,6 +14,7 @@ use peniko::{BlendMode, Color, Fill, FontData, StyleRef};
 
 use crate::damage::IntRect;
 use crate::error::EngineError;
+use crate::text_shadow::{ShadowScene, ShadowTable};
 use crate::types::{PaintMode, RgbaImage};
 
 pub fn paint_rgba(
@@ -25,9 +26,14 @@ pub fn paint_rgba(
     if width == 0 || height == 0 {
         return Err(EngineError::Paint("viewport size must be non-zero".into()));
     }
+    let table = ShadowTable::build(doc, scale);
     let pixels = render_to_buffer::<VelloCpuImageRenderer, _>(
         |scene| {
-            paint_scene(scene, doc, scale, width, height, 0, 0);
+            let mut shadow = ShadowScene {
+                inner: scene,
+                table: &table,
+            };
+            paint_scene(&mut shadow, doc, scale, width, height, 0, 0);
         },
         width,
         height,
@@ -52,13 +58,15 @@ pub fn paint_damage_into(
     if width == 0 || height == 0 {
         return Err(EngineError::Paint("viewport size must be non-zero".into()));
     }
+    // Issue #57: one shadow table for every rect of this paint.
+    let table = ShadowTable::build(doc, scale);
     for rect in damage {
         if rect.is_empty() {
             continue;
         }
         match mode {
-            PaintMode::Exact => paint_exact_rect(doc, frame, scale, *rect)?,
-            PaintMode::Shifted => paint_shifted_rect(doc, frame, scale, *rect)?,
+            PaintMode::Exact => paint_exact_rect(doc, frame, scale, *rect, &table)?,
+            PaintMode::Shifted => paint_shifted_rect(doc, frame, scale, *rect, &table)?,
         }
     }
     Ok(())
@@ -70,6 +78,7 @@ fn paint_exact_rect(
     frame: &mut RgbaImage,
     scale: f64,
     rect: IntRect,
+    table: &ShadowTable,
 ) -> Result<(), EngineError> {
     let width = frame.width;
     let height = frame.height;
@@ -89,7 +98,11 @@ fn paint_exact_rect(
             };
             // Full-size clip so fragments outside the rect cannot leak.
             PaintScene::push_clip_layer(&mut cull, Fill::NonZero, Affine::IDENTITY, &clip);
-            paint_scene(&mut cull, doc, scale, width, height, 0, 0);
+            let mut shadow = ShadowScene {
+                inner: &mut cull,
+                table,
+            };
+            paint_scene(&mut shadow, doc, scale, width, height, 0, 0);
             PaintScene::pop_layer(&mut cull);
         },
         width,
@@ -105,6 +118,7 @@ fn paint_shifted_rect(
     frame: &mut RgbaImage,
     scale: f64,
     rect: IntRect,
+    table: &ShadowTable,
 ) -> Result<(), EngineError> {
     let width = frame.width;
     let height = frame.height;
@@ -128,7 +142,11 @@ fn paint_shifted_rect(
                 shift: Some(shift),
                 skip_depth: 0,
             };
-            paint_scene(&mut cull, doc, scale, width, height, 0, 0);
+            let mut shadow = ShadowScene {
+                inner: &mut cull,
+                table,
+            };
+            paint_scene(&mut shadow, doc, scale, width, height, 0, 0);
         },
         rw,
         rh,
