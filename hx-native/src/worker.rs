@@ -152,10 +152,15 @@ impl SyncPacket {
     /// whenever `newer` is reporting on the slice at all: it carries the
     /// `"actions"` version key, or either field is non-empty (the latter a
     /// defensive fallback for a caller that forgot the version bump but
-    /// still has content to deliver). Verified equal to sequential
+    /// still has content to deliver). Checked against sequential
     /// `Engine::sync` application, including the "actions update after an
     /// earlier rules-only packet" case, by `gp24b_merge_vs_sync_semantics`
-    /// (`tests/paint_worker.rs`).
+    /// (`tests/paint_worker.rs`), with one known exception (Graph review,
+    /// PR #24 round 3): a newer packet with **no** `"actions"` version key
+    /// and both lists empty leaves the accumulated pair (and so the greying)
+    /// in place when coalesced, whereas `Engine::sync` applied in order
+    /// would clear it. Callers clearing the slice must send the `"actions"`
+    /// version key.
     pub fn merge_per_slice(&mut self, newer: SyncPacket) {
         let replace_actions = newer.versions.contains_key("actions")
             || !newer.actions.is_empty()
