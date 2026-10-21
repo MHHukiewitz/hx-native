@@ -10,3 +10,18 @@ It is under the same Bitstream Vera / DejaVu licence as the bundled
 `assets/fonts/DejaVuSans.ttf` (see `LICENSE-DejaVu.txt` here, the upstream
 `LICENSE` file, and `assets/fonts/LICENSE-DejaVu.txt`). It is used only by
 the crate's tests and is not compiled into the library.
+
+`DejaVuSans-subset-collection1.woff2` (5628 bytes) is a WOFF2-compressed
+one-face TrueType collection (`ttcf`) made from the bundled
+`assets/fonts/DejaVuSans.ttf` (sha256
+`ae7b7855e115a5966d8b1b3f80f254ccc117ec86f9965e202ee2940453837280`):
+`pyftsubset DejaVuSans.ttf --text="Collection" --name-IDs='*' --name-legacy
+--name-languages='*' --notdef-outline`, then fontTools
+`TTCollection` with that one face, then `woff2_compress`. It is a modified
+DejaVu font under the same licence (`LICENSE-DejaVu.txt`): the Bitstream
+Vera and Arev terms allow modification and redistribution with the notice
+kept, as long as the font is not sold by itself and its names do not
+contain "Bitstream", "Vera", "Arev" or "Tavmjong Bah"; its family name
+stays "DejaVu Sans". Used only by `woff2_collection_is_rejected` in
+`tests/host_fonts.rs`, which checks that the `ttcf` collection check runs
+on the decoded bytes.
