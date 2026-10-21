@@ -349,7 +349,16 @@ pub(crate) fn step_precise(current: f64, dir: i32, limits: &NumericLimits) -> f6
     } else {
         k.floor()
     };
-    let next = round_decimal(base + n * step, decimals).clamp(min, max);
+    // An arrow never leaves `[min, max]` and stays on the grid, like HTML
+    // stepUp/stepDown with an off-grid max: it lands on the highest grid
+    // value at or below `max` (max 99.996, step 0.01: 99.99). If that would
+    // move the value against the arrow (already past it), nothing changes.
+    let grid_max = round_decimal(base + ((max - base) / step + 1e-7).floor() * step, decimals);
+    let grid_max = if grid_max < min { min } else { grid_max };
+    let next = round_decimal(base + n * step, decimals).clamp(min, grid_max);
+    if (dir > 0 && next < current) || (dir < 0 && next > current) {
+        return no_negative_zero(current);
+    }
     no_negative_zero(clamp_safe_number(next))
 }
 
@@ -379,7 +388,10 @@ pub(crate) fn format_numeric_for_step(v: f64, limits: &NumericLimits) -> String 
         return format_numeric(v);
     }
     let v = no_negative_zero(v);
-    let decimals = result_decimals(limits, 0.0);
+    // Grid decimals ("2.20" with step 0.01), or more when the value is an
+    // off-grid one an arrow left alone (typed 99.996 under max 99.996 stays
+    // "99.996", never "100.00"; #49 round 2).
+    let decimals = result_decimals(limits, 0.0).max(decimals_of(v));
     if decimals == 0 {
         return format_numeric(v);
     }

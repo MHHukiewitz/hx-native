@@ -316,3 +316,83 @@ fn slice_limits_write_and_clamp_clean_values_grouped_and_ungrouped() {
         );
     }
 }
+
+/// Focus `id` and press `k` once; returns the stored value and the posted arg.
+fn arrow(eng: &mut Engine, id: &str, name: &str, k: &str) -> (Option<String>, Option<String>) {
+    eng.test_set_focus(id);
+    let out = key(eng, k, false);
+    (eng.attr(id, "value"), arg(&out, name).map(str::to_string))
+}
+
+fn num_box(attrs: &str, value: &str) -> Engine {
+    boot(
+        &format!(
+            r#"<form id="f"><input id="n" type="number" name="n" value="{value}" {attrs} hx-post="p.n" hx-trigger="change" /><input id="other" type="text" value="x" /></form>"#
+        ),
+        &["p.n"],
+    )
+}
+
+/// #49 round 2: the step maths the unit test checks, seen end to end
+/// through `LiveSurface::input` (stored value and posted args).
+#[test]
+fn arrow_results_are_clean_end_to_end() {
+    // Grid decimals come from `min` too: 0.005 ↑ (step 0.01) is 0.015,
+    // and 0.015 ↓ is 0.005 (not 0.01 / 0.02).
+    let mut eng = num_box(r#"min="0.005" step="0.01""#, "0.005");
+    // The first press posts (`change`); later presses only store, since
+    // that action is still pending.
+    let s = |v: &str| (Some(v.to_string()), Some(v.to_string()));
+    let v = |v: &str| Some(v.to_string());
+    assert_eq!(arrow(&mut eng, "n", "n", "ArrowUp"), s("0.015"));
+    assert_eq!(arrow(&mut eng, "n", "n", "ArrowUp").0, v("0.025"));
+    assert_eq!(arrow(&mut eng, "n", "n", "ArrowDown").0, v("0.015"));
+    // step="any" moves by 1 and is rounded too: 524287.07 + 1 is
+    // 524288.0700000001 in f64, which survives a 10-place rounding.
+    let mut eng = num_box(r#"step="any""#, "524287.07");
+    assert_eq!(arrow(&mut eng, "n", "n", "ArrowUp"), s("524288.07"));
+    assert_eq!(arrow(&mut eng, "n", "n", "ArrowDown").0, v("524287.07"));
+    let mut eng = num_box(r#"step="any""#, "524287.16");
+    assert_eq!(arrow(&mut eng, "n", "n", "ArrowUp"), s("524288.16"));
+    // Arrows on the fee box over many steps stay on the 2-place grid.
+    let mut eng = num_box(r#"min="0" max="100.00" step="0.01""#, "4.05");
+    for want in ["4.06", "4.07", "4.08", "4.09", "4.10", "4.11"] {
+        assert_eq!(arrow(&mut eng, "n", "n", "ArrowUp").0, v(want));
+    }
+}
+
+/// #49 round 2 (crate-owner decision): an arrow never leaves `[min, max]`;
+/// with an off-grid max it lands on the highest grid value at or below max,
+/// like `stepUp` (max 99.996, step 0.01: 99.99), and a value already past
+/// that grid point does not move up.
+#[test]
+fn arrow_with_an_off_grid_max_stops_on_the_grid_at_or_below_max() {
+    let mut eng = num_box(r#"min="0" max="99.996" step="0.01""#, "99.98");
+    let up = |eng: &mut Engine| arrow(eng, "n", "n", "ArrowUp").0;
+    assert_eq!(up(&mut eng).as_deref(), Some("99.99"));
+    assert_eq!(up(&mut eng).as_deref(), Some("99.99"), "never 100.00");
+    assert_eq!(up(&mut eng).as_deref(), Some("99.99"));
+    // Typed off-grid 99.996 (allowed: commits clamp, never snap, #39).
+    let mut eng = num_box(r#"min="0" max="99.996" step="0.01""#, "99.996");
+    assert_eq!(up(&mut eng).as_deref(), Some("99.996"), "does not go up");
+    assert_eq!(
+        arrow(&mut eng, "n", "n", "ArrowDown").0.as_deref(),
+        Some("99.99")
+    );
+    // Whole-number grid with off-grid max, number box.
+    let mut eng = num_box(r#"min="0" max="5" step="2""#, "4");
+    assert_eq!(up(&mut eng).as_deref(), Some("4"));
+    // Range: same rule (max 1, step 0.3 → 0.9).
+    let mut eng = boot(
+        r#"<form id="f"><input id="r" type="range" name="r" value="0.6" min="0" max="1" step="0.3" hx-post="p.r" hx-trigger="change" /></form>"#,
+        &["p.r"],
+    );
+    assert_eq!(
+        arrow(&mut eng, "r", "r", "ArrowUp").0.as_deref(),
+        Some("0.9")
+    );
+    assert_eq!(
+        arrow(&mut eng, "r", "r", "ArrowUp").0.as_deref(),
+        Some("0.9")
+    );
+}
