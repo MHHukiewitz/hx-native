@@ -73,11 +73,41 @@ pub struct TextEditSession {
 }
 
 /// True when grouping separators should be shown for an unfocused number input.
+///
+/// Grouping is **opt-in** (issue #40): only `data-hx-group="on"` groups.
+/// Without it (or with any other value) the box shows the raw number.
 pub fn grouping_enabled(node: &blitz_dom::node::Node) -> bool {
     if !is_number_input(node) {
         return false;
     }
-    attr(node, "data-hx-group").as_deref() != Some("off")
+    attr(node, "data-hx-group").as_deref() == Some("on")
+}
+
+/// Show grouped text in every unfocused opt-in number input whose editor
+/// does not already show it. Returns the inputs that changed.
+pub fn apply_group_display_all(doc: &mut HtmlDocument, focused: Option<NodeId>) -> Vec<NodeId> {
+    let root = doc.root_node().id;
+    let mut changed = Vec::new();
+    for (nid, _) in number_inputs_under(doc, root) {
+        if Some(nid) == focused {
+            continue;
+        }
+        let Some(node) = doc.get_node(nid) else {
+            continue;
+        };
+        if !grouping_enabled(node) {
+            continue;
+        }
+        let want = format_grouped(&attr(node, "value").unwrap_or_default());
+        match editor_text(doc, nid) {
+            Some(shown) if shown != want => {
+                set_editor_text(doc, nid, &want);
+                changed.push(nid);
+            }
+            _ => {}
+        }
+    }
+    changed
 }
 
 /// Format a canonical number string with `,` thousands separators in the integer part.

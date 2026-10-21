@@ -38,11 +38,12 @@ use crate::select_ui::{
     select_damage_rects, select_row_damage_rect, select_ua_stylesheet, OpenSelect, SELECT_MAX_ROWS,
 };
 use crate::text_edit::{
-    apply_unfocused_display, backspace, caret_device_rect, commit_field, delete_forward,
-    delete_selection, editor_text, filter_number_insert, has_selection, insert_text, is_disabled,
-    is_editable_input, move_end, move_home, move_left, move_right, place_caret_at,
-    prepare_focus_display, resolve_step_target, select_all, selected_text, step_and_regroup,
-    step_direction, sync_value_from_editor, TextEditSession, CARET_BLINK_HALF_PERIOD,
+    apply_group_display_all, apply_unfocused_display, backspace, caret_device_rect, commit_field,
+    delete_forward, delete_selection, editor_text, filter_number_insert, has_selection,
+    insert_text, is_disabled, is_editable_input, move_end, move_home, move_left, move_right,
+    place_caret_at, prepare_focus_display, resolve_step_target, select_all, selected_text,
+    step_and_regroup, step_direction, sync_value_from_editor, TextEditSession,
+    CARET_BLINK_HALF_PERIOD,
 };
 use crate::trigger::{
     filter_ctx_from_key, keydown_repeat_allowed, FilterCtx, FromTarget, TriggerEvent,
@@ -232,6 +233,11 @@ struct LiveSurface {
     /// Last paint scale factor (hidpi). Full repaint when this changes.
     layout_scale: f64,
     needs_resolve: bool,
+    /// Opt-in thousands grouping (`data-hx-group="on"`, issue #40) still has
+    /// to be written into unfocused number editors. Set on load and after
+    /// every swap; consumed right after the next style+layout pass, once
+    /// Blitz has (re)built the `PlainEditor`s from their `value`.
+    group_display_pending: bool,
     /// Spec: skip clean frames — only raster when something is damaged.
     paint_dirty: bool,
     /// Force a full-surface repaint (first frame, theme/stylesheet, etc.).
@@ -1429,7 +1435,7 @@ impl LiveSurface {
         doc.resolve(0.0);
         let select_nids = collect_select_nids(&doc);
         let applied_control_nids = collect_applied_control_nids(&doc);
-        Ok(Self {
+        let mut live = Self {
             doc,
             bindings,
             sections,
@@ -1450,6 +1456,7 @@ impl LiveSurface {
             layout_viewport,
             layout_scale,
             needs_resolve: false,
+            group_display_pending: true,
             paint_dirty: true,
             force_full_repaint: true,
             cached_rgba: None,
@@ -1470,7 +1477,24 @@ impl LiveSurface {
             text_edit: None,
             limits_cache: Vec::new(),
             limits_markup: HashMap::new(),
-        })
+        };
+        // `doc.resolve` above built the editors: show opt-in grouping on load.
+        live.apply_pending_group_display();
+        Ok(live)
+    }
+
+    /// Write grouped display text into every unfocused opt-in number input
+    /// whose editor does not show it yet (issue #40: load, swap and blur all
+    /// show the same thing). Queues damage only for fields that changed.
+    fn apply_pending_group_display(&mut self) {
+        if !self.group_display_pending {
+            return;
+        }
+        self.group_display_pending = false;
+        let focused = self.text_edit.as_ref().map(|s| s.node_id);
+        for nid in apply_group_display_all(&mut self.doc, focused) {
+            self.queue_text_field_damage(nid);
+        }
     }
 
     fn resolve_doc(&mut self) {
@@ -1807,6 +1831,8 @@ impl LiveSurface {
 
         self.mark_dom_dirty();
         self.mark_paint_dirty();
+        // New number inputs get their editors on the next resolve; group then.
+        self.group_display_pending = true;
         // Reindex after swap so new hx-* inside fragments are visible.
         self.reindex_bindings(declared_actions)?;
         Ok(())
@@ -2695,6 +2721,7 @@ impl LiveSurface {
             self.resolve_doc();
             self.needs_resolve = false;
         }
+        self.apply_pending_group_display();
     }
 
     fn input(&mut self, ctx: &mut ActionCtx<'_>, ev: InputEvent) -> InputOutcome {
@@ -4545,6 +4572,12 @@ impl LiveSurface {
         // before damage planning so partial frames match a full repaint.
         if self.text_edit.as_ref().is_some_and(|s| s.needs_prepare) {
             self.ensure_text_edit_prepared();
+        }
+        // Opt-in grouping for inputs a load/swap just (re)built (issue #40),
+        // with its damage folded into this frame's plan.
+        if self.group_display_pending {
+            self.apply_pending_group_display();
+            pending.extend(std::mem::take(&mut self.pending_damage));
         }
 
         let plan = self.compute_plan(

@@ -615,7 +615,7 @@ fn slice_limits_overwrite_markup() {
 fn clamp_on_limit_change_emits_no_action_and_regroups_display() {
     let html = r#"
 <form id="f">
-  <input id="fee" type="number" name="fee" value="180000" />
+  <input id="fee" type="number" name="fee" value="180000" data-hx-group="on" />
   <button id="save" hx-post="settings.apply" hx-trigger="click">Save</button>
 </form>
 "#;
