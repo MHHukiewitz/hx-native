@@ -253,7 +253,7 @@ pub fn step_numeric_value(doc: &mut HtmlDocument, id: &str, dir: i32) -> bool {
         .and_then(|s| parse_f64(&s))
         .unwrap_or(limits.min.unwrap_or(0.0));
     let next = step_precise(current, dir, &limits);
-    write_value_attr(doc, nid, &format_numeric_for_step(next, &limits))
+    write_value_attr(doc, nid, &format_numeric(next))
 }
 
 fn clamp_safe_number(v: f64) -> f64 {
@@ -263,15 +263,46 @@ fn clamp_safe_number(v: f64) -> f64 {
     v.clamp(-MAX_SAFE_NUMBER, MAX_SAFE_NUMBER)
 }
 
-/// Round `v` to `decimals` places via a decimal-string round-trip. No `i64`
-/// intermediate anywhere, so there is no overflow/wraparound boundary to hit
-/// for any finite `v` — `format!` on `f64` never panics or saturates.
+/// Most decimal places any engine-computed number carries.
+const MAX_DECIMALS: usize = 10;
+
+/// Round `v` to `decimals` places via a decimal-string round-trip: the
+/// result is the `f64` nearest that decimal, so its shortest form (what
+/// [`format_numeric`] prints) has no binary noise. No `i64` intermediate
+/// anywhere, so there is no overflow/wraparound boundary to hit for any
+/// finite `v` — `format!` on `f64` never panics or saturates.
 fn round_decimal(v: f64, decimals: usize) -> f64 {
     if !v.is_finite() {
         return 0.0;
     }
-    let d = decimals.min(10);
+    let d = decimals.min(MAX_DECIMALS);
     format!("{v:.d$}").parse::<f64>().unwrap_or(v)
+}
+
+/// Decimal places in `v`'s shortest round-trip form (at most
+/// [`MAX_DECIMALS`]): `0.01` → 2, `1234567.89` → 2, `5` → 0.
+pub(crate) fn decimals_of(v: f64) -> usize {
+    if !v.is_finite() {
+        return 0;
+    }
+    let s = format!("{}", v.abs());
+    s.split_once('.')
+        .map_or(0, |(_, frac)| frac.len().min(MAX_DECIMALS))
+}
+
+/// Issue #48: the decimals a computed value may carry: those of `step`
+/// (unless `step="any"`), of `min` (the grid's origin) and of `operand`
+/// (the typed or current value), whichever is greatest. Every step, snap
+/// and clamp result is rounded to this before it is stored, so
+/// `410 × 0.01` is stored as `4.1`, never `4.1000000000000005`.
+pub(crate) fn result_decimals(limits: &NumericLimits, operand: f64) -> usize {
+    let step = if limits.unconstrained {
+        0
+    } else {
+        step_decimal_places(limits.step)
+    };
+    step.max(limits.min.map_or(0, decimals_of))
+        .max(decimals_of(operand))
 }
 
 /// Step by `dir` × `step`, clamp to `[min, max]`, and (unless `unconstrained`)
@@ -290,11 +321,16 @@ pub(crate) fn step_precise(current: f64, dir: i32, limits: &NumericLimits) -> f6
     let max = max.max(min);
 
     if limits.unconstrained {
-        let next = current + dir as f64 * limits.step;
+        let next = round_decimal(
+            current + dir as f64 * limits.step,
+            result_decimals(limits, current).max(decimals_of(limits.step)),
+        );
         return clamp_safe_number(next.clamp(min, max));
     }
 
-    let decimals = step_decimal_places(limits.step);
+    // On the grid the result has the grid's decimals (step, min); the
+    // current value's own decimals never matter there.
+    let decimals = result_decimals(limits, 0.0);
     let step = limits.step;
     if step <= 0.0 {
         return clamp_safe_number(current.clamp(min, max));
@@ -313,32 +349,40 @@ pub(crate) fn step_precise(current: f64, dir: i32, limits: &NumericLimits) -> f6
     } else {
         k.floor()
     };
-    let next = round_decimal(base + n * step, decimals).clamp(min, max);
-    clamp_safe_number(next)
+    // An arrow never leaves `[min, max]` and stays on the grid, like HTML
+    // stepUp/stepDown with an off-grid max: it lands on the highest grid
+    // value at or below `max` (max 99.996, step 0.01: 99.99). If that would
+    // move the value against the arrow (already past it), nothing changes.
+    let mut grid_max = round_decimal(base + ((max - base) / step + 1e-7).floor() * step, decimals);
+    // The `1e-7` slack absorbs float error in the division, but a max within
+    // 1e-7 steps below a grid value (max 4.99999999, step 1) would round up
+    // past it: step back once (Graph review of #49 r2).
+    if grid_max > max {
+        grid_max = round_decimal(grid_max - step, decimals);
+    }
+    let grid_max = if grid_max < min { min } else { grid_max };
+    let next = round_decimal(base + n * step, decimals).clamp(min, grid_max);
+    if (dir > 0 && next < current) || (dir < 0 && next > current) {
+        return no_negative_zero(current);
+    }
+    no_negative_zero(clamp_safe_number(next))
+}
+
+/// `-0.0` (a tiny negative rounded to the grid, e.g. `-0.9 + 3 × 0.3`) is
+/// stored and sent as `0`, never `-0.0` (Graph review of #49).
+fn no_negative_zero(v: f64) -> f64 {
+    if v == 0.0 {
+        0.0
+    } else {
+        v
+    }
 }
 
 pub(crate) fn step_decimal_places(step: f64) -> usize {
     if step <= 0.0 || !step.is_finite() {
         return 0;
     }
-    // Count decimals in a stable rendering of step (max 10).
-    let s = format!("{step:.10}");
-    let s = s.trim_end_matches('0');
-    match s.split_once('.') {
-        Some((_, frac)) => frac.len().min(10),
-        None => 0,
-    }
-}
-
-pub(crate) fn format_numeric_for_step(v: f64, limits: &NumericLimits) -> String {
-    let decimals = step_decimal_places(limits.step);
-    if decimals == 0 {
-        return format_numeric(v);
-    }
-    let s = format!("{v:.decimals$}");
-    // Trim only trailing zeros beyond the step's natural decimals? Keep step precision.
-    // "2.20" with step 0.01 stays "2.20"; "2.00" → "2.00" is fine for fee displays.
-    s
+    decimals_of(step)
 }
 
 /// Set a range control's value from pointer `x` (document coordinates).
@@ -425,7 +469,11 @@ fn clamp_snap(value: f64, limits: &NumericLimits) -> f64 {
     let max = max.max(min);
     let base = limits.min.unwrap_or(0.0);
     let stepped = if limits.step > 0.0 && !limits.unconstrained {
-        base + ((value - base) / limits.step).round() * limits.step
+        // Issue #48: back on the grid's decimals (step, min), no float noise.
+        round_decimal(
+            base + ((value - base) / limits.step).round() * limits.step,
+            result_decimals(limits, 0.0),
+        )
     } else {
         value
     };
@@ -630,13 +678,15 @@ pub(crate) fn format_numeric(v: f64) -> String {
         }
         return format!("{rounded:.0}");
     }
-    // Deterministic trim of trailing zeros.
-    let s = format!("{v:.10}");
-    let s = s.trim_end_matches('0').trim_end_matches('.');
+    // Issue #48: the shortest decimal that round-trips, after rounding to
+    // MAX_DECIMALS places. A value parsed from `1234567.89` prints exactly
+    // that; the old fixed `{:.10}` printed `1234567.8899999999` (the f64's
+    // own binary digits). Rust's `f64` Display never uses an exponent.
+    let s = format!("{}", round_decimal(v, MAX_DECIMALS));
     if s == "-0" {
         return "0".to_string();
     }
-    s.to_string()
+    s
 }
 
 #[cfg(test)]
@@ -672,6 +722,87 @@ mod tests {
         assert_eq!(format_numeric(clamp_snap(4.3, &lim)), "4.3");
         assert_eq!(format_numeric(clamp_snap(11.0, &lim)), "10");
         assert_eq!(format_numeric(clamp_snap(-1.0, &lim)), "0");
+    }
+
+    /// Issue #48: no binary float noise from parsing, snapping or stepping.
+    #[test]
+    fn results_carry_no_float_noise() {
+        assert_eq!(format_numeric(1234567.89), "1234567.89");
+        assert_eq!(format_numeric(-1234567.89), "-1234567.89");
+        assert_eq!(format_numeric(0.1 + 0.2), "0.3");
+        let fee = NumericLimits {
+            min: Some(0.0),
+            max: Some(100.0),
+            step: 0.01,
+            unconstrained: false,
+        };
+        // 410 × 0.01 is 4.1000000000000005 in f64.
+        assert_eq!(clamp_snap(4.1, &fee), 4.1);
+        assert_eq!(format_numeric(clamp_snap(4.1, &fee)), "4.1");
+        let mut v = 0.1;
+        let tenth = NumericLimits {
+            min: None,
+            max: None,
+            step: 0.1,
+            unconstrained: false,
+        };
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            v = super::step_precise(v, 1, &tenth);
+            seen.push(v);
+        }
+        // 3 × 0.1 is 0.30000000000000004 in f64.
+        assert_eq!(seen, [0.2, 0.3, 0.4]);
+        assert_eq!(super::step_precise(4.09, 1, &fee), 4.1);
+        // Min with more decimals than step: the grid keeps min's decimals.
+        let off = NumericLimits {
+            min: Some(0.005),
+            max: Some(1.0),
+            step: 0.01,
+            unconstrained: false,
+        };
+        assert_eq!(format_numeric(clamp_snap(0.016, &off)), "0.015");
+        assert_eq!(format_numeric(super::step_precise(0.005, 1, &off)), "0.015");
+        // step="any": the operand's own decimals survive the step.
+        let any = NumericLimits {
+            min: None,
+            max: None,
+            step: 1.0,
+            unconstrained: true,
+        };
+        assert_eq!(super::step_precise(0.7, 1, &any), 1.7);
+        // 0.14 + 1 is 1.1400000000000001 in f64.
+        assert_eq!(super::step_precise(0.14, 1, &any), 1.14);
+        assert_eq!(super::step_precise(1234567.89, 1, &any), 1234568.89);
+    }
+
+    /// Graph review of #49 r2: the `-0` guard and the off-grid max guard,
+    /// seen on the `f64` itself (the engine's formatter hides `-0`).
+    #[test]
+    fn step_precise_never_returns_negative_zero_or_passes_max() {
+        let lim = NumericLimits {
+            min: Some(-0.9),
+            max: None,
+            step: 0.3,
+            unconstrained: false,
+        };
+        let v = super::step_precise(-0.3, 1, &lim);
+        assert_eq!(v, 0.0);
+        assert!(v.is_sign_positive(), "-0.0 stored");
+        for (max, step, from, want) in [
+            (4.99999999, 1.0, 4.0, 4.0),
+            (99.9999999999, 0.01, 99.99, 99.99),
+            (0.3, 0.1, 0.2, 0.3),
+            (9.7, 1.0, 8.5, 9.5),
+        ] {
+            let lim = NumericLimits {
+                min: Some(if step == 1.0 && from == 8.5 { 0.5 } else { 0.0 }),
+                max: Some(max),
+                step,
+                unconstrained: false,
+            };
+            assert_eq!(super::step_precise(from, 1, &lim), want, "max {max}");
+        }
     }
 
     /// Blocker 2 (PR27 round 2): no `i64` cast, so values at/near the safe
