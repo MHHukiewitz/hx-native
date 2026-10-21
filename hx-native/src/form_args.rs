@@ -417,6 +417,22 @@ pub fn range_page_toward_x(doc: &mut HtmlDocument, id: &str, x: f32) -> bool {
     write_value_attr(doc, nid, &format_numeric(next))
 }
 
+/// Issue #35 round 3: PageUp / PageDown on a focused range move one page
+/// block (`dir` = +1 / -1), on the grid and within `[min, max]`, like a
+/// groove press. Returns `true` when the attribute changed.
+pub(crate) fn range_page(doc: &mut HtmlDocument, nid: NodeId, dir: f64) -> bool {
+    let Some(node) = doc.get_node(nid) else {
+        return false;
+    };
+    if !is_range_input(node) {
+        return false;
+    }
+    let limits = numeric_limits(node);
+    let current = crate::slider::range_value(node, &limits);
+    let next = range_snap(current + dir * range_page_block(&limits), &limits);
+    write_value_attr(doc, nid, &format_numeric(next))
+}
+
 /// Issue #35: Home / End on a range — write `min` (or `max` snapped onto
 /// the step grid). Returns `true` when the attribute changed.
 pub(crate) fn range_to_end(doc: &mut HtmlDocument, nid: NodeId, to_max: bool) -> bool {
@@ -444,7 +460,16 @@ pub(crate) fn range_snap(raw: f64, limits: &NumericLimits) -> f64 {
     }
     let min = limits.min.unwrap_or(-MAX_SAFE_NUMBER);
     let max = limits.max.unwrap_or(MAX_SAFE_NUMBER).max(min);
-    round_decimal(snapped, step_decimal_places(limits.step)).clamp(min, max)
+    let places = step_decimal_places(limits.step);
+    let v = round_decimal(snapped, places).clamp(min, max);
+    // A clamp to a max that is off the step grid (0..10 step 3) leaves the
+    // grid; like HTML, take the last on-grid value at or below max (9).
+    if v >= max && limits.step > 0.0 {
+        let base = limits.min.unwrap_or(0.0);
+        let k = ((max - base) / limits.step + 1e-9).floor();
+        return round_decimal(base + k * limits.step, places).clamp(min, max);
+    }
+    v
 }
 
 pub(crate) struct NumericLimits {

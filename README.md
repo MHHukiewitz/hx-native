@@ -24,6 +24,11 @@ hx-native draws a control only when Blitz cannot paint it at all: the range slid
 | `--hx-thumb-w` | slider thumb width | `11px` |
 | `--hx-groove-h` | slider groove height | `4px` |
 
+**Interim paint contract (#36, #58).** These controls, and the bevel the engine replays on hard-inset typed fields, are painted after Blitz, on top of the page. Until #36 and #58 are fixed, on one surface:
+- an opaque overlay (dialog, tooltip, popup) must not cover a slider, a scroll container's 16 px bar strip or a replayed field bevel; put the overlay on another surface or keep it clear;
+- `opacity` does not hide them (they paint fully opaque); use `display:none`;
+- only scroll containers (`overflow-y: auto | scroll`) clip them; a non-scroll `overflow:hidden` box does not.
+
 Map them from your own design tokens. Mainnet's Win95 look, for example:
 
 ```css

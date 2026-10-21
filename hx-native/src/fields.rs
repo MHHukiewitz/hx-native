@@ -114,6 +114,20 @@ fn hard_insets(doc: &HtmlDocument, nid: NodeId) -> Option<Vec<HardInset>> {
     if shadows.is_empty() {
         return None;
     }
+    // The replay paints square bands; a rounded field keeps Blitz's paint.
+    let b = style.get_border();
+    let basis = style::values::computed::CSSPixelLength::new(1.0);
+    if [
+        &b.border_top_left_radius,
+        &b.border_top_right_radius,
+        &b.border_bottom_right_radius,
+        &b.border_bottom_left_radius,
+    ]
+    .iter()
+    .any(|r| r.0.width.0.resolve(basis).px() != 0.0 || r.0.height.0.resolve(basis).px() != 0.0)
+    {
+        return None;
+    }
     let current = style.clone_color();
     let mut out = Vec::with_capacity(shadows.len());
     for s in shadows.iter() {

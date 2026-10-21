@@ -1044,3 +1044,219 @@ fn overriding_hx_variables_recolours_the_select_button_and_open_list() {
     let full = full_frame(&mut eng);
     assert_same(&partial, &full, "select theme swap partial == full");
 }
+
+// ---------------------------------------------------------------------------
+// Graph review of round 2 (7bbff3e).
+
+fn graph_range(attrs: &str) -> String {
+    page(
+        "#d{top:40px}",
+        &format!(
+            r#"<form id="f"><input id="d" class="trk" type="range" name="d" {attrs} hx-post="set.d" hx-trigger="change"></form>"#
+        ),
+    )
+}
+
+fn graph_slices(v: u64, limits: Vec<(String, String, InputLimits)>) -> Slices {
+    Slices {
+        versions: HashMap::from([("actions".into(), v), ("settings".into(), v)]),
+        limits,
+    }
+}
+
+/// A groove page past a max that is off the step grid stays on the grid
+/// (HTML: the last valid value below max), like End and a full drag.
+#[test]
+fn a_page_past_an_off_grid_max_stays_on_the_step_grid() {
+    let mut eng = boot(&graph_range(r#"min="0" max="10" step="3" value="9""#));
+    let (c, _, t, _) = slider(&eng, "d");
+    let (x, y) = ((t.0 + t.2 + 3.0).min(c.0 + c.2 - 1.0), c.1 + c.3 / 2.0);
+    let _ = eng.input(down(x, y));
+    let out = eng.input(up(x, y));
+    assert!(action(&out).is_none(), "9 is the top of the grid: {out:?}");
+    assert_eq!(value(&eng, "d"), "9");
+    let _ = eng.input(down(c.0 + 1.0, y));
+    let out = eng.input(up(c.0 + 1.0, y));
+    assert_eq!(
+        action(&out).expect("change").1,
+        &[("d".to_string(), "6".to_string())]
+    );
+}
+
+/// A #16 limits change moves the thumb without touching `value`; the old
+/// thumb is repainted (partial == full).
+#[test]
+fn a_limits_change_moves_the_thumb_and_partial_equals_full() {
+    let mut eng = boot(&graph_range(r#"min="0" max="100" step="10" value="50""#));
+    let lim = |max: f64| {
+        vec![(
+            "set.d".to_string(),
+            "d".to_string(),
+            InputLimits::new(0.0, max, Some(10.0)),
+        )]
+    };
+    eng.sync(&graph_slices(1, lim(100.0)), &mut Frags::default())
+        .unwrap();
+    let _ = frame(&mut eng);
+    eng.sync(&graph_slices(2, lim(200.0)), &mut Frags::default())
+        .unwrap();
+    let partial = frame(&mut eng);
+    let (c, _, t, _) = slider(&eng, "d");
+    assert_eq!((value(&eng, "d").as_str(), t.0), ("50", c.0 + 25.0));
+    let full = full_frame(&mut eng);
+    assert_same(&partial, &full, "limits change partial == full");
+}
+
+/// Tab away from a focused slider clears its focus dots (partial == full).
+#[test]
+fn tab_away_from_a_slider_clears_the_focus_dots() {
+    let html = page(
+        "#d{top:40px}#b{position:absolute;left:200px;top:40px;width:60px;height:20px}",
+        r#"<form id="f"><input id="d" class="trk" type="range" name="d" min="0" max="100" step="10" value="50"><button id="b" type="button">B</button></form>"#,
+    );
+    let mut eng = boot(&html);
+    let (cx, cy) = thumb_centre(&eng, "d");
+    let _ = eng.input(down(cx, cy));
+    let _ = eng.input(up(cx, cy));
+    assert_eq!(px(&frame(&mut eng), 22.0, 40.0), INK, "dots while focused");
+    let _ = eng.input(key("Tab"));
+    assert_eq!(eng.focus_state().focused_id.as_deref(), Some("b"));
+    let partial = frame(&mut eng);
+    assert_eq!(px(&partial, 22.0, 40.0), WHITE, "dots gone");
+    let full = full_frame(&mut eng);
+    assert_same(&partial, &full, "tab-away partial == full");
+}
+
+/// A right-aligned field that arrives by swap is aligned too (the
+/// post-resolve pass, not only the load-time one).
+#[test]
+fn a_swapped_in_right_aligned_field_is_aligned() {
+    let html = page(
+        ".val{position:absolute;left:20px;top:20px;width:60px;height:20px;padding:2px 6px;line-height:16px;text-align:right;background:#fff;border:0;color:#000}body{background:#c0c0c0}",
+        r##"<section id="sec" hx-trigger="slice:settings" hx-target="#t" hx-swap="innerHTML"><div id="t"></div></section>"##,
+    );
+    let mut eng = boot(&html);
+    let mut frags = Frags::default();
+    frags.bodies.insert(
+        "sec".into(),
+        r#"<input id="n" class="val" type="number" name="n" value="7">"#.into(),
+    );
+    eng.sync(&graph_slices(1, vec![]), &mut frags).unwrap();
+    let (lo, hi) = ink_span(&frame(&mut eng));
+    assert!((70.0..=74.0).contains(&hi) && lo > 50.0, "{lo}..{hi}");
+}
+
+/// The bevel replay paints square bands, so a rounded field keeps Blitz's
+/// own paint: the rounded-off corner shows what is behind it.
+#[test]
+fn a_rounded_field_keeps_blitz_paint_at_its_corners() {
+    let html = page(
+        &format!(".val{{position:absolute;left:20px;top:20px;width:60px;height:20px;padding:2px 6px;background:#fff;border:0;border-radius:8px;{FIELD}}}body{{background:#00ff00}}"),
+        r#"<input id="n" class="val" type="text" value="7">"#,
+    );
+    let mut eng = boot(&html);
+    let img = frame(&mut eng);
+    assert_eq!(px(&img, 20.0, 20.0), [0, 0xFF, 0, 0xFF]);
+}
+
+// ---------------------------------------------------------------------------
+// Round 3: off-grid max for every pointer / key path, and PageUp / PageDown
+// ahead of #34's scroll keys.
+
+/// Drag past the end, End, and a groove page all stop on the highest grid
+/// value at or below an off-grid max (0..10 step 3: 9, never 10).
+#[test]
+fn drag_and_end_stop_on_the_grid_below_an_off_grid_max() {
+    let mut eng = boot(&graph_range(r#"min="0" max="10" step="3" value="0""#));
+    let (cx, cy) = thumb_centre(&eng, "d");
+    let _ = eng.input(down(cx, cy));
+    let _ = eng.input(mv(cx + 1000.0, cy));
+    assert_eq!(value(&eng, "d"), "9", "drag past the end");
+    let out = eng.input(up(cx + 1000.0, cy));
+    assert_eq!(
+        action(&out).expect("change").1,
+        &[("d".to_string(), "9".to_string())]
+    );
+    let _ = eng.input(key("Home"));
+    assert_eq!(value(&eng, "d"), "0");
+    let _ = eng.input(key("End"));
+    assert_eq!(value(&eng, "d"), "9", "End");
+    // Every pixel of a drag lands on the grid.
+    let (c, _, _, _) = slider(&eng, "d");
+    let (cx, cy) = thumb_centre(&eng, "d");
+    let _ = eng.input(down(cx, cy));
+    let mut x = c.0 - 5.0;
+    while x < c.0 + c.2 + 5.0 {
+        let _ = eng.input(mv(x, cy));
+        let v: f64 = value(&eng, "d").parse().unwrap();
+        assert!((0.0..=9.0).contains(&v) && v % 3.0 == 0.0, "x={x}: {v}");
+        x += 1.0;
+    }
+    let _ = eng.input(up(x, cy));
+}
+
+/// PageUp / PageDown on a focused slider page one block (max(step,
+/// (max-min)/10) on the grid), and never past the grid top.
+#[test]
+fn page_keys_page_a_focused_slider() {
+    let mut eng = boot(&graph_range(r#"min="0" max="100" step="5" value="50""#));
+    let (cx, cy) = thumb_centre(&eng, "d");
+    let _ = eng.input(down(cx, cy));
+    let _ = eng.input(up(cx, cy));
+    let out = eng.input(key("PageDown"));
+    assert_eq!(value(&eng, "d"), "40");
+    assert_eq!(
+        action(&out).expect("change").1,
+        &[("d".to_string(), "40".to_string())]
+    );
+    let _ = eng.input(key("PageUp"));
+    let _ = eng.input(key("PageUp"));
+    assert_eq!(value(&eng, "d"), "60");
+    let mut eng = boot(&graph_range(r#"min="0" max="10" step="3" value="6""#));
+    let (cx, cy) = thumb_centre(&eng, "d");
+    let _ = eng.input(down(cx, cy));
+    let _ = eng.input(up(cx, cy));
+    let _ = eng.input(key("PageUp"));
+    assert_eq!(value(&eng, "d"), "9");
+    let _ = eng.input(key("PageUp"));
+    assert_eq!(value(&eng, "d"), "9", "grid top under max 10");
+}
+
+/// A slider inside a scroll container: PageDown moves the slider by one
+/// block and does not scroll the container (slider keys run before #34's
+/// scroll keys, as number-box arrows do). Even at the slider's bottom the
+/// key stays with the slider.
+#[test]
+fn page_down_on_a_slider_in_a_scroll_container_moves_the_slider_not_the_list() {
+    let html = page(
+        "#box{position:absolute;left:0;top:0;width:300px;height:100px;overflow-y:auto}#d{top:20px}#fill{height:600px}",
+        r#"<div id="box"><form id="f"><input id="d" class="trk" type="range" name="d" min="0" max="100" step="10" value="50" hx-post="set.d" hx-trigger="change"></form><div id="fill"></div></div>"#,
+    );
+    let mut eng = boot(&html);
+    let _ = frame(&mut eng);
+    let (top0, max) = eng.test_scroll_top("box").expect("box scrolls");
+    assert!(max > 0.0, "the container can scroll");
+    let (cx, cy) = thumb_centre(&eng, "d");
+    let _ = eng.input(down(cx, cy));
+    let _ = eng.input(up(cx, cy));
+    let out = eng.input(key("PageDown"));
+    assert_eq!(value(&eng, "d"), "40", "one block down");
+    assert!(action(&out).is_some(), "change fires: {out:?}");
+    assert_eq!(
+        eng.test_scroll_top("box").unwrap().0,
+        top0,
+        "list did not scroll"
+    );
+    for _ in 0..8 {
+        let _ = eng.input(key("PageDown"));
+    }
+    assert_eq!(value(&eng, "d"), "0");
+    assert_eq!(
+        eng.test_scroll_top("box").unwrap().0,
+        top0,
+        "at the slider's bottom PageDown still does not scroll"
+    );
+    let _ = eng.input(key("PageUp"));
+    assert_eq!(value(&eng, "d"), "10");
+    assert_eq!(eng.test_scroll_top("box").unwrap().0, top0);
+}

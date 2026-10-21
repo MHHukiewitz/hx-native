@@ -24,8 +24,8 @@ use crate::fonts::{bundled_font_context, HostFonts};
 use crate::form_args::{
     capture_applied_controls, capture_form_controls, clamp_snap_value, clamp_value, closest_form,
     collect_action_args, collect_applied_control_nids, format_numeric, is_number_input,
-    is_numeric_input, parse_f64, range_page_toward_x, range_to_end, set_range_value_from_x,
-    step_numeric_value, write_value_attr, NumericLimits, MAX_SAFE_NUMBER,
+    is_numeric_input, parse_f64, range_page, range_page_toward_x, range_to_end,
+    set_range_value_from_x, step_numeric_value, write_value_attr, NumericLimits, MAX_SAFE_NUMBER,
 };
 use crate::form_controls::{
     activate_checkable, checkbox_checked_by_name, control_is_disabled, form_control_at_point,
@@ -4391,8 +4391,15 @@ impl LiveSurface {
         let is_number = is_number_input(node);
         // Issue #35: Home / End on a focused range jump to min / max (the
         // max snapped onto the step grid), committing like an arrow step.
-        if !is_number && matches!(key, "Home" | "End") {
-            let changed = range_to_end(&mut self.doc, nid, key == "End");
+        // Round 3: PageUp / PageDown page one block, the same as a groove
+        // press. Handled here, before #34's scroll keys, so a slider inside
+        // a scroll container moves instead of scrolling it.
+        if !is_number && matches!(key, "Home" | "End" | "PageUp" | "PageDown") {
+            let changed = match key {
+                "PageUp" => range_page(&mut self.doc, nid, 1.0),
+                "PageDown" => range_page(&mut self.doc, nid, -1.0),
+                _ => range_to_end(&mut self.doc, nid, key == "End"),
+            };
             if changed {
                 let _ = sync_outputs_for(&mut self.doc, &fid);
                 self.mark_dom_dirty();
@@ -4692,7 +4699,14 @@ impl LiveSurface {
         if key.pressed
             && matches!(
                 key.key.as_str(),
-                "ArrowUp" | "ArrowRight" | "ArrowDown" | "ArrowLeft" | "Home" | "End"
+                "ArrowUp"
+                    | "ArrowRight"
+                    | "ArrowDown"
+                    | "ArrowLeft"
+                    | "Home"
+                    | "End"
+                    | "PageUp"
+                    | "PageDown"
             )
         {
             if let Some(out) = self.try_step_focused_numeric(ctx, &key.key) {
