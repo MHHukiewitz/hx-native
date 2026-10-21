@@ -184,6 +184,16 @@ impl SyncPacket {
     /// limits) in place when coalesced, whereas `Engine::sync` applied in
     /// order would clear greying and rules. Callers clearing the slice must
     /// send the `"actions"` version key.
+    ///
+    /// **Host contract (Graph review, PR #27 follow-up):** a host must change
+    /// the `"actions"` version key whenever it sends `input_limits` or
+    /// `input_rules`. A packet with `input_limits` but no `"actions"` key is
+    /// applied here when packets are coalesced (the non-empty term above),
+    /// but ignored by `Engine::sync` when syncs run in order, because
+    /// `input_limits()` is only re-read when the `"actions"` version changes.
+    /// The two paths only agree when the key moves with the data. The
+    /// non-empty `actions` / `input_rules` terms are pinned by
+    /// `tests/merge_no_actions_key.rs`.
     pub fn merge_per_slice(&mut self, newer: SyncPacket) {
         let replace_reserved_actions_slice = newer.versions.contains_key("actions")
             || !newer.actions.is_empty()
