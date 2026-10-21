@@ -80,7 +80,8 @@ Load-bearing facts to re-check at every Blitz bump:
   `ImageHandler`) must keep matching its decoder (same `image` crate build).
 - The header parsers in `src/svg.rs` (PNG IHDR, GIF screen + frames, WebP
   VP8/VP8L/VP8X, JPEG SOF) enforce `DATA_IMAGE_MAX_PIXELS` (256²),
-  `DATA_IMAGE_MAX_SIDE` (4096) and, summed per load or swap,
+  `DATA_IMAGE_MAX_SIDE` (4096) and, summed over the `<image>` references in
+  the markup of one load or swap (not painted copies; see #73),
   `DATA_IMAGE_MAX_TOTAL_PIXELS` (512²) before any decode. This header check is
   the limit: the decoders run inside blitz-dom and anyrender_svg under
   `image`'s default limits, and hx-native takes no direct `image` dependency

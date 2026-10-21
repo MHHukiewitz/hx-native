@@ -122,9 +122,11 @@ pub const DATA_IMAGE_MAX_PIXELS: u64 = 256 * 256;
 pub const DATA_IMAGE_MAX_SIDE: u64 = 4096;
 
 /// Decoded `<image>` pixels allowed in one load or swap, summed over every
-/// `<image>` reference in the markup (an inline `<image>`, or one inside a
-/// `data:` SVG, each time it appears), so many copies cannot add up:
-/// 512 x 512 (four images at the per-image cap).
+/// `<image>` reference in that markup (an inline `<image>`, or one inside a
+/// `data:` SVG, each time the URL is written): 512 x 512 (four images at
+/// the per-image cap). This counts references in the markup, not painted
+/// copies: one sheet rule painting a `data:` SVG on many elements counts
+/// once, and each swap is checked on its own (document-wide budget: #73).
 pub const DATA_IMAGE_MAX_TOTAL_PIXELS: u64 = 512 * 512;
 
 /// Why an SVG was rejected. Carried by
