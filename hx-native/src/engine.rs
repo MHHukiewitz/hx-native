@@ -21,7 +21,7 @@ use crate::error::EngineError;
 use crate::focus::{focusable_ids, ids_in_document_order, step_focus};
 use crate::fonts::{bundled_font_context, HostFonts};
 use crate::form_args::{
-    capture_applied_controls, capture_form_controls, clamp_snap_value, closest_form,
+    capture_applied_controls, capture_form_controls, clamp_snap_value, clamp_value, closest_form,
     collect_action_args, collect_applied_control_nids, format_numeric, is_number_input,
     is_numeric_input, parse_f64, set_range_value_from_x, step_numeric_value, write_value_attr,
     NumericLimits, MAX_SAFE_NUMBER,
@@ -46,11 +46,12 @@ use crate::select_ui::{
     select_damage_rects, select_row_damage_rect, select_ua_stylesheet, OpenSelect, SELECT_MAX_ROWS,
 };
 use crate::text_edit::{
-    apply_unfocused_display, backspace, caret_device_rect, commit_field, delete_forward,
-    delete_selection, editor_text, filter_number_insert, has_selection, insert_text, is_disabled,
-    is_editable_input, move_end, move_home, move_left, move_right, place_caret_at,
-    prepare_focus_display, resolve_step_target, select_all, selected_text, step_and_regroup,
-    step_direction, sync_value_from_editor, TextEditSession, CARET_BLINK_HALF_PERIOD,
+    apply_group_display_all, apply_unfocused_display, backspace, caret_device_rect, commit_field,
+    delete_forward, delete_selection, editor_text, filter_number_insert, has_selection,
+    insert_text, is_disabled, is_editable_input, move_end, move_home, move_left, move_right,
+    place_caret_at, prepare_focus_display, resolve_step_target, select_all, selected_text,
+    step_and_regroup, step_direction, sync_value_from_editor, text_outside_selection,
+    TextEditSession, CARET_BLINK_HALF_PERIOD,
 };
 use crate::trigger::{
     filter_ctx_from_key, keydown_repeat_allowed, FilterCtx, FromTarget, TriggerEvent,
@@ -240,6 +241,11 @@ struct LiveSurface {
     /// Last paint scale factor (hidpi). Full repaint when this changes.
     layout_scale: f64,
     needs_resolve: bool,
+    /// Opt-in thousands grouping (`data-hx-group="on"`, issue #40) still has
+    /// to be written into unfocused number editors. Set on load and after
+    /// every swap; consumed right after the next style+layout pass, once
+    /// Blitz has (re)built the `PlainEditor`s from their `value`.
+    group_display_pending: bool,
     /// Spec: skip clean frames — only raster when something is damaged.
     paint_dirty: bool,
     /// Force a full-surface repaint (first frame, theme/stylesheet, etc.).
@@ -1519,7 +1525,7 @@ impl LiveSurface {
         doc.resolve(0.0);
         let select_nids = collect_select_nids(&doc);
         let applied_control_nids = collect_applied_control_nids(&doc);
-        Ok(Self {
+        let mut live = Self {
             doc,
             bindings,
             sections,
@@ -1540,6 +1546,7 @@ impl LiveSurface {
             layout_viewport,
             layout_scale,
             needs_resolve: false,
+            group_display_pending: true,
             paint_dirty: true,
             force_full_repaint: true,
             cached_rgba: None,
@@ -1568,7 +1575,24 @@ impl LiveSurface {
             gutters: BTreeMap::new(),
             gutter_sheet_node: None,
             gutter_followup: false,
-        })
+        };
+        // `doc.resolve` above built the editors: show opt-in grouping on load.
+        live.apply_pending_group_display();
+        Ok(live)
+    }
+
+    /// Write grouped display text into every unfocused opt-in number input
+    /// whose editor does not show it yet (issue #40: load, swap and blur all
+    /// show the same thing). Queues damage only for fields that changed.
+    fn apply_pending_group_display(&mut self) {
+        if !self.group_display_pending {
+            return;
+        }
+        self.group_display_pending = false;
+        let focused = self.text_edit.as_ref().map(|s| s.node_id);
+        for nid in apply_group_display_all(&mut self.doc, focused) {
+            self.queue_text_field_damage(nid);
+        }
     }
 
     /// Blitz resolve plus scroll bookkeeping. Returns the number of
@@ -2053,6 +2077,8 @@ impl LiveSurface {
 
         self.mark_dom_dirty();
         self.mark_paint_dirty();
+        // New number inputs get their editors on the next resolve; group then.
+        self.group_display_pending = true;
         // Reindex after swap so new hx-* inside fragments are visible.
         self.reindex_bindings(declared_actions)?;
         Ok(())
@@ -2645,9 +2671,20 @@ impl LiveSurface {
         // to clamp). Range inputs cannot be meaningfully empty, so they keep
         // falling back to `limits.min` as before.
         let is_empty_number = is_number && value_attr.as_deref().unwrap_or("").trim().is_empty();
-        if !is_empty_number {
+        // A limits refresh never rewrites the box being edited (Designer
+        // call, #41 round 2): the new min/max/step attributes are already
+        // written above, so they apply on its commit (Enter or blur).
+        let focused_number = is_number && self.text_edit.as_ref().is_some_and(|s| s.node_id == nid);
+        if !is_empty_number && !focused_number {
             let current = value_attr.and_then(|s| parse_f64(&s)).unwrap_or(limits.min);
-            let clamped_s = format_numeric(clamp_snap_value(current, &clamp_limits));
+            // Number inputs hold typed values, which clamp to [min, max] but
+            // never snap to the step grid (issue #39); ranges keep the snap.
+            let clamped = if is_number {
+                clamp_value(current, &clamp_limits)
+            } else {
+                clamp_snap_value(current, &clamp_limits)
+            };
+            let clamped_s = format_numeric(clamped);
             if write_value_attr(&mut self.doc, nid, &clamped_s) {
                 changed = true;
                 let focused_here = self.text_edit.as_ref().is_some_and(|s| s.node_id == nid);
@@ -2941,11 +2978,12 @@ impl LiveSurface {
             let _ = self.resolve_doc();
             self.needs_resolve = std::mem::take(&mut self.gutter_followup);
         }
+        self.apply_pending_group_display();
     }
 
     fn input(&mut self, ctx: &mut ActionCtx<'_>, ev: InputEvent) -> InputOutcome {
         match ev {
-            InputEvent::Text(s) => self.on_text(s),
+            InputEvent::Text(s) => self.on_text(s, false),
             InputEvent::Paste(s) => self.on_paste(s),
             InputEvent::Copy => self.on_copy(false),
             InputEvent::Cut => self.on_copy(true),
@@ -3802,15 +3840,32 @@ impl LiveSurface {
         Some(change)
     }
 
+    fn hold_focused_number_to_commit(&mut self) {
+        let Some(nid) = self.text_edit.as_ref().map(|s| s.node_id) else {
+            return;
+        };
+        if self.doc.get_node(nid).is_some_and(is_number_input)
+            && editor_text(&mut self.doc, nid).is_some()
+        {
+            let _ = crate::text_edit::sync_value_from_editor(&mut self.doc, nid, true, true);
+        }
+    }
+
     fn revert_text_edit(&mut self) {
         let Some(session) = self.text_edit.take() else {
             return;
         };
-        let _ = crate::form_args::write_value_attr(
-            &mut self.doc,
-            session.node_id,
-            &session.value_at_focus,
-        );
+        // Esc restores the value at focus, held inside the limits as they are
+        // now: a limits refresh while focused skipped this box, and Esc also
+        // blurs, so it is the commit that applies them (Graph review of #41 r2).
+        let restored = match self.doc.get_node(session.node_id) {
+            Some(n) if is_number_input(n) && !session.value_at_focus.trim().is_empty() => {
+                let limits = crate::form_args::numeric_limits(n);
+                crate::text_edit::canonical_from_display(&session.value_at_focus, &limits, true)
+            }
+            _ => session.value_at_focus.clone(),
+        };
+        let _ = crate::form_args::write_value_attr(&mut self.doc, session.node_id, &restored);
         apply_unfocused_display(&mut self.doc, session.node_id);
         self.doc.clear_focus();
         self.focus.focused_id = None;
@@ -3818,7 +3873,7 @@ impl LiveSurface {
         self.queue_text_field_damage(session.node_id);
     }
 
-    fn on_text(&mut self, s: String) -> InputOutcome {
+    fn on_text(&mut self, s: String, paste: bool) -> InputOutcome {
         self.ensure_text_edit_prepared();
         let Some(session) = self.text_edit.clone() else {
             return InputOutcome::Unhandled(KeyEvent {
@@ -3840,7 +3895,10 @@ impl LiveSurface {
             return InputOutcome::None;
         }
         if is_number {
-            let existing = editor_text(&mut self.doc, nid).unwrap_or_default();
+            // Judge the insert against what survives the selection it
+            // replaces, not the old buffer (issue #38: pasting "3.45" over a
+            // selected "6.12" dropped the new '.').
+            let existing = text_outside_selection(&mut self.doc, nid).unwrap_or_default();
             let limits = self
                 .doc
                 .get_node(nid)
@@ -3851,8 +3909,30 @@ impl LiveSurface {
                     step: 1.0,
                     unconstrained: false,
                 });
-            // Commas accepted and ignored (not inserted while focused).
-            let filtered = filter_number_insert(&existing, &filtered, &limits);
+            let filtered = if paste {
+                // A paste is all or nothing (Graph review of #41): judge the
+                // whole text it would leave in the box, and refuse the paste
+                // rather than drop characters and commit a different number
+                // ("3.7" into a whole-month box must not become "37").
+                let ignore = self
+                    .doc
+                    .get_node(nid)
+                    .map(crate::text_edit::paste_ignore_chars)
+                    .unwrap_or_default();
+                let Some(cleaned) = crate::text_edit::clean_number_paste(&filtered, &ignore) else {
+                    return InputOutcome::None;
+                };
+                let (head, tail) =
+                    crate::text_edit::selection_split(&mut self.doc, nid).unwrap_or_default();
+                if !crate::text_edit::number_text_valid(&format!("{head}{cleaned}{tail}"), &limits)
+                {
+                    return InputOutcome::None;
+                }
+                cleaned
+            } else {
+                // Commas accepted and ignored (not inserted while focused).
+                filter_number_insert(&existing, &filtered, &limits)
+            };
             if filtered.is_empty() {
                 return InputOutcome::None;
             }
@@ -3872,7 +3952,7 @@ impl LiveSurface {
             return InputOutcome::None;
         }
         let prepared = crate::text_edit::sanitize_paste(&s);
-        self.on_text(prepared)
+        self.on_text(prepared, true)
     }
 
     fn on_copy(&mut self, cut: bool) -> InputOutcome {
@@ -4236,7 +4316,13 @@ impl LiveSurface {
             }
         };
         let changed = if is_number {
-            step_and_regroup(&mut self.doc, nid, dir)
+            let changed = step_and_regroup(&mut self.doc, nid, dir);
+            // Focused: keep the raw editable text with the caret at the end,
+            // not the grouped display (issue #40, Graph #42 review).
+            if self.text_edit.as_ref().is_some_and(|s| s.node_id == nid) {
+                prepare_focus_display(&mut self.doc, nid);
+            }
+            changed
         } else {
             step_numeric_value(&mut self.doc, &fid, dir)
         };
@@ -4741,6 +4827,11 @@ impl LiveSurface {
                     }
                     continue;
                 }
+                // A body shortcut does not blur the focused box (a click
+                // does), so hold its posted value to what Enter would commit:
+                // rounded and inside the current limits, never the raw text
+                // (Graph review of #41 round 2). Change still fires on commit.
+                self.hold_focused_number_to_commit();
                 return self.fire_on(ctx, &id, event, filter_ctx, trigger_info, None, true);
             }
             if let Some((source_id, name, reason)) = first_greyed {
@@ -5007,6 +5098,12 @@ impl LiveSurface {
         // before damage planning so partial frames match a full repaint.
         if self.text_edit.as_ref().is_some_and(|s| s.needs_prepare) {
             self.ensure_text_edit_prepared();
+        }
+        // Opt-in grouping for inputs a load/swap just (re)built (issue #40),
+        // with its damage folded into this frame's plan.
+        if self.group_display_pending {
+            self.apply_pending_group_display();
+            pending.extend(std::mem::take(&mut self.pending_damage));
         }
 
         let plan = self.compute_plan(

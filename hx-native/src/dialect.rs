@@ -14,8 +14,19 @@ pub const ATTR_HX_STEP: &str = "data-hx-step";
 /// Locked optional target id for a spin-box step control (bare id, no `#`).
 pub const ATTR_HX_STEP_FOR: &str = "data-hx-step-for";
 
-/// Engine-side opt-out for thousands grouping on `<input type=number>` (issue #17).
+/// Engine-side opt-in for thousands grouping on `<input type=number>` (issue #17;
+/// opt-in since issue #40: `data-hx-group="on"`, raw display otherwise).
 pub const ATTR_HX_GROUP: &str = "data-hx-group";
+
+/// Opt-in paste cleanup on `<input type=number>` (Designer call, #41 round 2):
+/// every character listed in the value is removed from pasted text before it
+/// is judged, e.g. `data-hx-paste-ignore="$,"` turns a pasted `$1,234` into
+/// `1234`. Default (absent / empty): nothing is removed. A `,` is never
+/// glued away: wherever it comes from, it must sit between thousands groups
+/// of the whole part ("1,234", "151,379,336"), or the paste is refused, so
+/// "3,5" never commits 35 (Graph review of #41 round 2). Listing `,` here
+/// has no effect: thousands commas are always handled by that rule.
+pub const ATTR_HX_PASTE_IGNORE: &str = "data-hx-paste-ignore";
 
 /// Issue #15 `RequiresChange` baseline override (Designer lock 2026-10-20).
 /// Valid only on `<input>` / `<select>` / `<textarea>`. Checkbox/radio hold
@@ -35,6 +46,7 @@ pub const SUPPORTED_HX_ATTRIBUTES: &[&str] = &[
     ATTR_HX_STEP,
     ATTR_HX_STEP_FOR,
     ATTR_HX_APPLIED,
+    ATTR_HX_PASTE_IGNORE,
 ];
 
 /// Locked swap strategies. Missing `hx-swap` defaults to `InnerHtml` (htmx parity).
