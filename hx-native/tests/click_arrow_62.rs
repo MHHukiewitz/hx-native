@@ -180,6 +180,18 @@ const TABLE: &[(&str, &str, &str, &str, bool, &str)] = &[
     ("step=any ▲", ANY, "2", "3.7", true, "4.7"),
     ("step=any ▼", ANY, "2", "3.7", false, "2.7"),
     ("grouped off grid ▲", GROUPED, "2", "1234.5", true, "1235"),
+    // #59 (issue #51): a typed comma that is not grouping is no number, so
+    // the value is the focus-time one; both arrows step from there.
+    (
+        "typed grouping comma ▲",
+        GROUPED,
+        "2",
+        "1,234.5",
+        true,
+        "1235",
+    ),
+    ("refused comma ▲ (3,5)", WHOLE, "2", "3,5", true, "3"),
+    ("refused comma ▼ (3,5)", WHOLE, "2", "3,5", false, "1"),
 ];
 
 /// The acceptance table: from a typed, uncommitted value, keyboard
