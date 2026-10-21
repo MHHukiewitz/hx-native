@@ -27,9 +27,24 @@ pub const FONT_REGULAR: &[u8] = include_bytes!("../../assets/fonts/DejaVuSans.tt
 /// It counts as an implicit entry in the host duplicate check (issue #28,
 /// crate-owner decision): a host face that ties with it would be silently
 /// shadowed (fontique keeps the first face registered), so it is rejected.
+/// The check compares family, weight and style only, **not width**: a
+/// condensed (or expanded) face registered as `"DejaVu Sans"` 400 normal is
+/// refused too, even though fontique would keep it as a separate face.
 pub(crate) const BUNDLED_FAMILY: &str = "DejaVu Sans";
 pub(crate) const BUNDLED_WEIGHT: u16 = 400;
 pub(crate) const BUNDLED_STYLE: FontStyle = FontStyle::Normal;
+
+/// Case-insensitive family key, lowercased per character exactly like
+/// fontique's family-name lookup (`char::to_lowercase`, not
+/// `str::to_lowercase`): a word-final `Σ` becomes `σ`, so `"ΟΔΟΣ"` and
+/// `"οδοσ"` are the same family here as they are in fontique.
+const COLLECTION_REASON: &str =
+    "font collections (.ttc/.otc, `ttcf` tag) and other multi-face files \
+     are not supported; pass one single-face file per FontFace";
+
+fn family_key(family: &str) -> String {
+    family.chars().flat_map(char::to_lowercase).collect()
+}
 
 /// One decoded DejaVu face shared across all ellipsis shapers / documents.
 fn decoded_font_bytes() -> Arc<Vec<u8>> {
@@ -96,14 +111,18 @@ impl HostFonts {
     /// validates the tables fontique reads to register a face (the font
     /// header, names, weight/style metadata) but **not glyph outlines**: a
     /// file with a corrupt `glyf`/`CFF` table passes and paints missing
-    /// glyphs. Only single-face files are accepted; a collection (`.ttc` /
-    /// `.otc`) or any file fontique reads as more than one face is rejected,
-    /// because one host family/weight/style override would apply to all of
-    /// its faces.
+    /// glyphs. Only single-face files are accepted: any collection (a
+    /// `ttcf` file tag, `.ttc` / `.otc`, even with one face) and any file
+    /// fontique reads as more than one face is rejected, because one host
+    /// family/weight/style override would apply to all of its faces.
+    ///
+    /// Families are compared case-insensitively the way fontique does
+    /// (per-character lowercasing, see `family_key`). The bundled-face tie
+    /// ignores width: a condensed `"DejaVu Sans"` 400 normal is refused too.
     pub(crate) fn build(faces: &[FontFace]) -> Result<Arc<Self>, EngineError> {
         let mut seen: HashSet<(String, u16, FontStyle)> = HashSet::new();
         // The bundled face is an implicit earlier entry (see BUNDLED_FAMILY).
-        seen.insert((BUNDLED_FAMILY.to_lowercase(), BUNDLED_WEIGHT, BUNDLED_STYLE));
+        seen.insert((family_key(BUNDLED_FAMILY), BUNDLED_WEIGHT, BUNDLED_STYLE));
         let mut out = Vec::with_capacity(faces.len());
         for (index, f) in faces.iter().enumerate() {
             let fail = |reason: &str| EngineError::InvalidFont {
@@ -118,8 +137,8 @@ impl HostFonts {
             if !(1..=1000).contains(&f.weight) {
                 return Err(fail("weight must be in 1..=1000"));
             }
-            let key = (family.to_lowercase(), f.weight, f.style);
-            let is_bundled = key == (BUNDLED_FAMILY.to_lowercase(), BUNDLED_WEIGHT, BUNDLED_STYLE);
+            let key = (family_key(family), f.weight, f.style);
+            let is_bundled = key == (family_key(BUNDLED_FAMILY), BUNDLED_WEIGHT, BUNDLED_STYLE);
             if !seen.insert(key) {
                 return Err(fail(if is_bundled {
                     "ties with the bundled DejaVu Sans 400 normal face, which it would never \
@@ -131,7 +150,13 @@ impl HostFonts {
             // TTF/OTF bytes are used as they are: the Blob shares the host's
             // `Arc<[u8]>` (no copy). Only WOFF/WOFF2 are decompressed, once
             // per engine.
-            let blob = match decode_font_bytes(&f.bytes) {
+            let decoded = decode_font_bytes(&f.bytes);
+            // Any collection is refused by its file tag, even with one face
+            // (checked on the decoded bytes, so a WOFF2-wrapped one counts).
+            if decoded.starts_with(b"ttcf") {
+                return Err(fail(COLLECTION_REASON));
+            }
+            let blob = match decoded {
                 Cow::Borrowed(_) => Blob::new(Arc::new(Arc::clone(&f.bytes)) as Arc<_>),
                 Cow::Owned(decoded) => Blob::new(Arc::new(decoded) as Arc<_>),
             };
@@ -154,10 +179,7 @@ impl HostFonts {
                 return Err(fail("bytes are not a readable TTF/OTF/WOFF/WOFF2 font"));
             }
             if face_count > 1 {
-                return Err(fail(
-                    "font collections (.ttc/.otc) and other multi-face files are not supported; \
-                     pass one single-face file per FontFace",
-                ));
+                return Err(fail(COLLECTION_REASON));
             }
             out.push(face);
         }
