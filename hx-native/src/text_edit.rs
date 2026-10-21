@@ -650,7 +650,7 @@ pub fn number_display(canonical: &str, limits: &NumericLimits, group: bool) -> S
 }
 
 /// Designer lock (Floor, 2026-10-21; Designer's HTML_CONTRACT): a number box
-/// always shows the grid's decimal places (those of `step` and `min`), so the
+/// always shows the step's decimal places, so the
 /// fee box (`step="0.01"`) shows `4.10` and `100.00`, never `4.1` / `100`.
 /// The `value` attribute and action args keep the plain number (`4.1`).
 /// `step="any"` has no grid and keeps the value's own decimals. Pure string
@@ -661,7 +661,7 @@ pub fn pad_to_step(canonical: &str, limits: &NumericLimits) -> String {
     if limits.unconstrained {
         return canonical.to_string();
     }
-    let want = crate::form_args::result_decimals(limits, 0.0);
+    let want = crate::form_args::decimals_of(limits.step);
     if want == 0 {
         return canonical.to_string();
     }

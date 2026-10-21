@@ -311,3 +311,66 @@ fn steady_state_re_render_does_not_fight_the_display() {
     }
     assert!(eng.paint(vp()).unwrap().skipped, "no follow-up paint");
 }
+
+/// Only `step` sets the places: with `min="0.005" step="0.01"` a typed `1`
+/// shows `1.00` (not `1.000`), and the grid value `0.015` shows as is.
+#[test]
+fn only_the_step_sets_the_places() {
+    let body = r#"<input id="fee" type="number" name="fee" value="0.015" min="0.005" step="0.01" /><input id="other" type="text" value="x" />"#;
+    let mut eng = boot(body);
+    assert_eq!(show(&mut eng).as_deref(), Some("0.015"));
+    eng.test_set_focus("fee");
+    let _ = key(&mut eng, "a", true);
+    let _ = eng.input(InputEvent::Text("1".into()));
+    let _ = key(&mut eng, "Tab", false);
+    assert_eq!(val(&eng).as_deref(), Some("1"));
+    assert_eq!(show(&mut eng).as_deref(), Some("1.00"));
+}
+
+struct LimitsSrc {
+    versions: HashMap<String, u64>,
+    limits: Vec<(String, String, InputLimits)>,
+}
+
+impl SliceSource for LimitsSrc {
+    fn version(&self, name: &str) -> Option<u64> {
+        self.versions.get(name).copied()
+    }
+    fn action_states(&self) -> Vec<(String, ActionState)> {
+        Vec::new()
+    }
+    fn input_limits(&self) -> Vec<(String, String, InputLimits)> {
+        self.limits.clone()
+    }
+}
+
+struct NoFrags;
+impl FragmentSource for NoFrags {
+    fn render(&mut self, _section_id: &str, _slices: &[&str]) -> String {
+        String::new()
+    }
+}
+
+/// A limits clamp of an unfocused box shows the step's decimals too
+/// (`150` clamped to max 100 shows `100.00`), grouped or not.
+#[test]
+fn limits_clamp_shows_the_steps_decimals() {
+    for (extra, shown) in [("", "100.00"), (r#"data-hx-group="on""#, "100.00")] {
+        let body = format!(
+            r#"<form id="f"><input id="fee" type="number" name="fee" value="150" {extra} /><button id="go" hx-post="deal.fee">Save</button></form>"#
+        );
+        let mut eng = boot(&body);
+        let src = LimitsSrc {
+            versions: HashMap::from([("actions".into(), 1)]),
+            limits: vec![(
+                "deal.fee".into(),
+                "fee".into(),
+                InputLimits::new(0.0, 100.0, Some(0.01)),
+            )],
+        };
+        eng.sync(&src, &mut NoFrags).unwrap();
+        let _ = eng.paint(vp()).unwrap();
+        assert_eq!(val(&eng).as_deref(), Some("100"), "{extra}");
+        assert_eq!(show(&mut eng).as_deref(), Some(shown), "{extra}");
+    }
+}
