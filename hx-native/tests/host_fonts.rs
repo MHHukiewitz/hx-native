@@ -405,3 +405,31 @@ fn duplicate_check_lowercases_like_fontique() {
         other => panic!("expected InvalidFont, got {other:?}"),
     }
 }
+
+/// A WOFF2-wrapped collection: the `ttcf` tag only appears after WOFF2
+/// decoding, so the collection check must run on the decoded bytes
+/// (Graph review of #32, mutant M3 "ttcf on raw bytes"). Fixture: a
+/// one-face TrueType collection of a DejaVu Sans subset, WOFF2-compressed
+/// (`tests/fonts/README.md`).
+#[test]
+fn woff2_collection_is_rejected() {
+    const WOFF2_TTC: &[u8] = include_bytes!("fonts/DejaVuSans-subset-collection1.woff2");
+    assert_eq!(&WOFF2_TTC[..4], b"wOF2");
+    assert_eq!(
+        &WOFF2_TTC[4..8],
+        b"ttcf",
+        "WOFF2 flavor must be a collection"
+    );
+    match invalid(vec![FontFace::new(
+        "Host",
+        400,
+        FontStyle::Normal,
+        Arc::<[u8]>::from(WOFF2_TTC),
+    )]) {
+        EngineError::InvalidFont { index, reason, .. } => {
+            assert_eq!(index, 0);
+            assert!(reason.contains("collection"), "{reason}");
+        }
+        other => panic!("expected InvalidFont, got {other:?}"),
+    }
+}

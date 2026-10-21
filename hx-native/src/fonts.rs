@@ -34,14 +34,16 @@ pub(crate) const BUNDLED_FAMILY: &str = "DejaVu Sans";
 pub(crate) const BUNDLED_WEIGHT: u16 = 400;
 pub(crate) const BUNDLED_STYLE: FontStyle = FontStyle::Normal;
 
-/// Case-insensitive family key, lowercased per character exactly like
-/// fontique's family-name lookup (`char::to_lowercase`, not
-/// `str::to_lowercase`): a word-final `Σ` becomes `σ`, so `"ΟΔΟΣ"` and
-/// `"οδοσ"` are the same family here as they are in fontique.
+/// `InvalidFont` reason for a font collection (a `ttcf` tag on the decoded
+/// bytes, or a file fontique reads as more than one face).
 const COLLECTION_REASON: &str =
     "font collections (.ttc/.otc, `ttcf` tag) and other multi-face files \
      are not supported; pass one single-face file per FontFace";
 
+/// Case-insensitive family key, lowercased per character exactly like
+/// fontique's family-name lookup (`char::to_lowercase`, not
+/// `str::to_lowercase`): a word-final `Σ` becomes `σ`, so `"ΟΔΟΣ"` and
+/// `"οδοσ"` are the same family here as they are in fontique.
 fn family_key(family: &str) -> String {
     family.chars().flat_map(char::to_lowercase).collect()
 }
@@ -178,6 +180,9 @@ impl HostFonts {
             if face_count == 0 {
                 return Err(fail("bytes are not a readable TTF/OTF/WOFF/WOFF2 font"));
             }
+            // Defensive: with read-fonts 0.41 only a `ttcf` tag yields more
+            // than one face, which the tag check above already refuses. Kept
+            // in case a later read-fonts reads other multi-face containers.
             if face_count > 1 {
                 return Err(fail(COLLECTION_REASON));
             }
