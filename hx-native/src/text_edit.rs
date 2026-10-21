@@ -117,7 +117,14 @@ pub fn format_grouped(canonical: &str) -> String {
         Some((i, f)) => (i, Some(f)),
         None => (rest, None),
     };
-    let digits: String = int_part.chars().filter(|c| c.is_ascii_digit()).collect();
+    // Only a plain decimal is grouped. Anything else (`1e5`, `abc`) is shown
+    // as written rather than having its non-digits dropped (`1e5` -> `15`).
+    if !int_part.chars().all(|c| c.is_ascii_digit())
+        || frac.is_some_and(|f| !f.chars().all(|c| c.is_ascii_digit()))
+    {
+        return canonical.to_string();
+    }
+    let digits: String = int_part.to_string();
     if digits.is_empty() {
         return canonical.to_string();
     }

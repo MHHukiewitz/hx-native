@@ -199,3 +199,56 @@ fn opt_in_swap_partial_matches_full_scale_1() {
 fn opt_in_swap_partial_matches_full_scale_2() {
     assert_swap_partial_matches_full(2.0);
 }
+
+// ── Graph #42 review additions ─────────────────────────────────────────
+
+#[test]
+fn focused_arrow_step_keeps_raw_text_and_caret_at_end() {
+    let mut eng = engine();
+    eng.declare_actions(&[]);
+    eng.load_html(&wrap(
+        r#"<input id="fee" type="number" name="fee" value="73480" data-hx-group="on" /><input id="other" type="text" value="x" />"#,
+    ))
+    .unwrap();
+    let _ = eng.paint(vp(1.0)).unwrap();
+    eng.test_set_focus("fee");
+    let _ = key(&mut eng, "ArrowUp", false);
+    assert_eq!(eng.attr("fee", "value").as_deref(), Some("73481"));
+    assert_eq!(
+        eng.test_editor_display("fee").as_deref(),
+        Some("73481"),
+        "a focused box stays raw after an arrow step"
+    );
+    let _ = eng.input(InputEvent::Text("9".into()));
+    assert_eq!(
+        eng.attr("fee", "value").as_deref(),
+        Some("734819"),
+        "the next digit appends, as in a box without grouping"
+    );
+    let _ = key(&mut eng, "Tab", false);
+    assert_eq!(eng.test_editor_display("fee").as_deref(), Some("734,819"));
+}
+
+#[test]
+fn non_plain_decimal_value_is_shown_as_written() {
+    let mut eng = engine();
+    eng.declare_actions(&[]);
+    eng.load_html(&wrap(
+        r#"<input id="e" type="number" name="e" value="1e5" data-hx-group="on" />"#,
+    ))
+    .unwrap();
+    assert_eq!(eng.test_editor_display("e").as_deref(), Some("1e5"));
+}
+
+/// Kills M5: without folding the group damage into the swap frame it spills
+/// into the next paint, which then is not skipped.
+#[test]
+fn swap_with_grouped_box_leaves_the_next_paint_idle() {
+    let (mut eng, out) = swapped_engine(1.0, true);
+    assert!(!out.skipped);
+    let next = eng.paint(vp(1.0)).unwrap();
+    assert!(
+        next.skipped,
+        "group damage must be painted in the swap frame, not the next one"
+    );
+}

@@ -3848,7 +3848,13 @@ impl LiveSurface {
             }
         };
         let changed = if is_number {
-            step_and_regroup(&mut self.doc, nid, dir)
+            let changed = step_and_regroup(&mut self.doc, nid, dir);
+            // Focused: keep the raw editable text with the caret at the end,
+            // not the grouped display (issue #40, Graph #42 review).
+            if self.text_edit.as_ref().is_some_and(|s| s.node_id == nid) {
+                prepare_focus_display(&mut self.doc, nid);
+            }
+            changed
         } else {
             step_numeric_value(&mut self.doc, &fid, dir)
         };
