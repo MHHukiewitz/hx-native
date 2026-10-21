@@ -433,8 +433,8 @@ pub(crate) struct BarGeom {
     pub max: f32,
     /// Clip from scroll-container ancestors (`None` = unclipped).
     pub clip: Option<ControlRect>,
-    /// Colours from the container's `--bg` / `--hi` / … tokens (issue #35);
-    /// a token change damages the bar.
+    /// Colours from the container's `--hx-*` variables (issue #35); a
+    /// variable change damages the bar.
     pub pal: Palette,
 }
 
@@ -780,8 +780,8 @@ impl<'a> Canvas<'a> {
         );
     }
 
-    /// `--raise`: `inset -1px -1px dk, inset 1px 1px hi, inset -2px -2px sh,
-    /// inset 2px 2px panel`, painted last-listed first.
+    /// Raised two-band bevel: outer `--hx-bevel-hi` top / left and
+    /// `--hx-bevel-dk` bottom / right, inner `--hx-bevel-lt` / `--hx-bevel-sh`.
     pub(crate) fn raise_bevel(&mut self, r: ControlRect) {
         self.top(r, 2.0, self.pal.lt);
         self.left(r, 2.0, self.pal.lt);
@@ -793,8 +793,8 @@ impl<'a> Canvas<'a> {
         self.right(r, 1.0, self.pal.dk);
     }
 
-    /// `--press`: `inset -1px -1px hi, inset 1px 1px dk, inset -2px -2px panel,
-    /// inset 2px 2px sh`.
+    /// Pressed two-band bevel: outer `--hx-bevel-dk` top / left and
+    /// `--hx-bevel-hi` bottom / right, inner `--hx-bevel-sh` / `--hx-bevel-lt`.
     pub(crate) fn press_bevel(&mut self, r: ControlRect) {
         self.top(r, 2.0, self.pal.sh);
         self.left(r, 2.0, self.pal.sh);
@@ -806,8 +806,8 @@ impl<'a> Canvas<'a> {
         self.right(r, 1.0, self.pal.hi);
     }
 
-    /// `--sunken` / `--field`: `inset -1px -1px hi, inset 1px 1px sh,
-    /// inset -2px -2px panel, inset 2px 2px dk`, painted last-listed first.
+    /// Sunken two-band bevel: outer `--hx-bevel-sh` top / left and
+    /// `--hx-bevel-hi` bottom / right, inner `--hx-bevel-dk` / `--hx-bevel-lt`.
     pub(crate) fn sunken_bevel(&mut self, r: ControlRect) {
         self.top(r, 2.0, self.pal.dk);
         self.left(r, 2.0, self.pal.dk);
@@ -820,7 +820,7 @@ impl<'a> Canvas<'a> {
     }
 
     /// Classic focus rectangle: 1 device px dotted line (every other pixel,
-    /// phase from the rect origin) along the edges of `r`, in `--ink`.
+    /// phase from the rect origin) along the edges of `r`, in `--hx-ink`.
     pub(crate) fn dotted_rect(&mut self, r: ControlRect) {
         let d = self.device(r);
         if d.w <= 0 || d.h <= 0 {

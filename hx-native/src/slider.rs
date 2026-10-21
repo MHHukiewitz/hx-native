@@ -231,13 +231,14 @@ pub(crate) fn grab_offset(g: &SliderGeom, x: f32, y: f32) -> f32 {
 pub(crate) fn paint_sliders(doc: &HtmlDocument, frame: &mut RgbaImage, scale: f64) {
     for g in all_sliders(doc) {
         let mut cv = Canvas::new(frame, scale, g.clip, g.pal);
-        // Thin groove: `--sunken` 4 px (sh / dk top, hi / panel bottom).
+        // Groove: sunken bevel, `--hx-groove-h` tall.
         cv.sunken_bevel(g.track);
-        // Focus: dotted `--ink` rectangle on the content box, under the thumb.
+        // Focus: dotted `--hx-ink` rectangle on the content box, under the thumb.
         if g.focused {
             cv.dotted_rect(g.content);
         }
-        // Thumb: `--bg` face + `--raise`; disabled = dithered face.
+        // Thumb: `--hx-face` + raised bevel; disabled = `--hx-face` /
+        // `--hx-bevel-hi` checker.
         if g.disabled {
             cv.checker(g.thumb, g.pal.face, g.pal.hi);
         } else {

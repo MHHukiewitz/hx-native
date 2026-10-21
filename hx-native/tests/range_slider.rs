@@ -979,6 +979,27 @@ fn without_host_variables_every_engine_drawn_control_uses_the_neutral_greys() {
     );
 }
 
+/// The 2026-10-21 styling rule: engine-drawn controls read only the crate's
+/// `--hx-*` variables. A host that defines only its own token names (the
+/// Mainnet fixture's `--bg` / `--edge-*` / `--ink` / `--field`, plus look-alike
+/// `--face` / `--track` names without the prefix) changes no engine-drawn
+/// pixel: the frame equals one with no host variables at all.
+#[test]
+fn host_tokens_without_the_hx_prefix_change_no_engine_drawn_pixel() {
+    let body = format!(r#"{}{SELECT_HTML}"#, skin_html(""));
+    let mut bare = boot(&page_bare("", &body));
+    bare.test_set_focus("r");
+    let want = frame(&mut bare);
+    let tokens = ":root{--bg:#ff0000;--ink:#00ff00;--edge-hi:#0000ff;--edge-lt:#ff00ff;--edge-sh:#00ffff;--edge-dk:#ffff00;--field:inset 1px 1px #ff0000;--face:#ff0000;--bevel-hi:#00ff00;--track:#0000ff;--thumb-w:40px;--groove-h:12px;--select-hl:#ff0000}";
+    let mut themed = boot(&page_bare(tokens, &body));
+    themed.test_set_focus("r");
+    let got = frame(&mut themed);
+    assert!(
+        want.pixels == got.pixels,
+        "non-`--hx-*` host tokens must not change slider, scrollbar or select pixels"
+    );
+}
+
 #[test]
 fn overriding_hx_variables_recolours_the_select_button_and_open_list() {
     let html = page(

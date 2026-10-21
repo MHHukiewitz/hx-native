@@ -1,5 +1,5 @@
 //! Typed field look fixes (issue #35): `text-align` inside single-line
-//! inputs and the full four-sided inset bevel (`--field`).
+//! inputs and the full four-sided inset bevel (author `box-shadow`).
 //!
 //! * Blitz `=0.3.0-beta.4` builds a single-line input's `PlainEditor` with no
 //!   width (`create_text_editor` → `set_width(None)`; only `<textarea>` gets
@@ -9,8 +9,8 @@
 //!   single-line field means anyway). Start-aligned fields are left alone.
 //! * Blitz's `draw_inset_box_shadow` paints inset shadows in list order, but
 //!   CSS paints the first shadow on top. A multi-layer hard bevel such as
-//!   `--field` (`inset -1px -1px hi, inset 1px 1px sh, inset -2px -2px panel,
-//!   inset 2px 2px dk`) therefore comes out as dark top/left only. For typed
+//!   `box-shadow: inset -1px -1px #fff, inset 1px 1px #888, inset -2px -2px
+//!   #ddd, inset 2px 2px #444` therefore comes out as dark top/left only. For typed
 //!   fields whose shadows are all hard insets (no blur / spread, opaque) the
 //!   engine repaints those bands in CSS order over the Blitz raster.
 
