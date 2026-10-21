@@ -374,7 +374,7 @@ pub enum InputEvent {
     /// Cut the current selection: [`InputOutcome::ClipboardWrite`] plus delete.
     Cut,
     /// Mouse wheel / trackpad scroll (issue #26), forwarded raw from egui's
-    /// `Event::MouseWheel`. `pos` is panel-local logical px (the same space as
+    /// `Event::MouseWheel`. `pos` is panel-local CSS px (the same space as
     /// [`InputEvent::PointerMove`]); `delta` keeps egui's sign (positive `y` =
     /// content moves down = scroll up). Only `delta.1` is used (vertical
     /// scrolling only); a wheel with `delta.1 == 0` is ignored.
@@ -393,9 +393,14 @@ pub enum InputEvent {
 
 /// Unit of [`InputEvent::Wheel`]'s `delta` (egui `MouseWheelUnit`).
 ///
-/// `Pixel`: logical px. `Line`: one line = [`SCROLL_LINE_ROWS`] rows of
-/// [`SCROLL_ROW_PX`]. `Page`: one page = the container's visible height minus
-/// one row. `#[non_exhaustive]`.
+/// Maps 1:1 from egui `MouseWheelUnit` (UI, 2026-10-21):
+/// - `Pixel` (egui `Point`): `delta` is in CSS px (1 CSS px per point).
+/// - `Line`: one line = [`SCROLL_LINE_ROWS`] rows of [`SCROLL_ROW_PX`]
+///   (60 px; winit reports one line per wheel notch, the Windows feel).
+/// - `Page`: one page = the container's visible (client) height minus one
+///   [`SCROLL_ROW_PX`] row, the same step as PageDown and a track click.
+///
+/// `#[non_exhaustive]`.
 #[non_exhaustive]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum WheelUnit {
