@@ -224,7 +224,14 @@ pub fn paint_select_overlays(
     };
     for &nid in selects {
         if let Some(rect) = control_rect_of(doc, nid) {
-            paint_dropdown_button(frame, &rect, scale);
+            match crate::scroll::ancestor_clip_css(doc, nid) {
+                None => paint_dropdown_button(frame, &rect, scale),
+                // Issue #26: a select inside a scroll container is clipped to
+                // its padding box like the rest of the scrolled content.
+                Some(clip) => paint_clipped(frame, &rect, clip, scale, |f| {
+                    paint_dropdown_button(f, &rect, scale)
+                }),
+            }
         }
     }
 
@@ -234,6 +241,49 @@ pub fn paint_select_overlays(
     let opts = select_options(doc, open.select_nid);
     let rows = opts.len().min(SELECT_MAX_ROWS);
     paint_open_list(frame, open, &opts[..rows], scale, hover_row);
+}
+
+/// Run `paint` but keep every pixel outside `clip` (CSS px) as it was.
+fn paint_clipped(
+    frame: &mut RgbaImage,
+    area: &ControlRect,
+    clip: ControlRect,
+    scale: f64,
+    paint: impl FnOnce(&mut RgbaImage),
+) {
+    let (fw, fh) = (frame.width as i32, frame.height as i32);
+    let a = area.as_device(scale);
+    let (x0, y0) = ((a.x - 2).max(0), (a.y - 2).max(0));
+    let (x1, y1) = ((a.x + a.w + 2).min(fw), (a.y + a.h + 2).min(fh));
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let c = clip.as_device(scale);
+    let inside = |x: i32, y: i32| x >= c.x && y >= c.y && x < c.x + c.w && y < c.y + c.h;
+    let mut saved = Vec::new();
+    for y in y0..y1 {
+        for x in x0..x1 {
+            if !inside(x, y) {
+                let i = ((y * fw + x) * 4) as usize;
+                saved.push((
+                    i,
+                    [
+                        frame.pixels[i],
+                        frame.pixels[i + 1],
+                        frame.pixels[i + 2],
+                        frame.pixels[i + 3],
+                    ],
+                ));
+            }
+        }
+    }
+    if saved.len() == ((x1 - x0) * (y1 - y0)) as usize {
+        return; // fully clipped
+    }
+    paint(frame);
+    for (i, px) in saved {
+        frame.pixels[i..i + 4].copy_from_slice(&px);
+    }
 }
 
 fn paint_dropdown_button(frame: &mut RgbaImage, control: &ControlRect, scale: f64) {

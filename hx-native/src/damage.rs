@@ -260,13 +260,15 @@ fn document_affine_device(doc: &HtmlDocument, nid: NodeId, scale: f64) -> Option
     for id in chain {
         let node = doc.get_node(id)?;
         let loc = node.final_layout().location;
-        let scroll = node.scroll_offset();
-        xf *= Affine::translate(Vec2::new(
-            (loc.x as f64 - scroll.x) * scale,
-            (loc.y as f64 - scroll.y) * scale,
-        ));
+        xf *= Affine::translate(Vec2::new(loc.x as f64 * scale, loc.y as f64 * scale));
         if let Some(t) = local_transform_device(node, scale, doc_scale) {
             xf *= t;
+        }
+        // A scroll offset moves the node's *children* (Blitz paint translates
+        // the content, not the scroll container's own box): issue #26.
+        if id != nid {
+            let scroll = node.scroll_offset();
+            xf *= Affine::translate(Vec2::new(-scroll.x * scale, -scroll.y * scale));
         }
     }
     Some(xf)
@@ -378,6 +380,10 @@ pub(crate) fn ink_box_device(
 /// Snapshot every element's own + ink bounds after a successful paint resolve.
 pub(crate) fn snapshot_bounds(doc: &HtmlDocument, scale: f64) -> BoundsSnapshot {
     let mut map = BoundsSnapshot::new();
+    // Issue #26: ink inside a scroll container is clipped to its padding box,
+    // so scrolling only damages the container, not the rows scrolled away
+    // beyond it (which Blitz does not paint).
+    let any_scroller = !crate::scroll::scroll_containers(doc).is_empty();
     let root = doc.root_node().id;
     let mut stack = vec![root];
     while let Some(nid) = stack.pop() {
@@ -403,10 +409,52 @@ pub(crate) fn snapshot_bounds(doc: &HtmlDocument, scale: f64) -> BoundsSnapshot 
             own_box_device(doc, nid, scale),
             ink_box_device(doc, nid, scale),
         ) {
+            let ink = if any_scroller {
+                clip_ink_to_scrollers(doc, nid, scale, ink)
+            } else {
+                ink
+            };
             map.insert(nid, NodeBounds { own, ink });
         }
     }
     map
+}
+
+/// Intersect `ink` (device px) with the padding boxes of `nid`'s scroll
+/// container ancestors. Fully clipped ink comes back with zero size.
+fn clip_ink_to_scrollers(
+    doc: &HtmlDocument,
+    nid: NodeId,
+    scale: f64,
+    ink: (f64, f64, f64, f64),
+) -> (f64, f64, f64, f64) {
+    let Some(c) = crate::scroll::ancestor_clip_css(doc, nid) else {
+        return ink;
+    };
+    let (cx0, cy0) = (c.x as f64 * scale, c.y as f64 * scale);
+    let (cx1, cy1) = (cx0 + c.w as f64 * scale, cy0 + c.h as f64 * scale);
+    let x0 = ink.0.max(cx0);
+    let y0 = ink.1.max(cy0);
+    let x1 = (ink.0 + ink.2).min(cx1);
+    let y1 = (ink.1 + ink.3).min(cy1);
+    if x1 <= x0 || y1 <= y0 {
+        return (x0.min(cx1), y0.min(cy1), 0.0, 0.0);
+    }
+    (x0, y0, x1 - x0, y1 - y0)
+}
+
+/// Snapped damage rect for an ink box; `None` for empty (fully clipped) ink.
+pub(crate) fn ink_damage_rect(
+    ink: (f64, f64, f64, f64),
+    surface_w: u32,
+    surface_h: u32,
+) -> Option<IntRect> {
+    let (x, y, w, h) = ink;
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    let r = snap_outward(x, y, w, h, surface_w, surface_h);
+    (!r.is_empty()).then_some(r)
 }
 
 /// Collect node ids that still carry non-empty restyle damage (call after `resolve_stylist`).
@@ -459,9 +507,7 @@ pub(crate) fn compute_raw_damage(
     // Disappeared nodes: old ink.
     for (nid, prev) in previous {
         if !current.contains_key(nid) {
-            let (x, y, w, h) = prev.ink;
-            let r = snap_outward(x, y, w, h, surface_w, surface_h);
-            if !r.is_empty() {
+            if let Some(r) = ink_damage_rect(prev.ink, surface_w, surface_h) {
                 rects.push(r);
             }
         }
@@ -480,15 +526,11 @@ pub(crate) fn compute_raw_damage(
         }
 
         if let Some(p) = prev {
-            let (x, y, w, h) = p.ink;
-            let r = snap_outward(x, y, w, h, surface_w, surface_h);
-            if !r.is_empty() {
+            if let Some(r) = ink_damage_rect(p.ink, surface_w, surface_h) {
                 rects.push(r);
             }
         }
-        let (x, y, w, h) = now.ink;
-        let r = snap_outward(x, y, w, h, surface_w, surface_h);
-        if !r.is_empty() {
+        if let Some(r) = ink_damage_rect(now.ink, surface_w, surface_h) {
             rects.push(r);
         }
     }
@@ -516,6 +558,34 @@ mod scale_space_tests {
                 ..Default::default()
             },
         )
+    }
+
+    /// Issue #26: a scroll offset moves the container's children, never the
+    /// container's own box (Blitz paint translates content only). Before the
+    /// fix the container's own border box moved up with its offset.
+    #[test]
+    fn scroll_offset_moves_children_not_the_container() {
+        let html = r#"<!DOCTYPE html><html><body style="margin:0">
+<div id="sc" style="position:absolute;left:10px;top:40px;width:100px;height:60px;overflow-y:auto">
+<div id="c" style="height:200px"></div></div>
+</body></html>"#;
+        for scale in [1.0_f64, 2.0] {
+            let mut doc = doc_at(html, (400.0 * scale) as u32, (300.0 * scale) as u32, scale);
+            doc.resolve(0.0);
+            let sc = doc.get_element_by_id("sc").unwrap();
+            let c = doc.get_element_by_id("c").unwrap();
+            doc.scroll_to(sc, 0.0, 30.0, blitz_dom::ScrollBehavior::Instant);
+            let own = element_border_box_device(&doc, sc, scale).unwrap();
+            let child = element_border_box_device(&doc, c, scale).unwrap();
+            assert!(
+                (own.1 - 40.0 * scale).abs() < 0.01,
+                "container stays: {own:?}"
+            );
+            assert!(
+                (child.1 - 10.0 * scale).abs() < 0.01,
+                "child moves: {child:?}"
+            );
+        }
     }
 
     #[test]

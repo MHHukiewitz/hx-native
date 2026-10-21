@@ -11,8 +11,9 @@ use blitz_html::{HtmlDocument, HtmlProvider};
 use blitz_traits::shell::{ColorScheme, Viewport as BlitzViewport};
 
 use crate::damage::{
-    collect_style_damaged, compute_raw_damage, ink_box_device, merge_damage_rects, snap_outward,
-    snapshot_bounds, BoundsSnapshot, DamagePlan, IntRect,
+    collect_style_damaged, compute_raw_damage, element_border_box_css, ink_box_device,
+    ink_damage_rect, merge_damage_rects, snap_outward, snapshot_bounds, BoundsSnapshot, DamagePlan,
+    IntRect,
 };
 use crate::dialect::{validate_loaded_attrs, ElementBinding, SwapMode, SyncMode};
 use crate::ellipsis::{prepare_ellipsis_for_paint, EllipsisCache, EllipsisShaper};
@@ -33,6 +34,13 @@ use crate::form_controls::{
 use crate::memory::estimate_surface_engine_bytes;
 use crate::paint::{paint_damage_into, paint_rgba};
 use crate::pending::{PendingEntry, PendingState, PendingTimeout, QueuedRelease};
+use crate::scroll::{
+    all_bars, author_padding_right_css, bar_geometry, bar_hit, bar_unoccluded, can_scroll,
+    container_damage_rect, containers_at, gutter_css, is_scroll_container, max_offset_y,
+    offset_y as scroll_offset_y, padding_box_css as scroll_padding_box, page_px, paint_scrollbars,
+    scroll_ancestors, scroll_containers, set_offset_y, visible_element_from_point, wants_gutter,
+    BarGeom, BarPart, PressedArrow,
+};
 use crate::select_ui::{
     collect_select_nids, control_rect_of, list_row_at, open_select_state, paint_select_overlays,
     select_damage_rects, select_row_damage_rect, select_ua_stylesheet, OpenSelect, SELECT_MAX_ROWS,
@@ -288,6 +296,37 @@ struct LiveSurface {
     /// non-blocking item): restored when a later `input_limits()` no longer
     /// lists that key.
     limits_markup: HashMap<(String, String), MarkupSnapshot>,
+    /// Issue #26: element id -> vertical scroll offset recorded just before
+    /// a swap replaced (or refilled) that element; restored, clamped, at the
+    /// next layout when an element with the same id exists.
+    scroll_restore: HashMap<String, f32>,
+    /// Issue #26: primary-button drag on a scrollbar thumb.
+    scroll_drag: Option<ScrollDrag>,
+    /// Issue #26: scrollbar arrow held down (pressed bevel until PointerUp).
+    scroll_pressed: Option<PressedArrow>,
+    /// Issue #26: the current primary press started on a scrollbar, so the
+    /// matching `PointerUp` is consumed (no click).
+    scroll_press_active: bool,
+    /// Issue #26: scrollbar geometry + pressed state painted last frame; a
+    /// change damages the old and new bar rects.
+    last_bars: Vec<(BarGeom, Option<BarPart>)>,
+    /// Issue #26 round 3: element id -> author `padding-right` (CSS text)
+    /// for every container with an engine-reserved 16 px gutter. Sticky per
+    /// id: kept across same-id swaps, dropped once no element has the id.
+    gutters: BTreeMap<String, String>,
+    /// Detached engine-owned element carrying the gutter stylesheet (never
+    /// in the tree, so never serialized and never hit-tested).
+    gutter_sheet_node: Option<NodeId>,
+    /// A gutter made another container overflow: resolve again next time.
+    gutter_followup: bool,
+}
+
+/// Thumb drag state (issue #26).
+#[derive(Copy, Clone, Debug)]
+struct ScrollDrag {
+    nid: NodeId,
+    /// Pointer y minus thumb top at press, CSS px.
+    grab: f32,
 }
 
 /// Markup `min`/`max`/`step` attribute values an input had before the engine
@@ -1292,6 +1331,57 @@ impl Engine {
         crate::damage::element_border_box_css(&live.doc, nid)
     }
 
+    /// Test helper (issue #26): vertical scroll offset and max offset of the
+    /// element `id` on the default surface, CSS px.
+    #[doc(hidden)]
+    pub fn test_scroll_top(&self, id: &str) -> Option<(f32, f32)> {
+        let live = self.live(SurfaceId::DEFAULT)?;
+        let nid = live.doc.get_element_by_id(id)?;
+        Some((
+            crate::scroll::offset_y(&live.doc, nid),
+            crate::scroll::max_offset_y(&live.doc, nid),
+        ))
+    }
+
+    /// Test helper (issue #26 round 3): content box of `id` in CSS px
+    /// `(x, y, w, h)` — border box minus border and padding (the reserved
+    /// gutter is part of the padding).
+    #[doc(hidden)]
+    pub fn test_content_box(&self, id: &str) -> Option<(f32, f32, f32, f32)> {
+        let live = self.live(SurfaceId::DEFAULT)?;
+        let nid = live.doc.get_element_by_id(id)?;
+        let (x, y, w, h) = crate::damage::element_border_box_css(&live.doc, nid)?;
+        let l = live.doc.get_node(nid)?.final_layout();
+        let (b, p) = (l.border, l.padding);
+        Some((
+            x + b.left + p.left,
+            y + b.top + p.top,
+            w - b.left - b.right - p.left - p.right,
+            h - b.top - b.bottom - p.top - p.bottom,
+        ))
+    }
+
+    /// Test helper (issue #26): engine-drawn scrollbar geometry for `id`
+    /// (CSS px): `(up, down, track, thumb)` as `(x, y, w, h)`; `None` when no
+    /// bar is shown.
+    #[doc(hidden)]
+    #[allow(clippy::type_complexity)]
+    pub fn test_scrollbar(
+        &self,
+        id: &str,
+    ) -> Option<(
+        (f32, f32, f32, f32),
+        (f32, f32, f32, f32),
+        (f32, f32, f32, f32),
+        Option<(f32, f32, f32, f32)>,
+    )> {
+        let live = self.live(SurfaceId::DEFAULT)?;
+        let nid = live.doc.get_element_by_id(id)?;
+        let g = crate::scroll::bar_geometry(&live.doc, nid)?;
+        let t = |r: crate::select_ui::ControlRect| (r.x, r.y, r.w, r.h);
+        Some((t(g.up), t(g.down), t(g.track), g.thumb.map(t)))
+    }
+
     /// Test helper (issue #15): total `hx-changed` class attribute writes on
     /// the default surface so far. Must not grow on an edit that keeps the
     /// same changed/unchanged state (flip-only mutation).
@@ -1427,7 +1517,7 @@ fn unrouted_outcome(ev: InputEvent) -> InputOutcome {
         InputEvent::PointerDown { .. } | InputEvent::PointerUp { .. } => {
             InputOutcome::Press { id: None }
         }
-        InputEvent::PointerMove { .. } => InputOutcome::None,
+        InputEvent::PointerMove { .. } | InputEvent::Wheel { .. } => InputOutcome::None,
     }
 }
 
@@ -1502,6 +1592,14 @@ impl LiveSurface {
             text_edit: None,
             limits_cache: Vec::new(),
             limits_markup: HashMap::new(),
+            scroll_restore: HashMap::new(),
+            scroll_drag: None,
+            scroll_pressed: None,
+            scroll_press_active: false,
+            last_bars: Vec::new(),
+            gutters: BTreeMap::new(),
+            gutter_sheet_node: None,
+            gutter_followup: false,
         };
         // `doc.resolve` above built the editors: show opt-in grouping on load.
         live.apply_pending_group_display();
@@ -1522,9 +1620,156 @@ impl LiveSurface {
         }
     }
 
-    fn resolve_doc(&mut self) {
-        let passes = resolve_with_data_images(&mut self.doc, &self.svg_provider);
-        self.resolve_count = self.resolve_count.saturating_add(passes);
+    /// Blitz resolve plus scroll bookkeeping. Returns the number of
+    /// style+layout passes run: 1, or 2 on the frame where a scroll
+    /// container first needs its gutter (issue #26 round 3).
+    fn resolve_doc(&mut self) -> u64 {
+        self.prune_gutters();
+        // #23: a pass that hands out a data: SVG gets one more resolve so
+        // the image is in this frame (counted, not a gutter pass).
+        let image_passes = resolve_with_data_images(&mut self.doc, &self.svg_provider);
+        self.resolve_count = self.resolve_count.saturating_add(image_passes);
+        let mut passes = 1;
+        // Gutters are sticky and only ever added, so this terminates; a
+        // gutter that makes a nested container overflow (narrower content)
+        // is reserved in the same frame. Bounded so a pathological tree
+        // costs at most GUTTER_MAX_PASSES extra layouts per frame.
+        const GUTTER_MAX_PASSES: u64 = 3;
+        while passes <= GUTTER_MAX_PASSES && self.reserve_new_gutters() {
+            self.doc.resolve(0.0);
+            self.resolve_count = self.resolve_count.saturating_add(1);
+            passes += 1;
+        }
+        if self.containers_needing_gutter().next().is_some() {
+            self.gutter_followup = true;
+            self.paint_dirty = true;
+        }
+        self.settle_scroll_offsets();
+        passes + image_passes - 1
+    }
+
+    /// Scroll containers with an id that need a gutter but have none yet.
+    fn containers_needing_gutter(&self) -> impl Iterator<Item = (NodeId, String)> + '_ {
+        scroll_containers(&self.doc).into_iter().filter_map(|nid| {
+            let id = node_id_attr(&self.doc, nid)?;
+            (!self.gutters.contains_key(&id) && wants_gutter(&self.doc, nid)).then_some((nid, id))
+        })
+    }
+
+    /// Issue #26 round 3: reserve the 16 px gutter on containers that first
+    /// overflow (or are `overflow-y: scroll`) after a layout. Returns whether
+    /// the gutter sheet changed (caller lays out once more).
+    fn reserve_new_gutters(&mut self) -> bool {
+        let new: Vec<(NodeId, String)> = self.containers_needing_gutter().collect();
+        if new.is_empty() {
+            return false;
+        }
+        for (nid, id) in &new {
+            let base = author_padding_right_css(&self.doc, *nid);
+            self.gutters.insert(id.clone(), base);
+        }
+        self.install_gutter_sheet();
+        for (nid, _) in new {
+            let r = container_damage_rect(&self.doc, nid, self.layout_scale);
+            self.push_pending_damage(r);
+        }
+        self.mark_paint_dirty();
+        true
+    }
+
+    /// Drop gutters whose id is gone from the document (element replaced by
+    /// a new id). Runs before layout; no extra pass.
+    fn prune_gutters(&mut self) {
+        if self.gutters.is_empty() {
+            return;
+        }
+        let before = self.gutters.len();
+        let doc = &self.doc;
+        self.gutters
+            .retain(|id, _| doc.get_element_by_id(id).is_some());
+        if self.gutters.len() != before {
+            self.install_gutter_sheet();
+        }
+    }
+
+    /// (Re)install the engine-owned gutter stylesheet on a detached element.
+    fn install_gutter_sheet(&mut self) {
+        let node = match self.gutter_sheet_node {
+            Some(n) => n,
+            None => {
+                let n = self
+                    .doc
+                    .mutate()
+                    .create_element(qual_name!("style"), vec![]);
+                self.gutter_sheet_node = Some(n);
+                n
+            }
+        };
+        let css = gutter_css(self.gutters.iter());
+        let sheet = self
+            .doc
+            .make_stylesheet(css, style::stylesheets::Origin::UserAgent);
+        self.doc.add_stylesheet_for_node(sheet, node);
+    }
+
+    /// Issue #26, after every layout: restore offsets recorded across a swap
+    /// (by element id), then clamp every scroll container to its new
+    /// `[0, max]`. Any change damages that container.
+    fn settle_scroll_offsets(&mut self) {
+        let restore = std::mem::take(&mut self.scroll_restore);
+        for (id, y) in restore {
+            if let Some(nid) = self.doc.get_element_by_id(&id) {
+                if is_scroll_container(&self.doc, nid) {
+                    self.apply_scroll(nid, y);
+                }
+            }
+        }
+        for nid in scroll_containers(&self.doc) {
+            let off = scroll_offset_y(&self.doc, nid);
+            let max = max_offset_y(&self.doc, nid);
+            if off > max || off < 0.0 {
+                self.apply_scroll(nid, off.clamp(0.0, max));
+            }
+        }
+    }
+
+    /// Issue #26: set a container's vertical offset (clamped by Blitz) and
+    /// damage its border box. Returns whether it moved.
+    fn apply_scroll(&mut self, nid: NodeId, y: f32) -> bool {
+        let moved = set_offset_y(&mut self.doc, nid, y);
+        if moved {
+            let r = container_damage_rect(&self.doc, nid, self.layout_scale);
+            self.push_pending_damage(r);
+            self.mark_paint_dirty();
+        }
+        moved
+    }
+
+    fn scrolled_outcome(&self, nid: NodeId) -> InputOutcome {
+        InputOutcome::Scrolled {
+            id: self.element_id_of(nid),
+        }
+    }
+
+    /// Issue #26: record offsets of scrolled elements with an id in the
+    /// subtree a swap is about to replace (target included).
+    fn record_scroll_offsets_in(&mut self, root: NodeId) {
+        let mut stack = vec![root];
+        while let Some(nid) = stack.pop() {
+            let Some(node) = self.doc.get_node(nid) else {
+                continue;
+            };
+            stack.extend(node.children.iter().copied());
+            if !node.is_element() {
+                continue;
+            }
+            let y = node.scroll_offset().y as f32;
+            if y > 0.0 {
+                if let Some(id) = node_id_attr(&self.doc, nid) {
+                    self.scroll_restore.insert(id, y);
+                }
+            }
+        }
     }
 
     /// Mark the DOM dirty without re-evaluating greying (issue #15). Used by
@@ -1597,9 +1842,9 @@ impl LiveSurface {
         let mut stack = vec![root];
         while let Some(nid) = stack.pop() {
             if let Some(bounds) = self.last_bounds.get(&nid) {
-                let (x, y, w, h) = bounds.ink;
-                let r = snap_outward(x, y, w, h, sw, sh);
-                self.push_pending_damage(r);
+                if let Some(r) = ink_damage_rect(bounds.ink, sw, sh) {
+                    self.push_pending_damage(r);
+                }
             }
             let Some(node) = self.doc.get_node(nid) else {
                 continue;
@@ -1827,6 +2072,9 @@ impl LiveSurface {
         // sync must not run style/layout). compute_plan merges these so old
         // boxes survive NodeId recycle after the swap.
         self.queue_pending_subtree_damage(target_id);
+        // Issue #26: an offset survives the swap when an element with the
+        // same id does (restored + clamped at the next layout).
+        self.record_scroll_offsets_in(target_id);
 
         match swap {
             SwapMode::InnerHtml => {
@@ -2755,8 +3003,8 @@ impl LiveSurface {
             self.doc.resolve_stylist(0.0);
             let carried = collect_style_damaged(&self.doc);
             self.carried_style_damage.extend(carried);
-            self.resolve_doc();
-            self.needs_resolve = false;
+            let _ = self.resolve_doc();
+            self.needs_resolve = std::mem::take(&mut self.gutter_followup);
         }
         self.apply_pending_group_display();
     }
@@ -2776,13 +3024,156 @@ impl LiveSurface {
                 self.on_pointer_up(ctx, x, y, button, mods)
             }
             InputEvent::Key(key) => self.on_key(ctx, key),
+            InputEvent::Wheel { pos, delta, unit } => self.on_wheel(pos, delta, unit),
+        }
+    }
+
+    /// Issue #26: wheel scrolls the innermost container under the pointer
+    /// that can move that way. No chaining of a remainder to a parent.
+    fn on_wheel(&mut self, pos: (f32, f32), delta: (f32, f32), unit: WheelUnit) -> InputOutcome {
+        self.ensure_resolved();
+        let (x, y) = pos;
+        if !delta.1.is_finite() || delta.1 == 0.0 {
+            return InputOutcome::None;
+        }
+        if self.open_select.is_some() {
+            self.close_select();
+        }
+        for nid in containers_at(&self.doc, x, y) {
+            let dy = match unit {
+                WheelUnit::Pixel => -delta.1,
+                WheelUnit::Line => -delta.1 * SCROLL_LINE_ROWS * SCROLL_ROW_PX,
+                WheelUnit::Page => -delta.1 * page_px(&self.doc, nid),
+            };
+            if !can_scroll(&self.doc, nid, dy) {
+                continue;
+            }
+            let target = scroll_offset_y(&self.doc, nid) + dy;
+            if self.apply_scroll(nid, target) {
+                return self.scrolled_outcome(nid);
+            }
+        }
+        InputOutcome::None
+    }
+
+    /// Issue #26: primary press on an engine-drawn scrollbar.
+    fn on_scrollbar_down(&mut self, geom: BarGeom, part: BarPart, y: f32) -> InputOutcome {
+        let nid = geom.nid;
+        self.scroll_press_active = true;
+        self.press = None;
+        let row = SCROLL_ROW_PX;
+        let page = page_px(&self.doc, nid);
+        match part {
+            BarPart::Up | BarPart::Down => {
+                self.scroll_pressed = Some(PressedArrow { nid, part });
+                self.mark_paint_dirty();
+                let d = if part == BarPart::Up { -row } else { row };
+                self.apply_scroll(nid, geom.offset + d);
+            }
+            BarPart::TrackAbove => {
+                self.apply_scroll(nid, geom.offset - page);
+            }
+            BarPart::TrackBelow => {
+                self.apply_scroll(nid, geom.offset + page);
+            }
+            BarPart::Thumb => {
+                let top = geom.thumb.map(|t| t.y).unwrap_or(geom.track.y);
+                self.scroll_drag = Some(ScrollDrag { nid, grab: y - top });
+            }
+        }
+        self.scrolled_outcome(nid)
+    }
+
+    /// Issue #26: thumb drag move. Offset follows the thumb top.
+    fn on_scroll_drag_move(&mut self, drag: ScrollDrag, y: f32) -> InputOutcome {
+        let Some(geom) = bar_geometry(&self.doc, drag.nid) else {
+            return InputOutcome::None;
+        };
+        let target = geom.offset_for_thumb_top(y - drag.grab);
+        if self.apply_scroll(drag.nid, target) {
+            self.scrolled_outcome(drag.nid)
+        } else {
+            InputOutcome::None
+        }
+    }
+
+    /// Issue #26: end a scrollbar press (arrow visual, thumb drag).
+    fn end_scroll_press(&mut self) {
+        if self.scroll_pressed.take().is_some() {
+            self.mark_paint_dirty();
+        }
+        self.scroll_drag = None;
+        self.scroll_press_active = false;
+    }
+
+    /// Issue #26: PageUp / PageDown / Home / End move the innermost scroll
+    /// container around the focused element that can move that way.
+    fn try_scroll_keys(&mut self, key: &KeyEvent) -> Option<InputOutcome> {
+        if !key.pressed || key.mods.ctrl || key.mods.alt {
+            return None;
+        }
+        if !matches!(key.key.as_str(), "PageUp" | "PageDown" | "Home" | "End") {
+            return None;
+        }
+        self.ensure_resolved();
+        let focused = self
+            .focus
+            .focused_id
+            .as_deref()
+            .and_then(|id| self.doc.get_element_by_id(id))?;
+        // The focused element may itself be the container (tabindex).
+        let mut chain = scroll_ancestors(&self.doc, focused);
+        if is_scroll_container(&self.doc, focused) {
+            chain.insert(0, focused);
+        }
+        for nid in chain {
+            let off = scroll_offset_y(&self.doc, nid);
+            let max = max_offset_y(&self.doc, nid);
+            let target = match key.key.as_str() {
+                "PageUp" => off - page_px(&self.doc, nid),
+                "PageDown" => off + page_px(&self.doc, nid),
+                "Home" => 0.0,
+                _ => max,
+            };
+            if (target.clamp(0.0, max) - off).abs() < 0.01 {
+                continue;
+            }
+            if self.apply_scroll(nid, target) {
+                return Some(self.scrolled_outcome(nid));
+            }
+        }
+        None
+    }
+
+    /// Issue #26: scroll each container around `nid` (innermost first) the
+    /// least amount that shows the element ("nearest"; a box taller than the
+    /// container aligns its top).
+    fn scroll_into_view(&mut self, nid: NodeId) {
+        self.ensure_resolved();
+        for anc in scroll_ancestors(&self.doc, nid) {
+            let (Some(el), Some(pb)) = (
+                element_border_box_css(&self.doc, nid),
+                scroll_padding_box(&self.doc, anc),
+            ) else {
+                continue;
+            };
+            let (top, h) = (el.1, el.3);
+            let off = scroll_offset_y(&self.doc, anc);
+            let target = if top < pb.y || h > pb.h {
+                off - (pb.y - top)
+            } else if top + h > pb.y + pb.h {
+                off + (top + h - (pb.y + pb.h))
+            } else {
+                continue;
+            };
+            self.apply_scroll(anc, target);
         }
     }
 
     fn hit_id(&mut self, x: f32, y: f32) -> Option<String> {
         self.ensure_resolved();
         let doc = &self.doc;
-        let nid = doc.element_from_point(x, y)?;
+        let nid = visible_element_from_point(doc, x, y)?;
         // Walk up to nearest element with an id that we know about, else any id.
         let mut cur = Some(nid);
         while let Some(id) = cur {
@@ -2804,6 +3195,7 @@ impl LiveSurface {
 
     /// Forward pointer leave to Blitz so `:hover` styles and CSS tooltips clear.
     fn on_pointer_leave(&mut self) -> InputOutcome {
+        self.end_scroll_press();
         self.press = None;
         self.range_drag_id = None;
         self.range_drag_released = None;
@@ -2820,6 +3212,9 @@ impl LiveSurface {
     /// clean-frame skip.
     fn on_pointer_move(&mut self, x: f32, y: f32) -> InputOutcome {
         self.ensure_resolved();
+        if let Some(drag) = self.scroll_drag {
+            return self.on_scroll_drag_move(drag, y);
+        }
         if let Some(ref rid) = self.range_drag_id.clone() {
             if !self.element_is_disabled_id(rid) {
                 let _ = self.apply_range_from_x(rid, x);
@@ -2892,6 +3287,19 @@ impl LiveSurface {
             return InputOutcome::Press {
                 id: self.open_select.as_ref().and_then(|o| o.select_id.clone()),
             };
+        }
+
+        // Issue #26: engine-drawn scrollbar (arrows, track, thumb).
+        if button == PointerButton::Primary {
+            if let Some((geom, part)) =
+                bar_hit(&self.doc, x, y).filter(|(g, _)| bar_unoccluded(&self.doc, g.nid, x, y))
+            {
+                if self.open_select.is_some() {
+                    self.close_select();
+                }
+                self.range_drag_id = None;
+                return self.on_scrollbar_down(geom, part, y);
+            }
         }
 
         // Open select: click outside closes without change; click on the closed
@@ -3012,6 +3420,12 @@ impl LiveSurface {
         button: PointerButton,
         mods: Modifiers,
     ) -> InputOutcome {
+        // Issue #26: a press that started on a scrollbar never clicks.
+        if button == PointerButton::Primary && self.scroll_press_active {
+            self.end_scroll_press();
+            self.press = None;
+            return InputOutcome::None;
+        }
         // Range drag commit: clear drag, fire change once, suppress click.
         let mut suppress_click = false;
         if let Some(ref rid) = self.range_drag_id.clone() {
@@ -3659,9 +4073,12 @@ impl LiveSurface {
         let scale = self.layout_scale;
         let (sw, sh) = self.layout_viewport;
         // Old ink (last paint) covers the previous :focus outline / caret.
-        if let Some(bounds) = self.last_bounds.get(&nid) {
-            let (x, y, w, h) = bounds.ink;
-            self.push_pending_damage(snap_outward(x, y, w, h, sw, sh));
+        if let Some(r) = self
+            .last_bounds
+            .get(&nid)
+            .and_then(|b| ink_damage_rect(b.ink, sw, sh))
+        {
+            self.push_pending_damage(r);
         }
         // Current ink includes outline width + outward outline-offset + box-shadow.
         if let Some((x, y, w, h)) = ink_box_device(&self.doc, nid, scale) {
@@ -4319,6 +4736,12 @@ impl LiveSurface {
             }
         }
 
+        // Issue #26: PageUp/PageDown/Home/End scroll the focused element's
+        // container (after text-edit keys, which own Home/End in a field).
+        if let Some(out) = self.try_scroll_keys(&key) {
+            return out;
+        }
+
         // (b) Tab / Shift+Tab focus order (engine-owned document-order walk).
         if key.pressed && key.key == "Tab" {
             self.ensure_resolved();
@@ -4344,6 +4767,15 @@ impl LiveSurface {
                 self.focus.focused_id = None;
             }
             self.reconcile_open_select_after_focus();
+            // Issue #26: focus scrolls into view.
+            if let Some(nid) = self
+                .focus
+                .focused_id
+                .as_deref()
+                .and_then(|id| self.doc.get_element_by_id(id))
+            {
+                self.scroll_into_view(nid);
+            }
             self.mark_paint_dirty();
             return InputOutcome::FocusChanged(self.focus.clone());
         }
@@ -4588,7 +5020,11 @@ impl LiveSurface {
             }
         };
 
-        self.paint_dirty = false;
+        // #34 round 5: a gutter chain longer than the per-frame pass cap
+        // left a reserve follow-up (`resolve_and_plan_damage` moved it into
+        // `needs_resolve`); keep the surface dirty so the next paint finishes
+        // it without waiting for input.
+        self.paint_dirty = self.needs_resolve;
         self.force_full_repaint = false;
         self.cached_rgba = Some(rgba);
         Ok(RenderResult {
@@ -4648,15 +5084,43 @@ impl LiveSurface {
         // node changes (Graph: at most 2 passes total per paint).
         let hover_before = self.doc.get_hover_node_id();
         // #13: resolve_doc runs Blitz resolve + ellipsis cache bookkeeping.
-        self.resolve_doc();
-        let mut passes = 1;
+        let mut passes = self.resolve_doc();
         // resolve() ends with refresh_hover(); compare hover node to decide follow-up.
         let hover_changed = self.doc.get_hover_node_id() != hover_before;
         if hover_changed {
-            self.resolve_doc();
-            passes += 1;
+            passes += self.resolve_doc();
         }
-        self.needs_resolve = false;
+        self.needs_resolve = std::mem::take(&mut self.gutter_followup);
+
+        // Issue #26: offsets restored / clamped by this resolve pushed their
+        // container damage after `pending` was taken; a scrollbar whose
+        // geometry or pressed state changed damages its old and new rects.
+        let bars: Vec<(BarGeom, Option<BarPart>)> = all_bars(&self.doc)
+            .into_iter()
+            .map(|g| {
+                let p = self
+                    .scroll_pressed
+                    .filter(|p| p.nid == g.nid)
+                    .map(|p| p.part);
+                (g, p)
+            })
+            .collect();
+        if bars != self.last_bars {
+            // Only bars that changed (old rect and new rect).
+            let changed = self
+                .last_bars
+                .iter()
+                .filter(|b| !bars.contains(b))
+                .chain(bars.iter().filter(|b| !self.last_bars.contains(b)));
+            for (g, _) in changed {
+                let r = g.bar.as_device(scale).clamp_to_surface(width, height);
+                if !r.is_empty() {
+                    pending.push(r);
+                }
+            }
+            self.last_bars = bars;
+        }
+        pending.append(&mut self.pending_damage);
 
         // Same-id swap: PlainEditor now exists — seed from value + caret at end
         // before damage planning so partial frames match a full repaint.
@@ -4812,6 +5276,9 @@ impl LiveSurface {
         // on `?` / panic via Drop.
         drop(session);
         let mut frame = rgba?;
+
+        // Issue #26: engine-drawn Win95 scrollbars (under select overlays).
+        paint_scrollbars(&self.doc, &mut frame, scale, self.scroll_pressed);
 
         // Engine-drawn select face button + open list (above Blitz content).
         paint_select_overlays(
