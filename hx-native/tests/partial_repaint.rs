@@ -118,6 +118,8 @@ body { width: 800px; height: 400px; background: #1a1f2a; color: #e8ecf4;
 #act { position: absolute; left: 600px; top: 20px; width: 120px; height: 32px;
   background: #2d3648; color: #e8ecf4; border: 1px solid #556; }
 #act:disabled { opacity: 0.4; }
+#log { position: absolute; left: 600px; top: 100px; width: 180px; height: 120px;
+  overflow-y: auto; background: #202634; font-size: 13px; line-height: 20px; }
 </style></head><body>
 <section id="sec-chips" hx-trigger="slice:time" hx-target="#chips" hx-swap="innerHTML">
   <div id="chips"></div>
@@ -132,8 +134,13 @@ body { width: 800px; height: 400px; background: #1a1f2a; color: #e8ecf4;
   <div id="win"></div>
 </section>
 <button id="act" hx-post="act.do" hx-trigger="click">Do</button>
-</body></html>"##
+<div id="log">"##
         .to_string()
+        + &(0..15)
+            .map(|i| format!("<div id=\"log-{i}\">Log entry {i}</div>"))
+            .collect::<String>()
+        + r##"</div>
+</body></html>"##
 }
 
 fn chips_html(active: &str) -> String {
@@ -463,6 +470,30 @@ fn run_scripted_sequence(scale: f64) {
     let win = eng.paint(view.clone()).unwrap();
     assert!(!win.skipped);
 
+    // Step 6 (issue #26): wheel-scroll the `#log` container — damage stays
+    // inside its box, and the final state below must still match a full
+    // repaint of a fresh engine scrolled the same way.
+    let scrolled = eng.input(log_wheel());
+    assert_eq!(
+        scrolled,
+        InputOutcome::Scrolled {
+            id: Some("log".into())
+        }
+    );
+    let sc = eng.paint(view.clone()).unwrap();
+    assert!(!sc.skipped);
+    assert!(!eng.last_paint_stats().full_repaint);
+    let (x0, y0, x1, y1) = damage_union(&sc).expect("scroll damage");
+    let s = scale as f32;
+    assert!(
+        x0 >= 600.0 * s - 1.0
+            && y0 >= 100.0 * s - 1.0
+            && x1 <= 780.0 * s + 1.0
+            && y1 <= 220.0 * s + 1.0,
+        "scroll damage must stay in #log at scale={scale}: {:?}",
+        sc.damage
+    );
+
     // Final byte-identical: current eng last_frame vs fresh full load of same fragments.
     {
         let expected = eng.last_frame().unwrap().pixels.clone();
@@ -476,6 +507,8 @@ fn run_scripted_sequence(scale: f64) {
             f_f.set(k, v);
         }
         eng_f.sync(&s_f, &mut f_f).unwrap();
+        let _ = eng_f.paint(view.clone()).unwrap();
+        let _ = eng_f.input(log_wheel());
         eng_f.mark_theme_or_stylesheet_changed();
         let full = eng_f.paint(view).unwrap();
         assert_eq!(
@@ -483,6 +516,15 @@ fn run_scripted_sequence(scale: f64) {
             full.rgba.as_ref().unwrap().pixels,
             "final scripted state byte-identical at scale={scale}"
         );
+    }
+}
+
+/// Issue #26: one wheel notch down over `#log` (CSS px).
+fn log_wheel() -> InputEvent {
+    InputEvent::Wheel {
+        pos: (690.0, 160.0),
+        delta: (0.0, -1.0),
+        unit: WheelUnit::Line,
     }
 }
 

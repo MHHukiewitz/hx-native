@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/>
+<title>34 Settings, Advanced tab: scrolling fixture (issue #26)</title>
+<style>
+/* Faithful extract of Mainnet docs/design/mocks/target/34-settings.html (c0194c06)
+   + desk98.css / _tokens.css rules the dialog uses, tokens inlined. Font: bundled
+   DejaVu Sans (no MS Sans Serif in the engine). */
+*{box-sizing:border-box}
+html,body{margin:0;width:1280px;height:720px;overflow:hidden;background:#c0c0c0;font-family:"DejaVu Sans",sans-serif;font-size:11px;color:#000}
+button{border:none;border-radius:0;background:#c0c0c0;box-shadow:inset -1px -1px #0a0a0a,inset 1px 1px #fff,inset -2px -2px #808080,inset 2px 2px #dfdfdf;min-height:23px;min-width:0;padding:2px 8px;color:#000;font-family:"DejaVu Sans",sans-serif;font-size:11px}
+button.on{box-shadow:inset -1px -1px #fff,inset 1px 1px #0a0a0a,inset -2px -2px #dfdfdf,inset 2px 2px #808080;font-weight:700;background:#b0b0b0}
+button.default{font-weight:700;outline:1px solid #000;outline-offset:-4px}
+.screen{position:relative;width:1280px;height:720px;background:#c0c0c0;overflow:hidden}
+.dlg-wash{position:absolute;inset:0;background:rgba(0,0,0,.45);z-index:10}
+.dlg{position:absolute;z-index:11;background:#c0c0c0;box-shadow:inset -1px -1px #0a0a0a,inset 1px 1px #fff,inset -2px -2px #808080,inset 2px 2px #dfdfdf;padding:3px;min-width:280px}
+.dlg .tb{background:#000080;color:#fff;font-weight:700;padding:3px 2px 3px 6px;display:flex;justify-content:space-between;align-items:center}
+.dlg .tb button{min-width:16px;min-height:14px;padding:0;font-size:9px}
+.dlg .wb{margin:8px;font-size:11px;line-height:1.4}
+.dlg.win{padding:3px;display:flex;flex-direction:column}
+.dlg.win > .wb{margin:8px;flex:1;min-height:0;overflow:hidden;position:relative}
+.btnrow{display:flex;gap:3px}
+.btnrow button{min-width:0}
+.ck{display:flex;align-items:center;gap:6px;line-height:13px;height:20px}
+.ck .box{display:inline-flex;align-items:center;justify-content:center;width:13px;height:13px;background:#fff;flex:0 0 auto;position:relative}
+.ck .box input{position:absolute;inset:0;width:13px;height:13px;margin:0;appearance:none;background:transparent;border:0}
+.ck .box input:not(:checked) + svg{visibility:hidden}
+.set .wb form{position:absolute;inset:0;display:flex;flex-direction:column;margin:0}
+.set #set-panel{flex:1;min-height:0;overflow:hidden}
+.set .panel.scroll{height:100%;overflow-y:auto}
+.set .lbl{line-height:13px;margin:8px 0 3px}
+.set .sub{line-height:13px;margin:6px 0 2px;font-weight:700}
+.set .note{line-height:13px;margin:6px 0 4px}
+.set .row{display:flex;align-items:center;gap:8px;height:24px;margin:2px 0}
+.set .row .k{width:136px;line-height:13px}
+.set .gap{height:6px}
+input[type=range].trk{appearance:none;width:110px;height:20px;margin:0;background:transparent}
+.val{display:inline-block;min-width:40px;height:20px;line-height:16px;padding:2px 6px;text-align:right;background:#fff}
+.set .foot{flex:0 0 auto;display:flex;align-items:center;gap:6px;padding-top:6px}
+.set .foot .why{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.set .foot button{min-width:75px}
+.set .foot .hx-ind{flex:0 0 48px}
+.hx-ind{visibility:hidden;height:14px;min-width:48px}
+.why{color:#808080}
+</style></head>
+<body><div class="screen" aria-label="34 Settings">
+<div class="dlg-wash"></div>
+<div class="dlg win set" id="set-win" style="left:300px;top:160px;width:480px;height:356px" role="dialog" aria-label="Settings">
+  <div class="tb"><span class="ttl">Settings</span><button type="button" id="set-close-x" hx-post="menu.back" hx-trigger="click" hx-sync="drop" hx-indicator="#set-ind" aria-label="Close">x</button></div>
+  <div class="wb">
+    <form id="set-form">
+      <div class="btnrow" id="set-tabs" role="tablist"><button type="button" id="set-tab-game" hx-post="settings.tab" hx-trigger="click" hx-sync="drop" hx-indicator="#set-ind" name="tab" value="game" role="tab">Game</button><button type="button" id="set-tab-display" hx-post="settings.tab" hx-trigger="click" hx-sync="drop" hx-indicator="#set-ind" name="tab" value="display" role="tab">Display</button><button type="button" id="set-tab-advanced" class="on" hx-post="settings.tab" hx-trigger="click" hx-sync="drop" hx-indicator="#set-ind" name="tab" value="advanced" role="tab">Advanced</button></div>
+      <div id="set-panel" hx-trigger="slice:settings">
+<div id="set-panel-advanced" class="panel scroll" role="tabpanel" aria-labelledby="set-tab-advanced">
+<div class="note" title="Internal tools and HUD chrome. Developer tools unlock the console (`) and F3.">Internal tools and HUD chrome. Developer tools unlock the console (`) and F3.</div>
+<div class="ck" title="Enables the DevConsole (` key) and the F3 performance overlay hotkey. Also set by launching with --dev."><span class="box"><input type="checkbox" id="set-dev-tools" name="dev_tools" value="on"><svg width="7" height="7" viewBox="0 0 7 7"><path d="M6 0h1v2H6v1H5v1H4v1H3v1H2V5H1V4H0V2h1v1h1v1h1V3h1V2h1V1h1z"/></svg></span><label for="set-dev-tools">Developer tools</label></div>
+<div class="ck" title="FPS, RSS, and frame/tick timings. Requires developer tools."><span class="box"><input type="checkbox" id="set-perf-overlay" name="perf_overlay" value="on"><svg width="7" height="7" viewBox="0 0 7 7"><path d="M6 0h1v2H6v1H5v1H4v1H3v1H2V5H1V4H0V2h1v1h1v1h1V3h1V2h1V1h1z"/></svg></span><label for="set-perf-overlay">Show performance overlay (F3)</label></div>
+<div class="lbl" title="Bounded playtest dials for sim timing, build crew, and access economics. Research points come from engineers/facilities — not a slider."><b>Engine knobs</b></div>
+<div class="row" title="Wall-clock minimum between full simulation ticks on the background sim thread (default 1000 ms). Lower = snappier sim, higher CPU. Render/UI still every frame."><label class="k" for="set-engine-sim-tick-wall-ms">Sim tick interval (ms)</label><input type="range" class="trk" id="set-engine-sim-tick-wall-ms" name="engine.sim_tick_wall_ms" value="1000"><span class="val" id="set-engine-sim-tick-wall-ms-val">1000</span></div>
+<div class="row" title="Game-time between rival AI thinks per company. Under week speed rivals may lag a bit (v1 fairness: catch-up is capped per sim tick)."><label class="k" for="set-engine-ai-think-game-hours">AI think interval (game hours)</label><input type="range" class="trk" id="set-engine-ai-think-game-hours" name="engine.ai_think_game_hours" value="6"><span class="val" id="set-engine-ai-think-game-hours-val">6</span></div>
+<div class="row" title="Max overdue rival brains drained after each sim tick (round-robin). Raise slightly for catch-up; keep low for CPU."><label class="k" for="set-engine-ai-thinks-per-sim-tick">AI thinks per sim tick</label><input type="range" class="trk" id="set-engine-ai-thinks-per-sim-tick" name="engine.ai_thinks_per_sim_tick" value="3"><span class="val" id="set-engine-ai-thinks-per-sim-tick-val">3</span></div>
+<div class="row" title="Months from hire until full productivity."><label class="k" for="set-engine-staff-train-months">Staff train months</label><input type="range" class="trk" id="set-engine-staff-train-months" name="engine.staff_train_months" value="3"><span class="val" id="set-engine-staff-train-months-val">3</span></div>
+<div class="row" title="Always-on baseline crew on every building (before Logistics)."><label class="k" for="set-engine-base-buildpower">Base buildpower</label><input type="range" class="trk" id="set-engine-base-buildpower" name="engine.base_buildpower" value="1"><span class="val" id="set-engine-base-buildpower-val">1.0</span></div>
+<div class="row" title="Max parallel buildpower for desk-scale module installs."><label class="k" for="set-engine-open-office-max-buildpower">Desk install crew cap</label><input type="range" class="trk" id="set-engine-open-office-max-buildpower" name="engine.open_office_max_buildpower" value="10"><span class="val" id="set-engine-open-office-max-buildpower-val">10</span></div>
+<div class="row" title="Calendar days to finish one open-office desk at 1.0 buildpower."><label class="k" for="set-engine-open-office-work-days">Desk work-days @ 1 bp</label><input type="range" class="trk" id="set-engine-open-office-work-days" name="engine.open_office_work_days" value="1"><span class="val" id="set-engine-open-office-work-days-val">1.0</span></div>
+<div class="sub">Access networks</div>
+<div class="row" title="Higher α makes late coverage much more expensive."><label class="k" for="set-engine-access-pareto-alpha">Buildout Pareto α</label><input type="range" class="trk" id="set-engine-access-pareto-alpha" name="engine.access_pareto_alpha" value="1.25"><span class="val" id="set-engine-access-pareto-alpha-val">1.25</span></div>
+<div class="row" title="Max coverage-point gain per spend slice (fraction 0–1)."><label class="k" for="set-engine-access-buildout-slice-cap">Buildout slice cap</label><input type="range" class="trk" id="set-engine-access-buildout-slice-cap" name="engine.access_buildout_slice_cap" value="0.05"><span class="val" id="set-engine-access-buildout-slice-cap-val">0.05</span></div>
+<div class="row" title="Monthly IP transit price per customer-equivalent at baseline indices."><label class="k" for="set-engine-access-transit-per-customer">Transit $/customer</label><input type="range" class="trk" id="set-engine-access-transit-per-customer" name="engine.access_transit_per_customer" value="0.40"><span class="val" id="set-engine-access-transit-per-customer-val">$0.40</span></div>
+<div class="row" title="Target wholesale markup on unit opex."><label class="k" for="set-engine-access-wholesale-margin">Wholesale margin</label><input type="range" class="trk" id="set-engine-access-wholesale-margin" name="engine.access_wholesale_margin" value="1.2"><span class="val" id="set-engine-access-wholesale-margin-val">1.20×</span></div>
+<div class="row" title="Global multiplier on tier base buildout costs."><label class="k" for="set-engine-access-capex-scale">Access CapEx scale</label><input type="range" class="trk" id="set-engine-access-capex-scale" name="engine.access_capex_scale" value="1"><span class="val" id="set-engine-access-capex-scale-val">1.00×</span></div>
+<div class="gap"></div>
+<button type="button" id="set-engine-reset" hx-post="settings.engine.reset" hx-trigger="click" hx-sync="drop" hx-indicator="#set-ind" name="reset" value="engine">Reset engine defaults</button>
+</div>
+      </div>
+      <div class="foot">
+        <div id="set-ind" class="hx-ind" aria-hidden="true"></div>
+        <span id="set-why" class="why"><span></span></span>
+        <button type="button" id="set-apply" class="default" hx-post="settings.apply" hx-trigger="click" hx-sync="drop" hx-indicator="#set-ind">Apply</button>
+        <button type="button" id="set-close" hx-post="menu.back" hx-trigger="click" hx-sync="drop" hx-indicator="#set-ind">Close</button>
+      </div>
+    </form>
+  </div>
+</div>
+</div></body></html>

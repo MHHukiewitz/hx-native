@@ -373,7 +373,44 @@ pub enum InputEvent {
     Copy,
     /// Cut the current selection: [`InputOutcome::ClipboardWrite`] plus delete.
     Cut,
+    /// Mouse wheel / trackpad scroll (issue #26), forwarded raw from egui's
+    /// `Event::MouseWheel`. `pos` is panel-local logical px (the same space as
+    /// [`InputEvent::PointerMove`]); `delta` keeps egui's sign (positive `y` =
+    /// content moves down = scroll up). Only `delta.1` is used (vertical
+    /// scrolling only); a wheel with `delta.1 == 0` is ignored.
+    ///
+    /// Scrolls the innermost `overflow-y: auto | scroll` container under `pos`
+    /// that can still move that way; never a parent of it in the same event
+    /// beyond that choice, never a host action. Returns
+    /// [`InputOutcome::Scrolled`] when something moved, else
+    /// [`InputOutcome::None`] (the host may then let its own UI scroll).
+    Wheel {
+        pos: (f32, f32),
+        delta: (f32, f32),
+        unit: WheelUnit,
+    },
 }
+
+/// Unit of [`InputEvent::Wheel`]'s `delta` (egui `MouseWheelUnit`).
+///
+/// `Pixel`: logical px. `Line`: one line = [`SCROLL_LINE_ROWS`] rows of
+/// [`SCROLL_ROW_PX`]. `Page`: one page = the container's visible height minus
+/// one row. `#[non_exhaustive]`.
+#[non_exhaustive]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WheelUnit {
+    Pixel,
+    Line,
+    Page,
+}
+
+/// One scroll "row" in CSS px (issue #26): a scrollbar arrow click, and the
+/// unit a wheel [`WheelUnit::Line`] is made of.
+pub const SCROLL_ROW_PX: f32 = 20.0;
+/// Rows per wheel line (browsers scroll about three lines per notch).
+pub const SCROLL_LINE_ROWS: f32 = 3.0;
+/// Width of the engine-drawn Win95 scrollbar in CSS px (HTML_CONTRACT §4).
+pub const SCROLLBAR_WIDTH_PX: f32 = 16.0;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PointerButton {
@@ -591,5 +628,11 @@ pub enum InputOutcome {
     /// never touches the OS clipboard itself.
     ClipboardWrite {
         text: String,
+    },
+    /// A scroll container moved (issue #26): wheel, scrollbar arrow / track /
+    /// thumb, or PageUp/PageDown/Home/End. `id` is the container's element id
+    /// (`None` when it has none). Never fires a host action.
+    Scrolled {
+        id: Option<String>,
     },
 }
