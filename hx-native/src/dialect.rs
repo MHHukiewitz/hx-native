@@ -17,6 +17,12 @@ pub const ATTR_HX_STEP_FOR: &str = "data-hx-step-for";
 /// Engine-side opt-out for thousands grouping on `<input type=number>` (issue #17).
 pub const ATTR_HX_GROUP: &str = "data-hx-group";
 
+/// Issue #15 `RequiresChange` baseline override (Designer lock 2026-10-20).
+/// Valid only on `<input>` / `<select>` / `<textarea>`. Checkbox/radio hold
+/// `"true"`/`"false"`; other controls hold the applied value (canonical for
+/// numbers, same encoding as action args).
+pub const ATTR_HX_APPLIED: &str = "data-hx-applied";
+
 /// Locked dialect attributes (exact names). Unknown `hx-*` / `data-hx-*` fail load.
 pub const SUPPORTED_HX_ATTRIBUTES: &[&str] = &[
     "hx-post",
@@ -28,6 +34,7 @@ pub const SUPPORTED_HX_ATTRIBUTES: &[&str] = &[
     ATTR_HX_GROUP,
     ATTR_HX_STEP,
     ATTR_HX_STEP_FOR,
+    ATTR_HX_APPLIED,
 ];
 
 /// Locked swap strategies. Missing `hx-swap` defaults to `InnerHtml` (htmx parity).
@@ -119,11 +126,15 @@ pub fn parse_id_selector(elem_id: &str, attr: &str, raw: &str) -> Result<String,
 /// Strict dialect checks for one element's attributes (HTML contract §2).
 ///
 /// Call this on HTML being **loaded** (`load_html` or a swap fragment), not on
-/// the live DOM after the engine writes `data-hx-reason`.
+/// the live DOM after the engine writes `data-hx-reason`. `tag` is the
+/// element's lowercase tag name, when known (unit tests on attrs alone may
+/// pass `None`, which skips the `data-hx-applied` placement check — the real
+/// load/sync path always passes it).
 pub fn validate_loaded_attrs(
     elem_id: &str,
     attrs: &[(String, String)],
     known_ids: &HashSet<String>,
+    tag: Option<&str>,
 ) -> Result<(), EngineError> {
     for (name, _) in attrs {
         if name == "data-hx-reason" {
@@ -174,6 +185,24 @@ pub fn validate_loaded_attrs(
                 attr: "hx-indicator".into(),
                 reason: format!(
                     "id `#{indicator_id}` does not resolve in the document or fragment"
+                ),
+            });
+        }
+    }
+
+    // Issue #15 (Designer lock 2026-10-20): data-hx-applied only on form controls.
+    if attrs.iter().any(|(k, _)| k == ATTR_HX_APPLIED) {
+        let ok = match tag {
+            Some(t) => matches!(t, "input" | "select" | "textarea"),
+            None => true,
+        };
+        if !ok {
+            return Err(EngineError::InvalidAttribute {
+                id: elem_id.to_string(),
+                attr: ATTR_HX_APPLIED.to_string(),
+                reason: format!(
+                    "data-hx-applied is only valid on input/select/textarea, not `<{}>`",
+                    tag.unwrap_or("?")
                 ),
             });
         }
@@ -281,7 +310,7 @@ mod tests {
     fn rejects_unknown_hx_attr() {
         let ids = HashSet::new();
         let attrs = vec![("hx-get".into(), "/x".into())];
-        let err = validate_loaded_attrs("e", &attrs, &ids).unwrap_err();
+        let err = validate_loaded_attrs("e", &attrs, &ids, None).unwrap_err();
         assert!(matches!(err, EngineError::InvalidAttribute { attr, .. } if attr == "hx-get"));
     }
 
@@ -289,7 +318,7 @@ mod tests {
     fn rejects_data_hx_reason() {
         let ids = HashSet::new();
         let attrs = vec![("data-hx-reason".into(), "nope".into())];
-        let err = validate_loaded_attrs("e", &attrs, &ids).unwrap_err();
+        let err = validate_loaded_attrs("e", &attrs, &ids, None).unwrap_err();
         assert!(matches!(
             err,
             EngineError::InvalidAttribute { attr, .. } if attr == "data-hx-reason"
@@ -309,6 +338,6 @@ mod tests {
             ("hx-sync".into(), "drop".into()),
             ("hx-trigger".into(), "click".into()),
         ];
-        validate_loaded_attrs("btn", &attrs, &ids).unwrap();
+        validate_loaded_attrs("btn", &attrs, &ids, None).unwrap();
     }
 }

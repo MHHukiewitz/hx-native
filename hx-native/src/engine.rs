@@ -20,14 +20,15 @@ use crate::error::EngineError;
 use crate::focus::{focusable_ids, ids_in_document_order, step_focus};
 use crate::fonts::bundled_font_context;
 use crate::form_args::{
-    clamp_snap_value, closest_form, collect_action_args, format_numeric, is_number_input,
+    capture_applied_controls, capture_form_controls, clamp_snap_value, closest_form,
+    collect_action_args, collect_applied_control_nids, format_numeric, is_number_input,
     is_numeric_input, parse_f64, set_range_value_from_x, step_numeric_value, write_value_attr,
     NumericLimits, MAX_SAFE_NUMBER,
 };
 use crate::form_controls::{
-    activate_checkable, control_is_disabled, form_control_at_point, select_options, select_radio,
-    select_set_index, select_step, sync_outputs_for, toggle_checkbox, FormControlKind,
-    FormControlRef,
+    activate_checkable, checkbox_checked_by_name, control_is_disabled, form_control_at_point,
+    named_controls_in_form, select_options, select_radio, select_set_index, select_step,
+    sync_outputs_for, toggle_checkbox, FormControlKind, FormControlRef,
 };
 use crate::memory::estimate_surface_engine_bytes;
 use crate::paint::{paint_damage_into, paint_rgba};
@@ -67,6 +68,11 @@ impl DirtySet {
 }
 
 static NO_FOCUS: FocusState = FocusState { focused_id: None };
+
+/// Issue #15 (Graph requirement): class the engine adds to a named form
+/// control while its current value differs from its `RequiresChange`
+/// baseline, removed once it matches again. Host classes are preserved.
+const HX_CHANGED_CLASS: &str = "hx-changed";
 
 /// Engine-wide RequestId counter plus the surface that owns each in-flight request.
 #[derive(Debug)]
@@ -171,8 +177,48 @@ struct LiveSurface {
     sections: HashMap<String, Vec<String>>,
     /// last seen slice versions (subscribed only)
     slice_versions: HashMap<String, u64>,
-    /// action name -> Disabled reason (from actions slice)
+    /// action name -> Disabled reason (from actions slice, folded with any
+    /// currently-dirty `RequiresChange` reasons; issue #15)
     disabled_actions: HashMap<String, String>,
+    /// Last `action_states()` poll, cached so a value-edit recompute (no Game
+    /// round trip) can re-evaluate `RequiresChange` without re-polling slices.
+    last_action_states: Vec<(String, ActionState)>,
+    /// Issue #15: per `<form id>` fallback baseline for `RequiresChange` /
+    /// `hx-changed`, captured on first sight and whenever a swap replaces the
+    /// form or its controls. A control carrying `data-hx-applied` overrides
+    /// its own entry here at comparison time (Designer lock 2026-10-20).
+    form_baselines: HashMap<String, Vec<(String, String)>>,
+    /// Issue #24 (Designer lock 2026-10-20): node ids of every control
+    /// carrying `data-hx-applied`, anywhere in the document (any form, or
+    /// none) — the attribute alone opts a control into `hx-changed`,
+    /// independent of `RequiresChange`. Refreshed on reindex (load / swap),
+    /// not per edit (cost rule: only opted-in controls are ever compared).
+    applied_control_nids: Vec<NodeId>,
+    /// Issue #15: last `input_rules()` poll (cached; no Game round trip per edit).
+    input_rules: Vec<(String, String, InputRule)>,
+    /// Issue #15: dependent-input element id -> reason currently greyed by an
+    /// `InputRule` the engine itself applied (never a host-authored `disabled`).
+    rule_disabled: HashMap<String, String>,
+    /// Issue #15 test hook: total `hx-changed` class attribute writes
+    /// (toggle-on-flip-only). Must not grow on an edit that keeps the same
+    /// changed/unchanged state.
+    hx_changed_write_count: u64,
+    /// Graph review (PR #24 follow-up): Blitz style damage observed by
+    /// input-time resolves (`ensure_resolved`), carried into the next
+    /// paint's damage plan so it is not silently dropped. Without this, an
+    /// `ensure_resolved` triggered by a later input event (e.g. hit-testing
+    /// a pointer move) consumes the restyle-damage flags a prior greying /
+    /// `hx-changed` write set, before the host's next real `paint()` ever
+    /// gets to read them via its own `resolve_stylist` probe.
+    ///
+    /// A `HashSet`, not a `Vec` (Graph re-review, PR #24 round 2): a host
+    /// that drives many input-time resolves on the same handful of nodes
+    /// without ever painting (e.g. rapid typing with no intervening frame)
+    /// would otherwise grow this without bound — one entry per resolve, not
+    /// per distinct node. Deduping by `NodeId` bounds it by the number of
+    /// distinct nodes that can ever carry style damage, i.e. document size,
+    /// not edit count.
+    carried_style_damage: HashSet<NodeId>,
     pending: PendingState,
     released_outcomes: Vec<InputOutcome>,
     hover_id: Option<String>,
@@ -1188,6 +1234,40 @@ impl Engine {
         crate::damage::element_border_box_css(&live.doc, nid)
     }
 
+    /// Test helper (issue #15): total `hx-changed` class attribute writes on
+    /// the default surface so far. Must not grow on an edit that keeps the
+    /// same changed/unchanged state (flip-only mutation).
+    #[doc(hidden)]
+    pub fn test_hx_changed_write_count(&self) -> u64 {
+        self.live(SurfaceId::DEFAULT)
+            .map(|l| l.hx_changed_write_count)
+            .unwrap_or(0)
+    }
+
+    /// Test helper: count of elements that currently carry non-empty Blitz
+    /// restyle damage (or a damaged descendant) on the default surface,
+    /// read **before** any `resolve`/`paint` clears the flags. Used to prove
+    /// a `hx-changed` no-op edit does not touch extra nodes.
+    #[doc(hidden)]
+    pub fn test_damaged_element_count(&self) -> usize {
+        self.live(SurfaceId::DEFAULT)
+            .map(|l| l.count_damage().0)
+            .unwrap_or(0)
+    }
+
+    /// Test helper (Graph re-review, PR #24 round 2): number of distinct
+    /// nodes currently carried in `carried_style_damage` on the default
+    /// surface — the input-time restyle damage an `ensure_resolved` call
+    /// has stashed because no paint has drained it yet. Deduped by
+    /// `NodeId`, so this must stay bounded by document size no matter how
+    /// many edits land between paints.
+    #[doc(hidden)]
+    pub fn test_carried_style_damage_len(&self) -> usize {
+        self.live(SurfaceId::DEFAULT)
+            .map(|l| l.carried_style_damage.len())
+            .unwrap_or(0)
+    }
+
     /// Test helper: force one caret blink phase flip (damage + paint dirty).
     pub fn test_force_caret_blink(&mut self) {
         if let Some(live) = self
@@ -1303,12 +1383,20 @@ impl LiveSurface {
         doc.add_user_agent_stylesheet(select_ua_stylesheet());
         doc.resolve(0.0);
         let select_nids = collect_select_nids(&doc);
+        let applied_control_nids = collect_applied_control_nids(&doc);
         Ok(Self {
             doc,
             bindings,
             sections,
             slice_versions: HashMap::new(),
             disabled_actions: HashMap::new(),
+            last_action_states: Vec::new(),
+            form_baselines: HashMap::new(),
+            applied_control_nids,
+            input_rules: Vec::new(),
+            rule_disabled: HashMap::new(),
+            hx_changed_write_count: 0,
+            carried_style_damage: HashSet::new(),
             pending: PendingState::default(),
             released_outcomes: Vec::new(),
             hover_id: None,
@@ -1344,9 +1432,42 @@ impl LiveSurface {
         self.resolve_count = self.resolve_count.saturating_add(1);
     }
 
-    fn mark_dom_dirty(&mut self) {
+    /// Mark the DOM dirty without re-evaluating greying (issue #15). Used by
+    /// the greying-write paths themselves (`apply_disabled_map`,
+    /// `apply_input_rules`, `apply_changed_classes`) so they do not recurse
+    /// into `recompute_greying`.
+    fn mark_dom_dirty_raw(&mut self) {
         self.needs_resolve = true;
         self.ellipsis_cache.clear();
+    }
+
+    /// Mark the DOM dirty and, when any `RequiresChange` action or input rule
+    /// is in play, re-evaluate greying / `hx-changed` locally (issue #15: no
+    /// Game round trip per edit). Called after every value-changing mutation.
+    fn mark_dom_dirty(&mut self) {
+        self.mark_dom_dirty_raw();
+        self.recompute_greying();
+    }
+
+    /// Re-evaluate `RequiresChange` / `EnabledWhen` / `hx-changed` against the
+    /// current DOM, using cached slice data (no `SliceSource` call). Cheap
+    /// no-op when none of the three is in use.
+    fn recompute_greying(&mut self) {
+        let has_requires_change = self
+            .last_action_states
+            .iter()
+            .any(|(_, s)| matches!(s, ActionState::RequiresChange { .. }));
+        if has_requires_change {
+            let new_disabled = self.compute_disabled_map(&self.last_action_states.clone());
+            self.apply_disabled_map(new_disabled, false);
+            self.apply_all_changed_classes();
+        }
+        if !self.input_rules.is_empty() {
+            self.apply_input_rules(false);
+        }
+        if !self.applied_control_nids.is_empty() {
+            self.apply_standalone_changed_classes();
+        }
     }
 
     /// Waiting on `complete()` (or a queued release the host has not taken yet).
@@ -1426,6 +1547,7 @@ impl LiveSurface {
         self.bindings = bindings;
         self.sections = sections;
         self.select_nids = collect_select_nids(&self.doc);
+        self.applied_control_nids = collect_applied_control_nids(&self.doc);
         self.reconcile_open_select();
         self.reconcile_text_edit();
         Ok(())
@@ -1517,15 +1639,24 @@ impl LiveSurface {
                 // give them the last good limits and this packet's greying
                 // before reporting the error. The version is still not
                 // recorded, so the next sync retries `input_limits`.
+                // Crate-owner decision (PR #27 merge with #24): read this
+                // packet's `input_rules` first, so the greying below never
+                // uses the previous packet's rules.
                 if !dirty_sections.is_empty() {
                     self.reapply_cached_limits();
                 }
+                self.input_rules = slices.input_rules();
                 self.apply_action_states(slices.action_states(), true);
                 return Err(err);
             }
         }
 
         self.slice_versions = current;
+
+        // Issue #15: cache input rules (no re-poll per edit). Read after the
+        // limits refresh (PR #27 merge with #24); the fail-closed error branch
+        // above reads them itself before greying.
+        self.input_rules = slices.input_rules();
 
         if !initial && !actions_changed && !dirty_sections.is_empty() {
             self.reapply_cached_limits();
@@ -1582,6 +1713,17 @@ impl LiveSurface {
         // Same dialect rules as load_html; failure returns EngineError from sync
         // and leaves the previous DOM in place for this section.
         self.validate_fragment_html(declared_actions, html, target_id, swap)?;
+
+        // Issue #15: a swap that replaces the form (or any of its controls)
+        // resets the `RequiresChange` / `hx-changed` fallback baseline —
+        // invalidate before mutating so the next evaluation recaptures it
+        // from the post-swap values (unless `data-hx-applied` overrides it).
+        self.invalidate_form_baselines_in(target_id);
+        // Blocker 4 (Graph re-review, PR #24 round 2): same invalidate-
+        // before-mutate treatment for rule-greyed element ids, so a
+        // re-authored host `disabled` on the swapped-in markup is never
+        // mistaken for a stale engine-owned grey.
+        self.invalidate_rule_disabled_in(target_id);
 
         // Record old subtree ink from the last paint snapshot (no resolve here —
         // sync must not run style/layout). compute_plan merges these so old
@@ -1640,20 +1782,131 @@ impl LiveSurface {
             .ok_or_else(|| EngineError::Internal(format!("hx-target `{sel}` matched nothing")))
     }
 
-    /// Apply greying from the reserved `actions` slice.
+    /// Apply greying from the reserved `actions` slice (`Disabled` and
+    /// `RequiresChange`, issue #15), then dependent-input `EnabledWhen` rules
+    /// and `hx-changed` classes.
     ///
     /// `force_dom_pass` is set when section swaps (or the initial full render)
     /// may have replaced elements that still need the current greying written.
-    /// When the desired disabled/reason map matches `disabled_actions` and no
-    /// DOM pass is forced, this is a no-op: no attribute writes and no paint dirty.
     fn apply_action_states(&mut self, states: Vec<(String, ActionState)>, force_dom_pass: bool) {
-        let mut new_disabled: HashMap<String, String> = HashMap::new();
-        for (name, state) in &states {
-            if let ActionState::Disabled { reason } = state {
-                new_disabled.insert(name.clone(), reason.clone());
+        self.last_action_states = states.clone();
+        for (_, state) in &states {
+            if let ActionState::RequiresChange { form, .. } = state {
+                self.ensure_form_baseline(form);
             }
         }
+        let new_disabled = self.compute_disabled_map(&states);
+        self.apply_disabled_map(new_disabled, force_dom_pass);
+        self.apply_input_rules(force_dom_pass);
+        self.apply_all_changed_classes();
+        self.apply_standalone_changed_classes();
+    }
 
+    /// Fold `Disabled` reasons with any currently-dirty `RequiresChange`
+    /// reasons (issue #15) into one action-name -> reason map.
+    fn compute_disabled_map(&self, states: &[(String, ActionState)]) -> HashMap<String, String> {
+        let mut new_disabled: HashMap<String, String> = HashMap::new();
+        for (name, state) in states {
+            match state {
+                ActionState::Disabled { reason } => {
+                    new_disabled.insert(name.clone(), reason.clone());
+                }
+                ActionState::RequiresChange { form, reason } => {
+                    if self.form_is_clean(form) {
+                        new_disabled.insert(name.clone(), reason.clone());
+                    }
+                }
+                ActionState::Enabled => {}
+            }
+        }
+        new_disabled
+    }
+
+    /// Single seam for what counts as a form's `RequiresChange` / `hx-changed`
+    /// baseline (issue #15). Per named control (document order):
+    /// `data-hx-applied` (Designer lock 2026-10-20) wins when present;
+    /// otherwise fall back to the value captured when the form was last
+    /// loaded/re-rendered (`self.form_baselines`). Keeping the merge isolated
+    /// here means a future change to the rule touches only this function.
+    fn capture_form_baseline(&self, form_id: &str) -> Vec<(String, String)> {
+        let controls = capture_form_controls(&self.doc, form_id);
+        let fallback = self.form_baselines.get(form_id);
+        controls
+            .into_iter()
+            .enumerate()
+            .map(|(i, (_nid, name, current, applied))| {
+                let value = applied.unwrap_or_else(|| {
+                    fallback
+                        .and_then(|f| f.get(i))
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(current)
+                });
+                (name, value)
+            })
+            .collect()
+    }
+
+    /// Plain current values (document order), ignoring `data-hx-applied` —
+    /// used on the "live" side of the `RequiresChange` / `hx-changed` compare.
+    fn capture_form_current(&self, form_id: &str) -> Vec<(String, String)> {
+        capture_form_controls(&self.doc, form_id)
+            .into_iter()
+            .map(|(_nid, name, current, _applied)| (name, current))
+            .collect()
+    }
+
+    /// Capture `form_id`'s fallback baseline if not already captured. A
+    /// missing form captures nothing (treated as enabled elsewhere;
+    /// debug-only warning).
+    fn ensure_form_baseline(&mut self, form_id: &str) {
+        if self.form_baselines.contains_key(form_id) {
+            return;
+        }
+        if self.doc.get_element_by_id(form_id).is_none() {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "hx_native: RequiresChange references unknown form `{form_id}`; action treated as enabled"
+            );
+            return;
+        }
+        self.form_baselines
+            .insert(form_id.to_string(), self.capture_form_current(form_id));
+    }
+
+    /// `true` (clean, so the action greys) when `form_id`'s live values equal
+    /// its effective baseline. A form missing from the document, or one whose
+    /// baseline was never captured, is treated as enabled (returns `false`).
+    fn form_is_clean(&self, form_id: &str) -> bool {
+        if self.doc.get_element_by_id(form_id).is_none() {
+            return false;
+        }
+        if !self.form_baselines.contains_key(form_id) {
+            return false;
+        }
+        self.capture_form_baseline(form_id) == self.capture_form_current(form_id)
+    }
+
+    /// Issue #15: forms containing an `[hx-post="action"]` control (deduped).
+    fn forms_with_hx_post(&self, action: &str) -> HashSet<NodeId> {
+        let mut out = HashSet::new();
+        for b in self.bindings.values() {
+            if b.hx_post.as_deref() != Some(action) {
+                continue;
+            }
+            let Some(nid) = self.doc.get_element_by_id(&b.id) else {
+                continue;
+            };
+            if let Some(form_nid) = closest_form(&self.doc, nid) {
+                out.insert(form_nid);
+            }
+        }
+        out
+    }
+
+    /// Write `new_disabled` onto every `[hx-post]` element (same three
+    /// attributes as `Disabled`). Only writes diffs; no-op when the map is
+    /// unchanged and no DOM pass is forced.
+    fn apply_disabled_map(&mut self, new_disabled: HashMap<String, String>, force_dom_pass: bool) {
         let map_changed = new_disabled != self.disabled_actions;
         if !map_changed && !force_dom_pass {
             return;
@@ -1683,6 +1936,10 @@ impl LiveSurface {
                         && currently_aria
                         && current_reason.as_deref() == Some(r.as_str())
                 }
+                // An element an InputRule currently greys stays greyed; the
+                // rule pass owns clearing it (Graph review, PR #24 follow-up:
+                // this pass must not undo greying it does not own).
+                None if self.rule_disabled.contains_key(&elem_id) => true,
                 None => !currently_disabled && !currently_aria && current_reason.is_none(),
             };
             if !already_matches {
@@ -1696,38 +1953,116 @@ impl LiveSurface {
             return;
         }
 
-        {
-            let mut mutr = self.doc.mutate();
-            for (elem_id, reason) in node_updates {
-                match reason {
-                    Some(r) => {
-                        mutr.set_attribute(elem_id, qual_name!("disabled"), "");
-                        mutr.set_attribute(
-                            elem_id,
-                            QualName::new(None, ns!(), LocalName::from("aria-disabled")),
-                            "true",
-                        );
-                        mutr.set_attribute(
-                            elem_id,
-                            QualName::new(None, ns!(), LocalName::from("data-hx-reason")),
-                            &r,
-                        );
-                    }
-                    None => {
-                        mutr.clear_attribute(elem_id, qual_name!("disabled"));
-                        mutr.clear_attribute(
-                            elem_id,
-                            QualName::new(None, ns!(), LocalName::from("aria-disabled")),
-                        );
-                        mutr.clear_attribute(
-                            elem_id,
-                            QualName::new(None, ns!(), LocalName::from("data-hx-reason")),
-                        );
+        self.write_greying_attrs(node_updates);
+        self.mark_dom_dirty_raw();
+        self.mark_paint_dirty();
+        self.reconcile_open_select();
+        self.reconcile_text_edit();
+    }
+
+    /// Issue #15: grey/ungrey dependent inputs per `self.input_rules`,
+    /// combining correctly with `apply_disabled_map` (run first: an element
+    /// that is both an `[hx-post]` target and a rule target stays greyed if
+    /// either wants it greyed) and never touching a host-authored `disabled`
+    /// (only elements this pass itself disabled, tracked in `rule_disabled`,
+    /// are ever cleared).
+    fn apply_input_rules(&mut self, force_dom_pass: bool) {
+        // Desired: element id -> (node, reason).
+        let mut desired: HashMap<String, (NodeId, String)> = HashMap::new();
+        // Elements currently greyed by the actions slice (Disabled / clean
+        // RequiresChange): element id -> action reason. Used both to skip a
+        // genuinely host-authored `disabled` below and to hand a clearing
+        // element back to the action's own greying instead of enabling it
+        // outright (Graph review, PR #24 follow-up).
+        let action_greyed: HashMap<String, String> = self
+            .bindings
+            .values()
+            .filter_map(|b| {
+                let r = self.disabled_actions.get(b.hx_post.as_ref()?)?;
+                Some((b.id.clone(), r.clone()))
+            })
+            .collect();
+        for (action, input_name, rule) in self.input_rules.clone() {
+            let InputRule::EnabledWhen {
+                input,
+                checked,
+                reason,
+            } = &rule;
+            for form_nid in self.forms_with_hx_post(&action) {
+                let gate = checkbox_checked_by_name(&self.doc, form_nid, input);
+                let violated = match gate {
+                    Some(c) => c != *checked,
+                    None => false,
+                };
+                if !violated {
+                    continue;
+                }
+                for nid in named_controls_in_form(&self.doc, form_nid, &input_name) {
+                    if let Some(eid) = self.element_id_of(nid) {
+                        // Host-authored `disabled`: never touch it. An
+                        // element already greyed by this pass or by the
+                        // actions slice is not host-authored — only a
+                        // `disabled` this engine did not itself set is.
+                        let host_disabled = self.attr(&eid, "disabled").is_some()
+                            && !self.rule_disabled.contains_key(&eid)
+                            && !action_greyed.contains_key(&eid);
+                        if host_disabled {
+                            continue;
+                        }
+                        desired.insert(eid, (nid, reason.clone()));
                     }
                 }
             }
         }
-        self.mark_dom_dirty();
+
+        let desired_reasons: HashMap<String, String> = desired
+            .iter()
+            .map(|(k, (_, r))| (k.clone(), r.clone()))
+            .collect();
+        let map_changed = desired_reasons != self.rule_disabled;
+        // Keep going whenever anything is currently desired-greyed, even if
+        // the desired-reasons map itself did not change: an earlier pass in
+        // the same call (`apply_disabled_map`) may have wrongly cleared a
+        // rule-greyed element before this pass got a chance to re-verify it
+        // (Graph review, PR #24 follow-up) — the per-element `already_matches`
+        // check below is what actually decides whether anything is rewritten.
+        if !map_changed && !force_dom_pass && desired.is_empty() {
+            return;
+        }
+
+        let mut node_updates: Vec<(NodeId, Option<String>)> = Vec::new();
+        // Clear ids we previously greyed that are no longer desired. Hand
+        // back to the actions slice if it still greys this element instead
+        // of enabling it outright (Graph review, PR #24 follow-up).
+        for elem_id in self.rule_disabled.keys() {
+            if desired.contains_key(elem_id) {
+                continue;
+            }
+            if let Some(nid) = self.doc.get_element_by_id(elem_id) {
+                node_updates.push((nid, action_greyed.get(elem_id).cloned()));
+            }
+        }
+        // Set/refresh ids that are desired and not already matching.
+        for (elem_id, (nid, reason)) in &desired {
+            let current_reason = self.attr(elem_id, "data-hx-reason");
+            let currently_disabled = self.attr(elem_id, "disabled").is_some();
+            let currently_aria = self.attr(elem_id, "aria-disabled").as_deref() == Some("true");
+            let already_matches = currently_disabled
+                && currently_aria
+                && current_reason.as_deref() == Some(reason.as_str());
+            if !already_matches {
+                node_updates.push((*nid, Some(reason.clone())));
+            }
+        }
+
+        self.rule_disabled = desired_reasons;
+
+        if node_updates.is_empty() {
+            return;
+        }
+
+        self.write_greying_attrs(node_updates);
+        self.mark_dom_dirty_raw();
         self.mark_paint_dirty();
         self.reconcile_open_select();
         self.reconcile_text_edit();
@@ -2038,6 +2373,242 @@ impl LiveSurface {
         changed
     }
 
+    /// Shared attribute write for both action-level and input-rule greying:
+    /// `disabled` + `aria-disabled="true"` + `data-hx-reason` when `Some`,
+    /// cleared when `None`.
+    fn write_greying_attrs(&mut self, node_updates: Vec<(NodeId, Option<String>)>) {
+        let mut mutr = self.doc.mutate();
+        for (elem_id, reason) in node_updates {
+            match reason {
+                Some(r) => {
+                    mutr.set_attribute(elem_id, qual_name!("disabled"), "");
+                    mutr.set_attribute(
+                        elem_id,
+                        QualName::new(None, ns!(), LocalName::from("aria-disabled")),
+                        "true",
+                    );
+                    mutr.set_attribute(
+                        elem_id,
+                        QualName::new(None, ns!(), LocalName::from("data-hx-reason")),
+                        &r,
+                    );
+                }
+                None => {
+                    mutr.clear_attribute(elem_id, qual_name!("disabled"));
+                    mutr.clear_attribute(
+                        elem_id,
+                        QualName::new(None, ns!(), LocalName::from("aria-disabled")),
+                    );
+                    mutr.clear_attribute(
+                        elem_id,
+                        QualName::new(None, ns!(), LocalName::from("data-hx-reason")),
+                    );
+                }
+            }
+        }
+    }
+
+    fn element_id_of(&self, nid: NodeId) -> Option<String> {
+        let node = self.doc.get_node(nid)?;
+        node.attrs().and_then(|attrs| {
+            attrs
+                .iter()
+                .find(|a| &*a.name.local == "id")
+                .map(|a| a.value.to_string())
+                .filter(|s| !s.is_empty())
+        })
+    }
+
+    /// Issue #15: drop any fallback baseline for a form inside `target_id`'s
+    /// pre-swap subtree (or `target_id` itself), so the next evaluation
+    /// recaptures it fresh from the post-swap values (unless overridden by
+    /// `data-hx-applied` on a given control).
+    fn invalidate_form_baselines_in(&mut self, target_id: NodeId) {
+        if self.form_baselines.is_empty() {
+            return;
+        }
+        let stale: Vec<String> = self
+            .form_baselines
+            .keys()
+            .filter(|form_id| {
+                self.doc
+                    .get_element_by_id(form_id)
+                    .is_some_and(|nid| nid == target_id || self.is_descendant(target_id, nid))
+            })
+            .cloned()
+            .collect();
+        for id in stale {
+            self.form_baselines.remove(&id);
+        }
+    }
+
+    /// Blocker 4 (Graph re-review, PR #24 round 2): drop any `rule_disabled`
+    /// entry for an element id inside `target_id`'s pre-swap subtree (or
+    /// `target_id` itself), so the first `apply_input_rules` pass after the
+    /// swap reads the new markup's `disabled` (if any) as host-authored,
+    /// not as a stale engine-owned grey left over from that id's pre-swap
+    /// occupant. Mirrors `invalidate_form_baselines_in`'s pre-mutation
+    /// invalidation (same filter, same call site). Without this, `dep`'s
+    /// `host_disabled` check in `apply_input_rules`
+    /// (`attr(disabled) && !rule_disabled.contains_key && …`) sees the
+    /// stale `rule_disabled` entry for a freshly-swapped-in element that
+    /// now carries a genuinely host-authored `disabled`, concludes it is
+    /// *not* host-authored, takes ownership, and later strips it (along
+    /// with `data-hx-reason`) the next time the rule clears.
+    ///
+    /// `disabled_actions` needs no equivalent: it is keyed by **action
+    /// name**, not element id (`apply_disabled_map` always fully
+    /// reassigns it from a fresh recompute every pass), and the
+    /// action-name → element-id lookup it feeds goes through
+    /// `self.bindings`, which `reindex_bindings` already rebuilds from
+    /// scratch on every swap.
+    fn invalidate_rule_disabled_in(&mut self, target_id: NodeId) {
+        if self.rule_disabled.is_empty() {
+            return;
+        }
+        let stale: Vec<String> = self
+            .rule_disabled
+            .keys()
+            .filter(|elem_id| {
+                self.doc
+                    .get_element_by_id(elem_id)
+                    .is_some_and(|nid| nid == target_id || self.is_descendant(target_id, nid))
+            })
+            .cloned()
+            .collect();
+        for id in stale {
+            self.rule_disabled.remove(&id);
+        }
+    }
+
+    fn is_descendant(&self, ancestor: NodeId, node: NodeId) -> bool {
+        let mut cur = self.doc.get_node(node).and_then(|n| n.parent);
+        while let Some(pid) = cur {
+            if pid == ancestor {
+                return true;
+            }
+            cur = self.doc.get_node(pid).and_then(|n| n.parent);
+        }
+        false
+    }
+
+    /// Issue #15 (Graph requirement): refresh `hx-changed` on every control in
+    /// every form currently referenced by a `RequiresChange` action (same
+    /// forms `self.form_baselines` tracks). Scoped this way per the cost
+    /// rule: only forms with `RequiresChange` are walked.
+    fn apply_all_changed_classes(&mut self) {
+        let mut forms: Vec<String> = Vec::new();
+        for (_, state) in &self.last_action_states {
+            if let ActionState::RequiresChange { form, .. } = state {
+                if !forms.contains(form) {
+                    forms.push(form.clone());
+                }
+            }
+        }
+        for form in forms {
+            self.apply_changed_classes(&form);
+        }
+    }
+
+    /// Add/remove class `hx-changed` on each named control in `form_id`
+    /// whenever its current value differs from its effective baseline (same
+    /// comparison as `RequiresChange`). Only mutates the class when the
+    /// per-control changed state actually flips vs. what the live DOM already
+    /// shows — never re-sets it on an edit that keeps the same state — so
+    /// restyle/damage from a flip stays local to that one control.
+    fn apply_changed_classes(&mut self, form_id: &str) {
+        let controls = capture_form_controls(&self.doc, form_id);
+        if controls.is_empty() {
+            return;
+        }
+        let fallback = self.form_baselines.get(form_id).cloned();
+        let mut updates: Vec<(NodeId, bool)> = Vec::new();
+        for (i, (nid, _name, current, applied)) in controls.iter().enumerate() {
+            let baseline_value = applied.clone().unwrap_or_else(|| {
+                fallback
+                    .as_ref()
+                    .and_then(|f| f.get(i))
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| current.clone())
+            });
+            let desired_changed = *current != baseline_value;
+            if self.node_has_class(*nid, HX_CHANGED_CLASS) != desired_changed {
+                updates.push((*nid, desired_changed));
+            }
+        }
+        if updates.is_empty() {
+            return;
+        }
+        for (nid, on) in updates {
+            self.toggle_class(nid, HX_CHANGED_CLASS, on);
+            self.hx_changed_write_count += 1;
+        }
+        self.mark_dom_dirty_raw();
+        self.mark_paint_dirty();
+    }
+
+    /// Issue #24 (Designer lock 2026-10-20): `hx-changed` for every control
+    /// carrying `data-hx-applied`, independent of any enclosing form or
+    /// `RequiresChange` action — the attribute alone opts a control in (a
+    /// plan row with no button of its own included). There is no fallback
+    /// baseline here: being in `self.applied_control_nids` means the
+    /// attribute is present, so it is always the comparison baseline (same
+    /// override rule as `apply_changed_classes`, just with nothing to fall
+    /// back to). A control also covered by a `RequiresChange` form's pass
+    /// computes the identical decision there, so the flip-check keeps this
+    /// idempotent — no double write.
+    fn apply_standalone_changed_classes(&mut self) {
+        let controls = capture_applied_controls(&self.doc, &self.applied_control_nids);
+        if controls.is_empty() {
+            return;
+        }
+        let mut updates: Vec<(NodeId, bool)> = Vec::new();
+        for (nid, current, applied) in &controls {
+            let desired_changed = current != applied;
+            if self.node_has_class(*nid, HX_CHANGED_CLASS) != desired_changed {
+                updates.push((*nid, desired_changed));
+            }
+        }
+        if updates.is_empty() {
+            return;
+        }
+        for (nid, on) in updates {
+            self.toggle_class(nid, HX_CHANGED_CLASS, on);
+            self.hx_changed_write_count += 1;
+        }
+        self.mark_dom_dirty_raw();
+        self.mark_paint_dirty();
+    }
+
+    fn node_class(&self, nid: NodeId) -> String {
+        self.doc
+            .get_node(nid)
+            .and_then(|n| n.attrs())
+            .and_then(|attrs| attrs.iter().find(|a| &*a.name.local == "class"))
+            .map(|a| a.value.to_string())
+            .unwrap_or_default()
+    }
+
+    fn node_has_class(&self, nid: NodeId, class: &str) -> bool {
+        class_tokens(&self.node_class(nid)).any(|t| t == class)
+    }
+
+    /// Preserve any host classes on the element; only add/remove `class`.
+    fn toggle_class(&mut self, nid: NodeId, class: &str, on: bool) {
+        let current = self.node_class(nid);
+        let new_value = if on {
+            add_class_token(&current, class)
+        } else {
+            remove_class_token(&current, class)
+        };
+        let mut mutr = self.doc.mutate();
+        if new_value.is_empty() {
+            mutr.clear_attribute(nid, qual_name!("class"));
+        } else {
+            mutr.set_attribute(nid, qual_name!("class"), &new_value);
+        }
+    }
+
     fn count_damage(&self) -> (usize, usize) {
         let doc = &self.doc;
         let mut damaged = 0usize;
@@ -2063,6 +2634,16 @@ impl LiveSurface {
 
     fn ensure_resolved(&mut self) {
         if self.needs_resolve {
+            // Graph review (PR #24 follow-up): read restyle damage before
+            // this input-time resolve clears it, so attribute/class writes
+            // (greying, hx-changed, checked) made before the next paint
+            // still reach that paint's damage plan. Without this, the full
+            // `resolve_doc` below consumes Blitz's one-shot restyle flags,
+            // and `resolve_and_plan_damage`'s own `resolve_stylist` probe at
+            // paint time finds nothing left to report.
+            self.doc.resolve_stylist(0.0);
+            let carried = collect_style_damaged(&self.doc);
+            self.carried_style_damage.extend(carried);
             self.resolve_doc();
             self.needs_resolve = false;
         }
@@ -2501,6 +3082,14 @@ impl LiveSurface {
         ctx: &mut ActionCtx<'_>,
         ctrl: &FormControlRef,
     ) -> Option<InputOutcome> {
+        // Graph review (PR #24 follow-up): explicit damage for the committed
+        // control itself. Checked/selected state is element state Blitz
+        // paints directly at paint time, not necessarily something a CSS
+        // restyle flags as damage — so style damage alone can miss a
+        // checkbox/radio's own tick-mark redraw (unchecking then rechecking
+        // a gate left a stale partial repaint). Despite the name, this ink-
+        // box helper is generic, not text-specific (see its doc comment).
+        self.queue_text_field_damage(ctrl.node_id);
         self.mark_dom_dirty();
         self.mark_paint_dirty();
         if let Some(ref sid) = ctrl.element_id {
@@ -3131,7 +3720,13 @@ impl LiveSurface {
     }
 
     fn action_args_for(&self, source_id: &str) -> Vec<(String, String)> {
-        collect_action_args(&self.doc, source_id)
+        // Issue #15 (K1): an `EnabledWhen`-greyed input still posts its value.
+        let rule_greyed: HashSet<NodeId> = self
+            .rule_disabled
+            .keys()
+            .filter_map(|eid| self.doc.get_element_by_id(eid))
+            .collect();
+        collect_action_args(&self.doc, source_id, &rule_greyed)
     }
 
     fn apply_range_from_x(&mut self, id: &str, x: f32) -> bool {
@@ -3497,6 +4092,10 @@ impl LiveSurface {
                             activate_checkable(&mut self.doc, nid)
                         };
                         if changed {
+                            // Same explicit commit damage as the pointer path
+                            // (`after_control_commit`): the tick mark is element
+                            // state, not guaranteed style damage.
+                            self.queue_text_field_damage(nid);
                             let _ = sync_outputs_for(&mut self.doc, fid);
                             self.mark_dom_dirty();
                             self.mark_paint_dirty();
@@ -3863,13 +4462,21 @@ impl LiveSurface {
             ColorScheme::Light,
         ));
 
+        // Graph review (PR #24 follow-up): drain damage an input-time
+        // `ensure_resolved` already carried (its one-shot restyle flags are
+        // long gone by now). Merged into the probe below; a force-full /
+        // first paint discards it since the whole surface repaints anyway.
+        let carried = std::mem::take(&mut self.carried_style_damage);
+
         // Probe: public resolve_stylist first so Node::damage() is readable,
         // then full resolve (stylist is a no-op; layout + paint-tree run).
         let style_damaged = if force_full || !had_previous {
             Vec::new()
         } else {
             self.doc.resolve_stylist(0.0);
-            collect_style_damaged(&self.doc)
+            let mut v = collect_style_damaged(&self.doc);
+            v.extend(carried);
+            v
         };
 
         // Style + layout once. A second pass is allowed only when the hovered
@@ -4130,11 +4737,11 @@ fn validate_loaded_tree(
             continue;
         }
         let (id_attr, attrs) = element_id_and_attrs(node);
-        validate_loaded_attrs(&id_attr, &attrs, known_ids)?;
         let tag = node
             .element_data()
             .map(|el| el.name.local.to_string())
             .unwrap_or_default();
+        validate_loaded_attrs(&id_attr, &attrs, known_ids, Some(&tag))?;
         let input_ty = attrs
             .iter()
             .find(|(k, _)| k == "type")

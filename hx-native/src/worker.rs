@@ -149,6 +149,9 @@ fn engine_err(surface: Option<SurfaceId>, error: EngineError) -> WorkerError {
 pub struct SyncPacket {
     pub versions: HashMap<String, u64>,
     pub actions: Vec<(String, ActionState)>,
+    /// Issue #15: dependent-input rules, carried alongside `actions` so the
+    /// worker's `SliceSource` snapshot stays in parity with the sync `Engine`.
+    pub input_rules: Vec<(String, String, InputRule)>,
     pub fragments: HashMap<String, String>,
     /// `(action, input name) -> InputLimits` (issue #16). See
     /// [`SliceSource::input_limits`].
@@ -156,23 +159,36 @@ pub struct SyncPacket {
 }
 
 impl SyncPacket {
-    /// Merge `newer` per slice / section (latest key wins). Used when coalescing.
+    /// Merge `newer` per slice / section (latest key wins). Used when
+    /// coalescing queued `sync` calls before the worker drains them.
     ///
-    /// PR27 round 2 (fixing the same "keep-when-empty" bug Graph found on
-    /// #24): the reserved `actions` slice — `actions` (greying) and
-    /// `input_limits` together — is replaced **as a whole** whenever
-    /// `newer` carries a fresh snapshot of it (signalled by
-    /// `newer.versions` touching the `"actions"` key), even if one or both
-    /// of those lists are empty. An empty list on a packet that *does* bump
-    /// the `actions` version is a deliberate "nothing greyed / no limits
-    /// now" state, not "no update" — matching `Engine::sync`, which
-    /// unconditionally re-reads `action_states()` and (when the version
-    /// changed) `input_limits()` every time, including to empty. A packet
-    /// that never touches `"actions"` in `versions` (e.g. a ticker-only
-    /// update) leaves both untouched, so coalescing several such packets
-    /// before `actions` changes keeps whatever the host last declared.
+    /// `versions` and `fragments` merge per **key**: a key missing from
+    /// `newer` leaves the accumulated entry alone, it does not delete it.
+    /// The reserved `actions` slice is `actions` (greying), `input_rules`
+    /// (issue #15) and `input_limits` (issue #16). All three are replaced
+    /// **together, as a unit** (Graph review, PR #24 round 2 and PR #27
+    /// round 2): `Engine::sync` re-reads `action_states()` and
+    /// `input_rules()` on every call and `input_limits()` whenever the
+    /// `actions` version changes, so a coalesced worker must reproduce what
+    /// sequential `Engine::sync(P1)` then `Engine::sync(P2)` ends with,
+    /// including `P2` *clearing* a list by sending it empty. The slice is
+    /// replaced whenever `newer` is reporting on it at all: it carries the
+    /// `"actions"` version key, or any of the three lists is non-empty (a
+    /// defensive fallback for a caller that forgot the version bump but
+    /// still has content to deliver). Checked against sequential
+    /// `Engine::sync` application by `gp24b_merge_vs_sync_semantics`
+    /// (`tests/paint_worker.rs`) and `merge_per_slice_matches_sequential_engine_sync`
+    /// (`tests/limits.rs`), with one known exception (Graph review, PR #24
+    /// round 3): a newer packet with **no** `"actions"` version key and all
+    /// three lists empty leaves the accumulated slice (greying, rules and
+    /// limits) in place when coalesced, whereas `Engine::sync` applied in
+    /// order would clear greying and rules. Callers clearing the slice must
+    /// send the `"actions"` version key.
     pub fn merge_per_slice(&mut self, newer: SyncPacket) {
-        let replace_reserved_actions_slice = newer.versions.contains_key("actions");
+        let replace_reserved_actions_slice = newer.versions.contains_key("actions")
+            || !newer.actions.is_empty()
+            || !newer.input_rules.is_empty()
+            || !newer.input_limits.is_empty();
         for (k, v) in newer.versions {
             self.versions.insert(k, v);
         }
@@ -181,6 +197,7 @@ impl SyncPacket {
         }
         if replace_reserved_actions_slice {
             self.actions = newer.actions;
+            self.input_rules = newer.input_rules;
             self.input_limits = newer.input_limits;
         }
     }
@@ -193,6 +210,10 @@ impl SliceSource for SyncPacket {
 
     fn action_states(&self) -> Vec<(String, ActionState)> {
         self.actions.clone()
+    }
+
+    fn input_rules(&self) -> Vec<(String, String, InputRule)> {
+        self.input_rules.clone()
     }
 
     fn input_limits(&self) -> Vec<(String, String, InputLimits)> {
@@ -327,6 +348,14 @@ enum Command {
     TestHold {
         release: Arc<AtomicBool>,
     },
+    /// Test-only (issue #25): force one caret blink phase flip on the
+    /// worker's own `Engine`, mirroring `Engine::test_force_caret_blink`.
+    TestForceCaretBlink,
+    /// Test-only (issue #25): read whether the caret is in its visible
+    /// blink phase, mirroring `Engine::test_caret_visible`.
+    TestCaretVisible {
+        reply: Reply<Option<bool>>,
+    },
     Shutdown,
 }
 
@@ -346,6 +375,8 @@ fn is_discrete_cmd(cmd: &Command) -> bool {
         | Command::LoadHtml { .. }
         | Command::TestPanic
         | Command::TestHold { .. }
+        | Command::TestForceCaretBlink
+        | Command::TestCaretVisible { .. }
         | Command::Shutdown => true,
         _ => false,
     }
@@ -1068,13 +1099,24 @@ impl PaintWorker {
     /// Use once after setup (or any batch whose result you need) when you do
     /// not want to poll [`Self::poll_error`] yourself.
     pub fn flush(&self) -> Result<(), WorkerError> {
+        self.flush_timeout(Duration::from_nanos(WORKER_STALL_TIMEOUT_NS))
+    }
+
+    /// [`Self::flush`] with a caller-chosen stall timeout. [`Self::flush`]
+    /// itself stays at [`WORKER_STALL_TIMEOUT_NS`] (100 ms) — that bound is
+    /// deliberately tight for production hosts deciding whether to fall back
+    /// to the sync `Engine`. Tests with an expensive first paint (debug
+    /// builds, loaded CI runners) need a longer bound; a timeout here still
+    /// records `Stalled` the same way.
+    #[doc(hidden)]
+    pub fn flush_timeout(&self, timeout: Duration) -> Result<(), WorkerError> {
         if let Some(err) = self.poll_error() {
             return Err(err);
         }
         let (tx, rx) = mpsc::sync_channel(1);
         self.mailbox
             .push_discrete(Command::Flush { reply: Reply(tx) })?;
-        match rx.recv_timeout(Duration::from_nanos(WORKER_STALL_TIMEOUT_NS)) {
+        match rx.recv_timeout(timeout) {
             Ok(r) => r,
             Err(RecvTimeoutError::Timeout) => {
                 let err = WorkerError::Stalled;
@@ -1162,6 +1204,56 @@ impl PaintWorker {
     /// Test-only: park the worker until `release` is set true.
     pub fn inject_hold_for_test(&self, release: Arc<AtomicBool>) -> Result<(), WorkerError> {
         self.mailbox.push_discrete(Command::TestHold { release })
+    }
+
+    /// Test-only (issue #25): force one caret blink phase flip on the
+    /// worker's own `Engine` (default surface), mirroring
+    /// [`crate::Engine::test_force_caret_blink`]. Fire-and-forget like other
+    /// setup/test commands; pair with [`Self::flush`] or
+    /// [`Self::test_caret_visible`] to wait for it to apply.
+    #[doc(hidden)]
+    pub fn force_caret_blink_for_test(&self) -> Result<(), WorkerError> {
+        self.check_stall_after_enqueue(self.mailbox.push_discrete(Command::TestForceCaretBlink))
+    }
+
+    /// Test-only (issue #25): read whether the caret is in its visible
+    /// blink phase on the worker's own `Engine` (default surface),
+    /// mirroring [`crate::Engine::test_caret_visible`]. Blocks (bounded by
+    /// [`WORKER_STALL_TIMEOUT_NS`]) until commands queued before this call
+    /// are applied.
+    ///
+    /// Deliberately does not mirror [`Self::flush`]'s blanket
+    /// `poll_error()` pre-check: that check honours a *stale* recorded
+    /// `Stalled` permanently (by design, for production hosts deciding
+    /// whether to fall back to the sync `Engine`), but a test probing
+    /// worker state after one slow-but-recovered operation (e.g. an
+    /// expensive first paint under a loaded CI box) still wants a fresh
+    /// answer. Only a genuine `Panic` — the thread is actually gone — stays
+    /// fatal, the same distinction [`Self::check_stall_after_enqueue`]
+    /// already draws for every fire-and-forget command.
+    #[doc(hidden)]
+    pub fn test_caret_visible(&self) -> Result<Option<bool>, WorkerError> {
+        if let Some(err @ WorkerError::Panic(_)) = self.poll_error() {
+            return Err(err);
+        }
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.mailbox
+            .push_discrete(Command::TestCaretVisible { reply: Reply(tx) })?;
+        match rx.recv_timeout(Duration::from_nanos(WORKER_STALL_TIMEOUT_NS)) {
+            Ok(v) => Ok(v),
+            Err(RecvTimeoutError::Timeout) => {
+                let err = WorkerError::Stalled;
+                self.shared.set_error(err.clone());
+                Err(err)
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                if let Some(err) = self.poll_error() {
+                    Err(err)
+                } else {
+                    Err(WorkerError::ShutDown)
+                }
+            }
+        }
     }
 }
 
@@ -1345,6 +1437,14 @@ fn process_command(
             }
             Ok(false)
         }
+        Command::TestForceCaretBlink => {
+            eng.test_force_caret_blink();
+            Ok(false)
+        }
+        Command::TestCaretVisible { reply } => {
+            reply.send(eng.test_caret_visible());
+            Ok(false)
+        }
         Command::Shutdown => Ok(true),
     }
 }
@@ -1429,6 +1529,7 @@ mod mailbox_and_buffer_tests {
         SyncPacket {
             versions: HashMap::from([("ticker".into(), 1)]),
             actions: Vec::new(),
+            input_rules: Vec::new(),
             fragments,
             input_limits: Vec::new(),
         }

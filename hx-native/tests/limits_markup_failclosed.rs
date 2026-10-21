@@ -223,3 +223,75 @@ fn limits_clamp_damage_stays_within_field() {
         );
     }
 }
+
+/// Crate-owner decision (PR #27 merge with #24): the fail-closed error branch
+/// reads this packet's `input_rules` before it greys, so a failing sync that
+/// also changes the rules greys by the new rules, never the previous ones.
+#[test]
+fn failed_limits_sync_greys_by_the_new_input_rules() {
+    let frag = "<input id=\"gate\" type=\"checkbox\" name=\"gate\"/>\
+                <input id=\"dep\" type=\"text\" name=\"dep\" value=\"x\"/>\
+                <input id=\"fee\" type=\"number\" name=\"fee\" value=\"5\"/>\
+                <button id=\"save\" hx-post=\"settings.apply\" hx-trigger=\"click\">Save</button>";
+    let mut e = boot(&format!(
+        "<form id=\"f\"><section id=\"sec\" hx-trigger=\"slice:panel\">{frag}</section></form>"
+    ));
+    let gate_rule = || {
+        vec![(
+            "settings.apply".to_string(),
+            "dep".to_string(),
+            InputRule::EnabledWhen {
+                input: "gate".into(),
+                checked: true,
+                reason: "gate off".into(),
+            },
+        )]
+    };
+    let mk = |av: u64, pv: u64, l: Vec<(&str, &str, InputLimits)>, rules| {
+        let mut p = packet(av, pv, l);
+        p.input_rules = rules;
+        p.fragments.insert("sec".into(), frag.into());
+        p
+    };
+    let fee = || {
+        vec![(
+            "settings.apply",
+            "fee",
+            InputLimits::new(0.0, 10.0, Some(1.0)),
+        )]
+    };
+    let nosuch = || {
+        vec![(
+            "settings.apply",
+            "nosuch",
+            InputLimits::new(0.0, 10.0, Some(1.0)),
+        )]
+    };
+
+    // Good sync, no rules: dep is enabled.
+    let good = mk(1, 1, fee(), Vec::new());
+    e.sync(&good, &mut good.clone()).unwrap();
+    assert!(e.attr("dep", "disabled").is_none());
+
+    // Failing sync (unknown limit input) that swaps the section and adds the
+    // gate rule: dep must be greyed by the new rule.
+    let bad = mk(2, 2, nosuch(), gate_rule());
+    e.sync(&bad, &mut bad.clone())
+        .expect_err("unknown limit input must fail sync");
+    assert!(
+        e.attr("dep", "disabled").is_some(),
+        "failed sync must grey by this packet's new input_rules"
+    );
+    assert_eq!(e.attr("dep", "data-hx-reason").as_deref(), Some("gate off"));
+    assert_eq!(e.attr("fee", "max").as_deref(), Some("10"));
+
+    // Failing sync that drops the rule: the engine-owned grey must clear.
+    let bad2 = mk(3, 3, nosuch(), Vec::new());
+    e.sync(&bad2, &mut bad2.clone())
+        .expect_err("unknown limit input must fail sync");
+    assert!(
+        e.attr("dep", "disabled").is_none(),
+        "failed sync must stop greying by the previous packet's rules"
+    );
+    assert_eq!(e.attr("dep", "data-hx-reason"), None);
+}

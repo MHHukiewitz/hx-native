@@ -13,9 +13,13 @@
 //! field with that name, both appear: the trigger's value first, then the
 //! form's (htmx parity).
 
+use std::collections::HashSet;
+
 use blitz_dom::node::Node;
 use blitz_dom::{qual_name, NodeId};
 use blitz_html::HtmlDocument;
+
+use crate::dialect::ATTR_HX_APPLIED;
 
 /// IEEE-754 safe integer limit (±2^53). Beyond this, number fields clamp at commit
 /// and step math refuses to proceed with wrapping/`as i64` casts.
@@ -37,7 +41,16 @@ pub fn args_get_all<'a>(args: &'a [(String, String)], name: &str) -> Vec<&'a str
 }
 
 /// Collect args for an action fired from `source_id`.
-pub fn collect_action_args(doc: &HtmlDocument, source_id: &str) -> Vec<(String, String)> {
+///
+/// `rule_greyed` (issue #15) is the set of input nodes currently disabled by
+/// an `InputRule::EnabledWhen` (engine-applied, not host-authored): those
+/// still contribute their value (Game ignores/validates it, K1), unlike a
+/// plain host-authored `disabled` control, which is skipped as before.
+pub fn collect_action_args(
+    doc: &HtmlDocument,
+    source_id: &str,
+    rule_greyed: &HashSet<NodeId>,
+) -> Vec<(String, String)> {
     let mut args = Vec::new();
     let Some(source_nid) = doc.get_element_by_id(source_id) else {
         return args;
@@ -65,11 +78,116 @@ pub fn collect_action_args(doc: &HtmlDocument, source_id: &str) -> Vec<(String, 
         let Some(node) = doc.get_node(nid) else {
             continue;
         };
-        if let Some(pair) = form_control_pair(doc, node) {
+        if let Some(pair) = form_control_pair(doc, node, rule_greyed.contains(&nid)) {
             args.push(pair);
         }
     }
     args
+}
+
+/// Issue #15: one entry per named form control (document order, under
+/// `form_id`): its node id, name, current value, and — when present —
+/// its `data-hx-applied` value (Designer lock 2026-10-20), decoded into the
+/// same encoding as the current value: checkbox/radio as `"true"`/`"false"`;
+/// everything else the literal control value (canonical for numbers). Always
+/// one entry per control regardless of `disabled` (an `EnabledWhen` toggle
+/// must not by itself change `RequiresChange` dirtiness). Empty when
+/// `form_id` is not in the document.
+pub(crate) fn capture_form_controls(
+    doc: &HtmlDocument,
+    form_id: &str,
+) -> Vec<(NodeId, String, String, Option<String>)> {
+    let Some(form_nid) = doc.get_element_by_id(form_id) else {
+        return Vec::new();
+    };
+    descendants_document_order(doc, form_nid)
+        .into_iter()
+        .filter_map(|nid| {
+            let node = doc.get_node(nid)?;
+            let (name, current) = control_baseline_pair(doc, node)?;
+            Some((nid, name, current, applied_value(node)))
+        })
+        .collect()
+}
+
+/// This control's `data-hx-applied` value decoded into the same encoding as
+/// [`capture_form_controls`]'s current value (`"true"`/`"false"` for
+/// checkbox/radio, the literal value otherwise). `None` when absent.
+fn applied_value(node: &Node) -> Option<String> {
+    let raw = attr(node, ATTR_HX_APPLIED)?;
+    let tag = tag_name(node);
+    if tag == "input" && matches!(input_type(node).as_str(), "checkbox" | "radio") {
+        return Some(if raw.trim().eq_ignore_ascii_case("true") {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        });
+    }
+    Some(raw)
+}
+
+fn control_baseline_pair(doc: &HtmlDocument, node: &Node) -> Option<(String, String)> {
+    let name = named_attr(node, "name")?;
+    let current = control_current_value(doc, node)?;
+    Some((name, current))
+}
+
+/// Current value for a supported control, same encoding used throughout this
+/// module (checkbox/radio as `"true"`/`"false"`, everything else the literal
+/// value). Unlike [`control_baseline_pair`], does not require a `name` —
+/// standalone `data-hx-applied` controls (Designer lock 2026-10-20) opt into
+/// `hx-changed` by the attribute alone, with or without a form or a name.
+fn control_current_value(doc: &HtmlDocument, node: &Node) -> Option<String> {
+    match tag_name(node).as_str() {
+        "input" => match input_type(node).as_str() {
+            "checkbox" | "radio" => Some(is_checked(node).to_string()),
+            "number" | "range" | "hidden" | "text" => Some(control_value(node)),
+            _ => None,
+        },
+        "select" => Some(select_value(doc, node)),
+        _ => None,
+    }
+}
+
+/// Issue #24 (Designer lock 2026-10-20): node ids of every element anywhere
+/// in the document carrying `data-hx-applied` — the attribute alone opts a
+/// control into `hx-changed` tracking, independent of any enclosing form or
+/// `RequiresChange` action. Walked once per structural DOM change (reindex),
+/// not per sync/edit, so the per-edit recompute stays cheap (issue #15 cost
+/// rule: only opted-in controls are ever compared).
+pub(crate) fn collect_applied_control_nids(doc: &HtmlDocument) -> Vec<NodeId> {
+    let root = doc.root_node().id;
+    let mut stack = vec![root];
+    let mut out = Vec::new();
+    while let Some(nid) = stack.pop() {
+        let Some(node) = doc.get_node(nid) else {
+            continue;
+        };
+        stack.extend(node.children.iter().copied());
+        if node.is_element() && attr(node, ATTR_HX_APPLIED).is_some() {
+            out.push(nid);
+        }
+    }
+    out
+}
+
+/// Issue #24: `(node id, current value, applied value)` for each id in
+/// `nids` (from [`collect_applied_control_nids`]) still present and still a
+/// supported control. The applied value is always present by construction —
+/// that is what being in `nids` means — so there is no fallback baseline to
+/// track or invalidate on re-render (data-hx-applied always wins).
+pub(crate) fn capture_applied_controls(
+    doc: &HtmlDocument,
+    nids: &[NodeId],
+) -> Vec<(NodeId, String, String)> {
+    nids.iter()
+        .filter_map(|&nid| {
+            let node = doc.get_node(nid)?;
+            let current = control_current_value(doc, node)?;
+            let applied = applied_value(node)?;
+            Some((nid, current, applied))
+        })
+        .collect()
 }
 
 /// Value for a triggering element: real control value for form controls,
@@ -320,8 +438,15 @@ pub(crate) fn write_value_attr(doc: &mut HtmlDocument, nid: NodeId, new_value: &
     true
 }
 
-fn form_control_pair(doc: &HtmlDocument, node: &Node) -> Option<(String, String)> {
-    if attr(node, "disabled").is_some() {
+/// `force_include` keeps a `disabled` control in the args anyway — used for
+/// an `EnabledWhen`-greyed input (issue #15, K1): still posted with its
+/// current value.
+fn form_control_pair(
+    doc: &HtmlDocument,
+    node: &Node,
+    force_include: bool,
+) -> Option<(String, String)> {
+    if !force_include && attr(node, "disabled").is_some() {
         return None;
     }
     let name = named_attr(node, "name")?;

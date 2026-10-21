@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use hx_native::*;
 
@@ -952,7 +953,7 @@ fn paint_worker_matches_sync_engine_after_limits_apply_and_clamp() {
         .resize_surface(SurfaceId::DEFAULT, view.clone())
         .unwrap();
     worker.sync(limits_packet(1, 3.0)).unwrap();
-    worker.flush().unwrap();
+    worker.flush_timeout(Duration::from_secs(10)).unwrap();
     let frame = worker.latest_frame(SurfaceId::DEFAULT, 0).unwrap();
     let host_img = frame.output.rgba.as_ref().unwrap().clone();
 
@@ -982,7 +983,7 @@ fn worker_coalesced_syncs_keep_input_limits() {
     // which must not drop the limits carried by the second packet.
     worker.sync(baseline_pkt).unwrap();
     worker.sync(limited_pkt.clone()).unwrap();
-    worker.flush().unwrap();
+    worker.flush_timeout(Duration::from_secs(10)).unwrap();
     let worker_img = worker
         .latest_frame(SurfaceId::DEFAULT, 0)
         .unwrap()
