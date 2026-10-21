@@ -125,6 +125,26 @@ fn engine_err(surface: Option<SurfaceId>, error: EngineError) -> WorkerError {
 }
 
 /// Owned slice + fragment snapshot the host sends to the worker.
+///
+/// `#[non_exhaustive]` (PR27 round 2): future fields (e.g. a prospective
+/// `input_rules`) must not break downstream code. Outside this crate a
+/// `#[non_exhaustive]` struct cannot be built with a struct literal, not even
+/// `SyncPacket { field, ..Default::default() }` (E0639), so start from
+/// `SyncPacket::default()` and assign fields:
+///
+/// ```
+/// use hx_native::{InputLimits, SyncPacket};
+///
+/// let mut packet = SyncPacket::default();
+/// packet.versions.insert("actions".into(), 1);
+/// packet.input_limits = vec![(
+///     "settings.apply".into(),
+///     "fee".into(),
+///     InputLimits::new(0.0, 10.0, Some(1.0)),
+/// )];
+/// assert!(packet.actions.is_empty());
+/// ```
+#[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct SyncPacket {
     pub versions: HashMap<String, u64>,
@@ -133,6 +153,9 @@ pub struct SyncPacket {
     /// worker's `SliceSource` snapshot stays in parity with the sync `Engine`.
     pub input_rules: Vec<(String, String, InputRule)>,
     pub fragments: HashMap<String, String>,
+    /// `(action, input name) -> InputLimits` (issue #16). See
+    /// [`SliceSource::input_limits`].
+    pub input_limits: Vec<(String, String, InputLimits)>,
 }
 
 impl SyncPacket {
@@ -141,39 +164,41 @@ impl SyncPacket {
     ///
     /// `versions` and `fragments` merge per **key**: a key missing from
     /// `newer` leaves the accumulated entry alone, it does not delete it.
-    /// `actions` and `input_rules` are **one** reserved slice (Graph review,
-    /// PR #24 round 2, reverting an earlier per-field split that diverged
-    /// from `Engine::sync`) and are replaced **together, as a unit**:
-    /// `Engine::sync` unconditionally re-reads both on every call
-    /// (`self.input_rules = slices.input_rules()`; `apply_action_states`),
-    /// so a coalesced worker must reproduce exactly what sequential
-    /// `Engine::sync(P1)` then `Engine::sync(P2)` ends with — including
-    /// `P2` *clearing* a field by sending it empty. The pair is replaced
-    /// whenever `newer` is reporting on the slice at all: it carries the
-    /// `"actions"` version key, or either field is non-empty (the latter a
+    /// The reserved `actions` slice is `actions` (greying), `input_rules`
+    /// (issue #15) and `input_limits` (issue #16). All three are replaced
+    /// **together, as a unit** (Graph review, PR #24 round 2 and PR #27
+    /// round 2): `Engine::sync` re-reads `action_states()` and
+    /// `input_rules()` on every call and `input_limits()` whenever the
+    /// `actions` version changes, so a coalesced worker must reproduce what
+    /// sequential `Engine::sync(P1)` then `Engine::sync(P2)` ends with,
+    /// including `P2` *clearing* a list by sending it empty. The slice is
+    /// replaced whenever `newer` is reporting on it at all: it carries the
+    /// `"actions"` version key, or any of the three lists is non-empty (a
     /// defensive fallback for a caller that forgot the version bump but
     /// still has content to deliver). Checked against sequential
-    /// `Engine::sync` application, including the "actions update after an
-    /// earlier rules-only packet" case, by `gp24b_merge_vs_sync_semantics`
-    /// (`tests/paint_worker.rs`), with one known exception (Graph review,
-    /// PR #24 round 3): a newer packet with **no** `"actions"` version key
-    /// and both lists empty leaves the accumulated pair (and so the greying)
-    /// in place when coalesced, whereas `Engine::sync` applied in order
-    /// would clear it. Callers clearing the slice must send the `"actions"`
-    /// version key.
+    /// `Engine::sync` application by `gp24b_merge_vs_sync_semantics`
+    /// (`tests/paint_worker.rs`) and `merge_per_slice_matches_sequential_engine_sync`
+    /// (`tests/limits.rs`), with one known exception (Graph review, PR #24
+    /// round 3): a newer packet with **no** `"actions"` version key and all
+    /// three lists empty leaves the accumulated slice (greying, rules and
+    /// limits) in place when coalesced, whereas `Engine::sync` applied in
+    /// order would clear greying and rules. Callers clearing the slice must
+    /// send the `"actions"` version key.
     pub fn merge_per_slice(&mut self, newer: SyncPacket) {
-        let replace_actions = newer.versions.contains_key("actions")
+        let replace_reserved_actions_slice = newer.versions.contains_key("actions")
             || !newer.actions.is_empty()
-            || !newer.input_rules.is_empty();
+            || !newer.input_rules.is_empty()
+            || !newer.input_limits.is_empty();
         for (k, v) in newer.versions {
             self.versions.insert(k, v);
         }
         for (k, v) in newer.fragments {
             self.fragments.insert(k, v);
         }
-        if replace_actions {
+        if replace_reserved_actions_slice {
             self.actions = newer.actions;
             self.input_rules = newer.input_rules;
+            self.input_limits = newer.input_limits;
         }
     }
 }
@@ -189,6 +214,10 @@ impl SliceSource for SyncPacket {
 
     fn input_rules(&self) -> Vec<(String, String, InputRule)> {
         self.input_rules.clone()
+    }
+
+    fn input_limits(&self) -> Vec<(String, String, InputLimits)> {
+        self.input_limits.clone()
     }
 }
 
@@ -1502,6 +1531,7 @@ mod mailbox_and_buffer_tests {
             actions: Vec::new(),
             input_rules: Vec::new(),
             fragments,
+            input_limits: Vec::new(),
         }
     }
 

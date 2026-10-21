@@ -50,12 +50,10 @@ fn packet(ticker_ver: u64, cell: &str) -> SyncPacket {
     versions.insert("actions".into(), 1);
     let mut fragments = HashMap::new();
     fragments.insert("sec".into(), format!(r#"<div id="cell">{cell}</div>"#));
-    SyncPacket {
-        versions,
-        actions: Vec::new(),
-        input_rules: Vec::new(),
-        fragments,
-    }
+    let mut pkt = SyncPacket::default();
+    pkt.versions = versions;
+    pkt.fragments = fragments;
+    pkt
 }
 
 fn click_at(x: f32, y: f32) -> [InputEvent; 3] {
@@ -740,12 +738,11 @@ fn gp24b_pkt(
     actions: Vec<(String, ActionState)>,
     rules: Vec<(String, String, InputRule)>,
 ) -> SyncPacket {
-    SyncPacket {
-        versions: HashMap::from([("actions".into(), ver)]),
-        actions,
-        input_rules: rules,
-        fragments: HashMap::new(),
-    }
+    let mut p = SyncPacket::default();
+    p.versions = HashMap::from([("actions".into(), ver)]);
+    p.actions = actions;
+    p.input_rules = rules;
+    p
 }
 
 /// Apply `pkts` to a fresh sync `Engine`, one `sync` + `paint` per packet

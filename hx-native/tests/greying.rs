@@ -1015,12 +1015,9 @@ fn wrapped_big_form() -> String {
 }
 
 fn base_packet() -> SyncPacket {
-    SyncPacket {
-        versions: HashMap::from([("actions".into(), 1)]),
-        actions: Vec::new(),
-        input_rules: Vec::new(),
-        fragments: HashMap::new(),
-    }
+    let mut p = SyncPacket::default();
+    p.versions = HashMap::from([("actions".into(), 1)]);
+    p
 }
 
 /// Run `script` (pointer/key events) through a worker and a sync `Engine`

@@ -63,12 +63,9 @@ fn click_script(x: f32, y: f32) -> Vec<InputEvent> {
 }
 
 fn base_packet() -> SyncPacket {
-    SyncPacket {
-        versions: HashMap::from([("actions".into(), 1)]),
-        actions: Vec::new(),
-        input_rules: Vec::new(),
-        fragments: HashMap::new(),
-    }
+    let mut p = SyncPacket::default();
+    p.versions = HashMap::from([("actions".into(), 1)]);
+    p
 }
 
 fn probe(html: &str, actions: &[&str]) -> Engine {

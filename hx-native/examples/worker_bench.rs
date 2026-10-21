@@ -68,12 +68,10 @@ fn packet(ver: u64, offset: i32) -> SyncPacket {
             r#"<div id="ticker-lane"><span style="margin-left:{offset}px">Breaking · Port delay · Week tick · Sim</span></div>"#
         ),
     );
-    SyncPacket {
-        versions,
-        actions: Vec::new(),
-        input_rules: Vec::new(),
-        fragments,
-    }
+    let mut pkt = SyncPacket::default();
+    pkt.versions = versions;
+    pkt.fragments = fragments;
+    pkt
 }
 
 struct MemSlices {

@@ -47,24 +47,22 @@ fn html() -> String {
 }
 
 fn pkt(panel: u64, other: u64, sec: &str, sec2: &str) -> SyncPacket {
-    let mut p = SyncPacket {
-        versions: HashMap::from([
-            ("actions".into(), 1),
-            ("panel".into(), panel),
-            ("other".into(), other),
-        ]),
-        actions: vec![],
-        input_rules: vec![(
-            "settings.save".into(),
-            "dep".into(),
-            InputRule::EnabledWhen {
-                input: "gate".into(),
-                checked: true,
-                reason: "gate off".into(),
-            },
-        )],
-        fragments: HashMap::new(),
-    };
+    // `SyncPacket` is `#[non_exhaustive]` (#27): default() plus assignment.
+    let mut p = SyncPacket::default();
+    p.versions = HashMap::from([
+        ("actions".into(), 1),
+        ("panel".into(), panel),
+        ("other".into(), other),
+    ]);
+    p.input_rules = vec![(
+        "settings.save".into(),
+        "dep".into(),
+        InputRule::EnabledWhen {
+            input: "gate".into(),
+            checked: true,
+            reason: "gate off".into(),
+        },
+    )];
     p.fragments.insert("sec".into(), sec.into());
     p.fragments.insert("sec2".into(), sec2.into());
     p

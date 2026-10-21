@@ -155,21 +155,20 @@ pub fn number_char_allowed(existing: &str, ch: char, limits: &NumericLimits) -> 
         return limits.min.is_none_or(|m| m < 0.0);
     }
     if ch == '.' {
-        // One decimal point; allow when step is not an integer (or step has fraction).
+        // One decimal point; allow when step is not an integer (or step has
+        // fraction), or when step is "any" (issue #16: no grid constraint at
+        // all, so decimals are always allowed regardless of `step`'s shape).
         if existing.contains('.') {
             return false;
         }
+        if limits.unconstrained {
+            return true;
+        }
         let step = limits.step;
         let step_is_int = (step - step.round()).abs() < 1e-12;
-        return !step_is_int || attr_step_explicitly_fractional(limits);
+        return !step_is_int;
     }
     false
-}
-
-fn attr_step_explicitly_fractional(limits: &NumericLimits) -> bool {
-    // `limits.step` already parsed; integer step → no decimal point.
-    let step = limits.step;
-    (step - step.round()).abs() >= 1e-12
 }
 
 /// Filter a multi-char paste for a number field.
@@ -425,6 +424,7 @@ pub fn sync_value_from_editor(
                 min: None,
                 max: None,
                 step: 1.0,
+                unconstrained: false,
             });
         canonical_from_display(&display, &limits, clamp)
     } else {
@@ -644,6 +644,7 @@ mod tests {
             min: Some(0.0),
             max: Some(9.0),
             step: 1.0,
+            unconstrained: false,
         };
         assert!(!number_char_allowed("", 'a', &lim));
         assert!(number_char_allowed("", '5', &lim));
@@ -653,8 +654,23 @@ mod tests {
             min: Some(0.0),
             max: Some(9.0),
             step: 0.01,
+            unconstrained: false,
         };
         assert!(number_char_allowed("1", '.', &lim2));
+    }
+
+    /// Blocker 1 (PR27 round 2): `step="any"` (`unconstrained`) allows a
+    /// decimal point even though the fallback `step` (1.0) looks integer.
+    #[test]
+    fn number_allows_decimal_when_unconstrained() {
+        let lim = NumericLimits {
+            min: Some(0.0),
+            max: Some(10.0),
+            step: 1.0,
+            unconstrained: true,
+        };
+        assert!(number_char_allowed("4", '.', &lim));
+        assert!(number_char_allowed("4.", '3', &lim));
     }
 }
 
