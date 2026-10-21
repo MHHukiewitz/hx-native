@@ -1455,6 +1455,18 @@ impl Engine {
         editor_text(&mut live.doc, nid)
     }
 
+    /// Test harness (issue #68): the focused editor's selected text for
+    /// `#id` (`None` when nothing is selected).
+    #[doc(hidden)]
+    pub fn test_selected_text(&mut self, elem_id: &str) -> Option<String> {
+        let live = self
+            .surfaces
+            .get_mut(&SurfaceId::DEFAULT)
+            .and_then(|s| s.live.as_mut())?;
+        let nid = live.doc.get_element_by_id(elem_id)?;
+        selected_text(&mut live.doc, nid).filter(|t| !t.is_empty())
+    }
+
     /// Test helper: subscribed slice names the engine will ask `version` for.
     pub fn subscribed_slices(&self) -> HashSet<String> {
         let mut s = HashSet::new();
@@ -4740,6 +4752,15 @@ impl LiveSurface {
                     .is_some_and(|n| is_editable_input(n) && !is_disabled(n));
                 if editable {
                     let _ = self.focus_text_input(ctx, nid_str);
+                    // Issue #68 (Designer lock, HTML_CONTRACT §2): focus that
+                    // arrives by Tab / Shift+Tab selects the whole text, so
+                    // typing replaces the value (Win95 edit boxes, Chrome).
+                    // Click focus places the caret; host / swap focus keeps
+                    // the caret at the end with no selection. The field's
+                    // damage is already queued by `focus_text_input`.
+                    if let Some(nid) = self.doc.get_element_by_id(nid_str) {
+                        select_all(&mut self.doc, nid);
+                    }
                 } else if let Some(nid) = self.doc.get_element_by_id(nid_str) {
                     self.doc.set_focus_to(nid);
                     self.focus.focused_id = Some(nid_str.clone());
