@@ -510,8 +510,16 @@ pub(crate) fn range_snap(raw: f64, limits: &NumericLimits) -> f64 {
     // grid; like HTML, take the last on-grid value at or below max (9).
     if v >= max && limits.step > 0.0 {
         let base = limits.min.unwrap_or(0.0);
-        let k = ((max - base) / limits.step + 1e-9).floor();
-        return round_decimal(base + k * limits.step, places).clamp(min, max);
+        // Same slack as `step_precise`: `(1234567.89 - 1000000) / 0.01` comes
+        // out just under 23456789, and a 1e-9 slack floored it one step short
+        // of an on-grid max. A max just below a grid value can round up past
+        // it, so step back once.
+        let k = ((max - base) / limits.step + 1e-7).floor();
+        let mut top = round_decimal(base + k * limits.step, places);
+        if top > max {
+            top = round_decimal(top - limits.step, places);
+        }
+        return top.clamp(min, max);
     }
     v
 }
@@ -793,6 +801,7 @@ pub(crate) fn format_numeric(v: f64) -> String {
 mod tests {
     use super::clamp_snap;
     use super::format_numeric;
+    use super::range_snap;
     use super::NumericLimits;
     use super::MAX_SAFE_NUMBER;
 
@@ -878,6 +887,26 @@ mod tests {
 
     /// Graph review of #49 r2: the `-0` guard and the off-grid max guard,
     /// seen on the `f64` itself (the engine's formatter hides `-0`).
+    #[test]
+    fn range_snap_reaches_an_on_grid_max_and_never_passes_an_off_grid_one() {
+        let lim = |min: f64, max: f64, step: f64| NumericLimits {
+            min: Some(min),
+            max: Some(max),
+            step,
+            unconstrained: false,
+        };
+        // On-grid max on a large fractional range (float_noise_48 drag).
+        let big = lim(1_000_000.0, 1_234_567.89, 0.01);
+        assert_eq!(format_numeric(range_snap(2_000_000.0, &big)), "1234567.89");
+        assert_eq!(format_numeric(range_snap(1_234_567.89, &big)), "1234567.89");
+        // Off-grid max: the last grid value at or below it.
+        assert_eq!(format_numeric(range_snap(10.0, &lim(0.0, 10.0, 3.0))), "9");
+        assert_eq!(
+            format_numeric(range_snap(5.0, &lim(0.0, 4.99999999, 1.0))),
+            "4"
+        );
+    }
+
     #[test]
     fn step_precise_never_returns_negative_zero_or_passes_max() {
         let lim = NumericLimits {
