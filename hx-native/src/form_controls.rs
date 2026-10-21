@@ -34,7 +34,9 @@ pub fn is_disabled(node: &Node) -> bool {
 /// child (e.g. `<i>`) finds the associated control even when the input itself
 /// is `pointer-events:none` / zero-size (`.vh` in mock 27).
 pub fn form_control_at_point(doc: &HtmlDocument, x: f32, y: f32) -> Option<FormControlRef> {
-    let hit = doc.element_from_point(x, y)?;
+    // Issue #26: content scrolled out of a container's padding box is not
+    // hittable (Blitz's own hit test still finds it when nothing else is there).
+    let hit = crate::scroll::visible_element_from_point(doc, x, y)?;
     form_control_from_node(doc, hit)
 }
 
