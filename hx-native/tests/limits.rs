@@ -617,7 +617,7 @@ fn slice_limits_overwrite_markup() {
 fn clamp_on_limit_change_emits_no_action_and_regroups_display() {
     let html = r#"
 <form id="f">
-  <input id="fee" type="number" name="fee" value="180000" />
+  <input id="fee" type="number" name="fee" value="180000" data-hx-group="on" />
   <button id="save" hx-post="settings.apply" hx-trigger="click">Save</button>
 </form>
 "#;
@@ -1263,5 +1263,120 @@ fn removed_limits_restore_markup_or_clear_when_absent() {
         eng2.attr("vol", "step"),
         None,
         "no markup to restore to: step must be cleared"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Clamp, don't snap: re-applying limits to a number input keeps an
+// off-grid typed value and only clamps to [min, max] (Designer lock).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn limits_reapply_clamps_number_without_snapping_to_step() {
+    let html = r#"
+<form id="f">
+  <input id="fee" type="number" name="fee" value="151234" data-hx-group="off" />
+  <button id="save" hx-post="settings.apply" hx-trigger="click">Save</button>
+</form>
+"#;
+    let mut eng = boot(html, &["settings.apply"]);
+    let slices = one_limit(
+        "settings.apply",
+        "fee",
+        InputLimits::new(0.0, 1_000_000.0, Some(1000.0)),
+    );
+    let mut frags = Frags::default();
+    eng.sync(&slices, &mut frags).unwrap();
+    assert_eq!(
+        eng.attr("fee", "value").as_deref(),
+        Some("151234"),
+        "number value inside [min, max] must not snap to the step grid"
+    );
+
+    let slices2 = LimitsSlices {
+        versions: HashMap::from([("actions".into(), 2)]),
+        actions: Vec::new(),
+        limits: limits_for(vec![(
+            "settings.apply",
+            "fee",
+            InputLimits::new(0.0, 100_500.0, Some(1000.0)),
+        )]),
+        limits_calls: Arc::new(Mutex::new(0)),
+    };
+    eng.sync(&slices2, &mut frags).unwrap();
+    assert_eq!(
+        eng.attr("fee", "value").as_deref(),
+        Some("100500"),
+        "out-of-range number value clamps to max, still without snapping"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Designer call (#41 round 2): a limits refresh never rewrites the focused
+// box; the new min/max apply on its commit. A box without focus clamps now.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn limits_refresh_leaves_focused_box_alone_until_commit() {
+    let html = r#"
+<form id="f">
+  <input id="fee" type="number" name="fee" value="150000" data-hx-group="off" />
+  <input id="cap" type="number" name="cap" value="950000" data-hx-group="off" />
+  <button id="save" hx-post="settings.apply" hx-trigger="click">Save</button>
+</form>
+"#;
+    let mut eng = boot(html, &["settings.apply"]);
+    let wide = |ver: u64, max: f64| LimitsSlices {
+        versions: HashMap::from([("actions".into(), ver)]),
+        actions: Vec::new(),
+        limits: limits_for(vec![
+            (
+                "settings.apply",
+                "fee",
+                InputLimits::new(0.0, max, Some(1000.0)),
+            ),
+            (
+                "settings.apply",
+                "cap",
+                InputLimits::new(0.0, max, Some(1000.0)),
+            ),
+        ]),
+        limits_calls: Arc::new(Mutex::new(0)),
+    };
+    let mut frags = Frags::default();
+    eng.sync(&wide(1, 1_000_000.0), &mut frags).unwrap();
+
+    eng.test_set_focus("fee");
+    let _ = eng.input(InputEvent::Key(KeyEvent {
+        key: "a".into(),
+        code: "KeyA".into(),
+        mods: Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        },
+        repeat: false,
+        pressed: true,
+    }));
+    let _ = eng.input(InputEvent::Text("950000".into()));
+
+    eng.sync(&wide(2, 900_000.0), &mut frags).unwrap();
+    assert_eq!(
+        eng.test_editor_display("fee").as_deref(),
+        Some("950000"),
+        "the focused box text is not rewritten mid-edit"
+    );
+    assert_eq!(eng.attr("fee", "value").as_deref(), Some("950000"));
+    assert_eq!(eng.attr("fee", "max").as_deref(), Some("900000"));
+    assert_eq!(
+        eng.attr("cap", "value").as_deref(),
+        Some("900000"),
+        "a box without focus clamps right away"
+    );
+
+    let _ = key(&mut eng, "Enter");
+    assert_eq!(
+        eng.attr("fee", "value").as_deref(),
+        Some("900000"),
+        "the new max applies on commit"
     );
 }

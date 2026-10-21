@@ -11,8 +11,8 @@ use blitz_html::HtmlDocument;
 
 use crate::damage::{snap_outward, IntRect};
 use crate::form_args::{
-    clamp_snap_value, format_numeric, is_number_input, is_text_input, numeric_limits, parse_f64,
-    write_value_attr, NumericLimits,
+    clamp_value, format_numeric, is_number_input, is_text_input, numeric_limits, parse_f64,
+    whole_number_step, write_value_attr, NumericLimits,
 };
 
 /// Default caret blink half-period (on or off).
@@ -73,11 +73,41 @@ pub struct TextEditSession {
 }
 
 /// True when grouping separators should be shown for an unfocused number input.
+///
+/// Grouping is **opt-in** (issue #40): only `data-hx-group="on"` groups.
+/// Without it (or with any other value) the box shows the raw number.
 pub fn grouping_enabled(node: &blitz_dom::node::Node) -> bool {
     if !is_number_input(node) {
         return false;
     }
-    attr(node, "data-hx-group").as_deref() != Some("off")
+    attr(node, "data-hx-group").as_deref() == Some("on")
+}
+
+/// Show grouped text in every unfocused opt-in number input whose editor
+/// does not already show it. Returns the inputs that changed.
+pub fn apply_group_display_all(doc: &mut HtmlDocument, focused: Option<NodeId>) -> Vec<NodeId> {
+    let root = doc.root_node().id;
+    let mut changed = Vec::new();
+    for (nid, _) in number_inputs_under(doc, root) {
+        if Some(nid) == focused {
+            continue;
+        }
+        let Some(node) = doc.get_node(nid) else {
+            continue;
+        };
+        if !grouping_enabled(node) {
+            continue;
+        }
+        let want = format_grouped(&attr(node, "value").unwrap_or_default());
+        match editor_text(doc, nid) {
+            Some(shown) if shown != want => {
+                set_editor_text(doc, nid, &want);
+                changed.push(nid);
+            }
+            _ => {}
+        }
+    }
+    changed
 }
 
 /// Format a canonical number string with `,` thousands separators in the integer part.
@@ -87,7 +117,14 @@ pub fn format_grouped(canonical: &str) -> String {
         Some((i, f)) => (i, Some(f)),
         None => (rest, None),
     };
-    let digits: String = int_part.chars().filter(|c| c.is_ascii_digit()).collect();
+    // Only a plain decimal is grouped. Anything else (`1e5`, `abc`) is shown
+    // as written rather than having its non-digits dropped (`1e5` -> `15`).
+    if !int_part.chars().all(|c| c.is_ascii_digit())
+        || frac.is_some_and(|f| !f.chars().all(|c| c.is_ascii_digit()))
+    {
+        return canonical.to_string();
+    }
+    let digits: String = int_part.to_string();
     if digits.is_empty() {
         return canonical.to_string();
     }
@@ -119,13 +156,24 @@ pub fn parse_number_display(text: &str) -> Option<f64> {
 pub fn canonical_from_display(text: &str, limits: &NumericLimits, clamp: bool) -> String {
     let stripped: String = text.chars().filter(|c| *c != ',').collect();
     let t = stripped.trim();
-    if t.is_empty() || t == "-" || t == "+" {
+    // A bare point or sign is no number: commit keeps the old value instead
+    // of storing "." (reachable in whole-number boxes since round 2).
+    if t.is_empty() || t == "-" || t == "+" || t == "." || t == "-." || t == "+." {
         return String::new();
     }
     match parse_f64(t) {
         Some(v) => {
+            // Typed commit clamps to [min, max] only; it never snaps to the
+            // step grid (Designer lock, issue #39). Arrows/spin still step.
+            // A whole-number box (integer step) rounds half away from zero
+            // first (Designer call, #41 round 2): 3.7 commits 4.
             let v = if clamp {
-                clamp_snap_value(v, limits)
+                let v = if whole_number_step(limits) {
+                    v.round()
+                } else {
+                    v
+                };
+                clamp_value(v, limits)
             } else {
                 v
             };
@@ -155,18 +203,10 @@ pub fn number_char_allowed(existing: &str, ch: char, limits: &NumericLimits) -> 
         return limits.min.is_none_or(|m| m < 0.0);
     }
     if ch == '.' {
-        // One decimal point; allow when step is not an integer (or step has
-        // fraction), or when step is "any" (issue #16: no grid constraint at
-        // all, so decimals are always allowed regardless of `step`'s shape).
-        if existing.contains('.') {
-            return false;
-        }
-        if limits.unconstrained {
-            return true;
-        }
-        let step = limits.step;
-        let step_is_int = (step - step.round()).abs() < 1e-12;
-        return !step_is_int;
+        // One decimal point, whatever the step (Designer call, #41 round 2):
+        // a whole-number box accepts '.' while typing and rounds on commit,
+        // so typing 3.7 commits 4, never 37.
+        return !existing.contains('.');
     }
     false
 }
@@ -231,6 +271,93 @@ pub fn editor_text(doc: &mut HtmlDocument, nid: NodeId) -> Option<String> {
         out = Some(driver.editor.text().to_string());
     });
     out
+}
+
+/// The editor text as it will be once the current selection is replaced:
+/// the buffer with the selected range removed (the whole buffer when nothing
+/// is selected). Number filters must look at this, not the old buffer, so
+/// a paste that replaces a selection containing `.` (or a sign) is judged
+/// against what actually survives (issue #38).
+pub fn text_outside_selection(doc: &mut HtmlDocument, nid: NodeId) -> Option<String> {
+    let mut out = None;
+    doc.with_text_input(nid, |driver| {
+        let text = driver.editor.text().to_string();
+        let range = driver.editor.raw_selection().text_range();
+        let kept = match (text.get(..range.start), text.get(range.end..)) {
+            (Some(head), Some(tail)) if range.start <= range.end => format!("{head}{tail}"),
+            _ => text,
+        };
+        out = Some(kept);
+    });
+    out
+}
+
+/// The editor text before and after the current selection (the caret when
+/// nothing is selected).
+pub fn selection_split(doc: &mut HtmlDocument, nid: NodeId) -> Option<(String, String)> {
+    let mut out = None;
+    doc.with_text_input(nid, |driver| {
+        let text = driver.editor.text().to_string();
+        let range = driver.editor.raw_selection().text_range();
+        out = match (text.get(..range.start), text.get(range.end..)) {
+            (Some(head), Some(tail)) if range.start <= range.end => {
+                Some((head.to_string(), tail.to_string()))
+            }
+            _ => Some((text, String::new())),
+        };
+    });
+    out
+}
+
+/// Characters a number input's `data-hx-paste-ignore` asks to strip from
+/// pasted text (empty when the attribute is absent).
+pub fn paste_ignore_chars(node: &blitz_dom::node::Node) -> String {
+    attr(node, crate::dialect::ATTR_HX_PASTE_IGNORE).unwrap_or_default()
+}
+
+/// A pasted number as it would be inserted: characters listed in
+/// `data-hx-paste-ignore` removed (nothing else is cleaned up, no trimming),
+/// then grouping commas dropped exactly as typed `,` is (accepted, never
+/// stored while focused). `None` when a comma is not thousands grouping
+/// ("3,5", "1,2,3", "12,34"): dropping it would commit a different number
+/// (35, 123, 1234), so the paste is refused (Graph review of #41 round 2).
+pub fn clean_number_paste(paste: &str, ignore: &str) -> Option<String> {
+    // ',' is judged as grouping even when listed: listing it means "allow
+    // grouping commas", not "glue any digits together".
+    let kept: String = paste
+        .chars()
+        .filter(|c| *c == ',' || !ignore.contains(*c))
+        .collect();
+    if !commas_are_grouping(&kept) {
+        return None;
+    }
+    Some(kept.chars().filter(|c| *c != ',').collect())
+}
+
+/// Commas only between thousands groups of the whole part: "1,234",
+/// "-151,234.5". No comma at all is fine.
+fn commas_are_grouping(s: &str) -> bool {
+    if !s.contains(',') {
+        return true;
+    }
+    let body = s.strip_prefix(['-', '+']).unwrap_or(s);
+    let (whole, frac) = body.split_once('.').unwrap_or((body, ""));
+    if frac.contains(',') {
+        return false;
+    }
+    let mut groups = whole.split(',');
+    let first = groups.next().unwrap_or("");
+    (1..=3).contains(&first.len())
+        && first.chars().all(|c| c.is_ascii_digit())
+        && groups.all(|g| g.len() == 3 && g.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Whether `text` (commas ignored) is a number the typing rules could have
+/// produced: an optional leading sign, digits, and one `.` only when `step`
+/// allows decimals.
+pub fn number_text_valid(text: &str, limits: &NumericLimits) -> bool {
+    let bare: String = text.chars().filter(|c| *c != ',').collect();
+    filter_number_insert("", &bare, limits) == bare
 }
 
 /// Replace the PlainEditor buffer (does not write the value attribute).
@@ -649,7 +776,10 @@ mod tests {
         assert!(!number_char_allowed("", 'a', &lim));
         assert!(number_char_allowed("", '5', &lim));
         assert!(number_char_allowed("1", ',', &lim));
-        assert!(!number_char_allowed("1", '.', &lim)); // integer step
+        // Whole-number box accepts one "." while typing and rounds on commit
+        // (Designer call, #41 round 2).
+        assert!(number_char_allowed("1", '.', &lim));
+        assert!(!number_char_allowed("1.", '.', &lim));
         let lim2 = NumericLimits {
             min: Some(0.0),
             max: Some(9.0),
