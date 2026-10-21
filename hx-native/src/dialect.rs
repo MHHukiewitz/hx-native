@@ -14,7 +14,8 @@ pub const ATTR_HX_STEP: &str = "data-hx-step";
 /// Locked optional target id for a spin-box step control (bare id, no `#`).
 pub const ATTR_HX_STEP_FOR: &str = "data-hx-step-for";
 
-/// Engine-side opt-out for thousands grouping on `<input type=number>` (issue #17).
+/// Engine-side opt-in for thousands grouping on `<input type=number>` (issue #17;
+/// opt-in since issue #40: `data-hx-group="on"`, raw display otherwise).
 pub const ATTR_HX_GROUP: &str = "data-hx-group";
 
 /// Opt-in paste cleanup on `<input type=number>` (Designer call, #41 round 2):
