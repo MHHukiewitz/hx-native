@@ -72,11 +72,18 @@ Load-bearing facts to re-check at every Blitz bump:
   Re-check `usvg::parser::from_str`, `svgtree::parse_tag_name` (namespace
   `None | SVG`) and `svg_source` at every bump.
 - anyrender_svg has no raster decode cache: every paint of an SVG with an
-  `<image>` decodes it again (4096² costs about 247 ms per paint in release).
-  Re-measure with a bump; a cache upstream would remove the cost.
+  `<image>` decodes it again (4096² cost about 247 ms per paint in release,
+  hence the caps below; 256² costs 0.4 ms, four 256² 1.0 ms). Re-measure with
+  a bump; a cache upstream would remove the cost.
 - anyrender_svg draws a red box over an image it cannot decode and decodes on
   every paint; `probe_decode` (a throwaway `<img>` document using blitz-dom's
   `ImageHandler`) must keep matching its decoder (same `image` crate build).
 - The header parsers in `src/svg.rs` (PNG IHDR, GIF screen + frames, WebP
-  VP8/VP8L/VP8X, JPEG SOF) enforce `DATA_IMAGE_MAX_PIXELS` before any decode.
+  VP8/VP8L/VP8X, JPEG SOF) enforce `DATA_IMAGE_MAX_PIXELS` (256²),
+  `DATA_IMAGE_MAX_SIDE` (4096) and, summed per load or swap,
+  `DATA_IMAGE_MAX_TOTAL_PIXELS` (512²) before any decode. This header check is
+  the limit: the decoders run inside blitz-dom and anyrender_svg under
+  `image`'s default limits, and hx-native takes no direct `image` dependency
+  to set `image::Limits`. anyrender_vello_cpu 0.18.0 `image_convert.rs`
+  panics on a side above 65535 at every paint; re-check it at every bump.
 - SVG children have no layout; `damage::snapshot_bounds` skips them.

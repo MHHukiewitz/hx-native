@@ -1,6 +1,7 @@
 //! Issue #23, round 2 (Mike, 2026-10-21): SVG `<image>` is allowed with a
 //! `data:` href of PNG, JPEG, GIF or WebP, inside the 64 KiB per-URL cap and
-//! the 4096x4096 pixel cap; everything else rejects the whole load or swap
+//! the pixel caps (256x256 per image since round 4, see
+//! `svg_image_budget.rs`); everything else rejects the whole load or swap
 //! with `EngineError::InvalidSvg`, and nothing is ever fetched. A corrupt
 //! image is rejected (decision: reject, never paint the rest), because
 //! anyrender_svg would otherwise draw a half-transparent red box over it.

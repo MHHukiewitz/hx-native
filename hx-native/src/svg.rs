@@ -19,7 +19,9 @@
 //! one of [`SVG_IMAGE_MIME_TYPES`]. Each image is checked here before usvg or
 //! Blitz ever decodes it: decoded size at most [`DATA_SVG_MAX_BYTES`], magic
 //! bytes matching the declared type, header dimensions read by hand and at
-//! most [`DATA_IMAGE_MAX_PIXELS`] (every frame of a GIF), and then one trial
+//! most [`DATA_IMAGE_MAX_PIXELS`] with no side over [`DATA_IMAGE_MAX_SIDE`]
+//! (every frame of a GIF), at most [`DATA_IMAGE_MAX_TOTAL_PIXELS`] summed over
+//! every `<image>` reference in one load or swap, and then one trial
 //! decode with Blitz's own decoder ([`probe_decode`]). Any failure rejects
 //! the whole load or swap with [`SvgRejection`]; nothing is ever fetched.
 //!
@@ -80,10 +82,28 @@ pub const SVG_MAX_DEPTH: usize = 64;
 pub const SVG_IMAGE_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
 
 /// Largest decoded image an SVG `<image>` may declare: width x height at
-/// most 4096 x 4096 (16 Mi pixels, 64 MiB RGBA), checked from the file
-/// header before any decode. For GIF the logical screen and every frame are
-/// checked. Raise only with a measured case.
-pub const DATA_IMAGE_MAX_PIXELS: u64 = 4096 * 4096;
+/// most 256 x 256 (64 Ki pixels, 256 KiB RGBA), checked from the file header
+/// before any decode. For GIF the logical screen and every frame are
+/// checked. anyrender_svg decodes the raster again on every paint, so this
+/// bounds each repaint (Graph's #52 HOLD; at 4096 x 4096 one repaint cost
+/// 104-247 ms and 130-163 MB in release, at 256 x 256 it costs 0.4 ms and
+/// about 1 MB). Raise only with a measured case.
+///
+/// This header check is the limit: `image::Limits` cannot be set from
+/// hx-native (the decoders run inside blitz-dom and anyrender_svg under
+/// `image`'s defaults), and hx-native takes no direct `image` dependency.
+pub const DATA_IMAGE_MAX_PIXELS: u64 = 256 * 256;
+
+/// Longest side an SVG `<image>` may declare, whatever its area:
+/// anyrender_vello_cpu panics on every paint for a side above 65535, and a
+/// 1 x 65536 PNG would pass the area cap alone (Graph's #52 HOLD).
+pub const DATA_IMAGE_MAX_SIDE: u64 = 4096;
+
+/// Decoded `<image>` pixels allowed in one load or swap, summed over every
+/// `<image>` reference in the markup (an inline `<image>`, or one inside a
+/// `data:` SVG, each time it appears), so many copies cannot add up:
+/// 512 x 512 (four images at the per-image cap).
+pub const DATA_IMAGE_MAX_TOTAL_PIXELS: u64 = 512 * 512;
 
 /// Why an SVG was rejected. Carried by
 /// [`EngineError::InvalidSvg`](crate::EngineError::InvalidSvg).
@@ -109,8 +129,12 @@ pub enum SvgRejection {
     ImageHref { href: String },
     /// The image bytes are a different format from the declared MIME type.
     ImageTypeMismatch { declared: String, actual: String },
-    /// The image header declares more than [`DATA_IMAGE_MAX_PIXELS`].
+    /// The image header declares more than [`DATA_IMAGE_MAX_PIXELS`], or a
+    /// side longer than [`DATA_IMAGE_MAX_SIDE`] (`limit` is the area cap).
     ImageTooLarge { width: u64, height: u64, limit: u64 },
+    /// The `<image>`s of one load or swap add up to more than
+    /// [`DATA_IMAGE_MAX_TOTAL_PIXELS`] decoded pixels.
+    ImagePixelBudget { pixels: u64, limit: u64 },
     /// The image header is unreadable or the decoder refused the data.
     CorruptImage { mime: String, detail: String },
 }
@@ -155,6 +179,10 @@ impl std::fmt::Display for SvgRejection {
             } => write!(
                 f,
                 "SVG <image> is {width}x{height}, above the {limit}-pixel limit"
+            ),
+            SvgRejection::ImagePixelBudget { pixels, limit } => write!(
+                f,
+                "SVG <image>s in one load or swap total {pixels} pixels, above the {limit}-pixel limit"
             ),
             SvgRejection::CorruptImage { mime, detail } => {
                 write!(f, "corrupt {mime} in SVG <image>: {detail}")
@@ -257,9 +285,10 @@ pub(crate) fn check_svg_attribute(
     value: &str,
 ) -> Result<Option<RasterImage>, SvgRejection> {
     let local = attr.rsplit(':').next().unwrap_or(attr);
+    let lower = local.to_ascii_lowercase();
     if let Some(p) = FORBIDDEN_SVG_PROPERTIES
         .iter()
-        .find(|p| p.eq_ignore_ascii_case(local))
+        .find(|p| lower.contains(**p))
     {
         return Err(SvgRejection::ForbiddenProperty {
             property: p.to_string(),
@@ -412,6 +441,10 @@ pub(crate) fn check_xml_tree(
 pub(crate) struct RasterImage {
     pub(crate) mime: &'static str,
     pub(crate) data: Arc<Vec<u8>>,
+    /// Decoded pixels one paint of this image costs (the largest frame or
+    /// screen the header declares), counted toward
+    /// [`DATA_IMAGE_MAX_TOTAL_PIXELS`].
+    pub(crate) pixels: u64,
 }
 
 fn short(href: &str) -> String {
@@ -477,21 +510,24 @@ pub(crate) fn check_raster(mime: &str, data: Vec<u8>) -> Result<RasterImage, Svg
     let Some(dims) = dims else {
         return Err(corrupt("unreadable image header"));
     };
+    let mut pixels = 0;
     for (w, h) in dims {
         if w == 0 || h == 0 {
             return Err(corrupt("zero-sized image"));
         }
-        if w * h > DATA_IMAGE_MAX_PIXELS {
+        if w > DATA_IMAGE_MAX_SIDE || h > DATA_IMAGE_MAX_SIDE || w * h > DATA_IMAGE_MAX_PIXELS {
             return Err(SvgRejection::ImageTooLarge {
                 width: w,
                 height: h,
                 limit: DATA_IMAGE_MAX_PIXELS,
             });
         }
+        pixels = pixels.max(w * h);
     }
     Ok(RasterImage {
         mime: declared,
         data: Arc::new(data),
+        pixels,
     })
 }
 
@@ -630,7 +666,8 @@ fn jpeg_dimensions(d: &[u8]) -> Option<(u64, u64)> {
 /// only resource source is these bytes. A corrupt image is rejected here so
 /// it never reaches paint, where anyrender_svg would draw a half-transparent
 /// red box over it. Animated GIF and WebP: both decoders take the first
-/// frame only; memory is bounded by [`DATA_IMAGE_MAX_PIXELS`].
+/// frame only; memory is bounded by [`DATA_IMAGE_MAX_PIXELS`] per image and
+/// [`DATA_IMAGE_MAX_TOTAL_PIXELS`] per load or swap.
 pub(crate) fn probe_decode(images: &[RasterImage]) -> Result<(), SvgRejection> {
     if images.is_empty() {
         return Ok(());
@@ -1254,15 +1291,47 @@ mod tests {
 
     #[test]
     fn pixel_cap_boundary_and_svg_sniff() {
-        assert!(check_raster("image/png", png_header(4096, 4096)).is_ok());
-        assert!(check_raster("image/png", png_header(16_777_216, 1)).is_ok());
-        assert_eq!(
-            check_raster("image/png", png_header(4097, 4096)),
+        let too_large = |width, height| {
             Err(SvgRejection::ImageTooLarge {
-                width: 4097,
-                height: 4096,
-                limit: DATA_IMAGE_MAX_PIXELS
+                width,
+                height,
+                limit: DATA_IMAGE_MAX_PIXELS,
             })
+        };
+        // Area: 256x256 is the cap, one more column or row is over it.
+        let ok = check_raster("image/png", png_header(256, 256)).unwrap();
+        assert_eq!(ok.pixels, 256 * 256);
+        assert_eq!(
+            check_raster("image/png", png_header(257, 256)),
+            too_large(257, 256)
+        );
+        assert_eq!(
+            check_raster("image/png", png_header(256, 257)),
+            too_large(256, 257)
+        );
+        // Side (Graph #52 r2): within the area cap, a side over 4096 is
+        // refused; vello_cpu panics on every paint above 65535.
+        assert!(check_raster("image/png", png_header(4096, 16)).is_ok());
+        assert!(check_raster("image/png", png_header(16, 4096)).is_ok());
+        assert_eq!(
+            check_raster("image/png", png_header(4097, 1)),
+            too_large(4097, 1)
+        );
+        assert_eq!(
+            check_raster("image/png", png_header(1, 4097)),
+            too_large(1, 4097)
+        );
+        assert_eq!(
+            check_raster("image/png", png_header(1, 65_536)),
+            too_large(1, 65_536)
+        );
+        assert_eq!(
+            check_raster("image/png", png_header(1, 16_777_216)),
+            too_large(1, 16_777_216)
+        );
+        assert_eq!(
+            check_raster("image/png", png_header(70_000, 1)),
+            too_large(70_000, 1)
         );
         assert_eq!(
             check_raster("image/gif", b" <svg/>".to_vec()),

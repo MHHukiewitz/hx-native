@@ -48,7 +48,7 @@ use crate::select_ui::{
 use crate::svg::{
     check_svg_attribute, classify_url, css_forbidden_property, css_urls, forbidden_element,
     probe_decode, spawn_svg_warm_up, DataSvg, DataSvgProvider, RasterImage, SvgRejection,
-    SVG_MAX_DEPTH,
+    DATA_IMAGE_MAX_TOTAL_PIXELS, SVG_MAX_DEPTH,
 };
 use crate::text_edit::{
     apply_group_display_all, apply_unfocused_display, backspace, caret_device_rect, commit_field,
@@ -5402,6 +5402,22 @@ fn validate_loaded_tree(
                     });
                 }
             }
+        }
+    }
+    // #23 (Graph's #52 HOLD): anyrender_svg decodes every `<image>`
+    // reference on every paint, so the whole load or swap gets one budget,
+    // counting each reference (also repeated bytes).
+    let mut total: u64 = 0;
+    for (label, img) in &images {
+        total += img.pixels;
+        if total > DATA_IMAGE_MAX_TOTAL_PIXELS {
+            return Err(EngineError::InvalidSvg {
+                id: label.clone(),
+                rejection: SvgRejection::ImagePixelBudget {
+                    pixels: images.iter().map(|(_, i)| i.pixels).sum(),
+                    limit: DATA_IMAGE_MAX_TOTAL_PIXELS,
+                },
+            });
         }
     }
     let mut probed: Vec<&RasterImage> = Vec::new();
