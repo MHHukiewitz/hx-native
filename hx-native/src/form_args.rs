@@ -350,7 +350,17 @@ pub(crate) fn step_precise(current: f64, dir: i32, limits: &NumericLimits) -> f6
         k.floor()
     };
     let next = round_decimal(base + n * step, decimals).clamp(min, max);
-    clamp_safe_number(next)
+    no_negative_zero(clamp_safe_number(next))
+}
+
+/// `-0.0` (a tiny negative rounded to the grid, e.g. `-0.9 + 3 × 0.3`) is
+/// stored and sent as `0`, never `-0.0` (Graph review of #49).
+fn no_negative_zero(v: f64) -> f64 {
+    if v == 0.0 {
+        0.0
+    } else {
+        v
+    }
 }
 
 pub(crate) fn step_decimal_places(step: f64) -> usize {
@@ -362,6 +372,13 @@ pub(crate) fn step_decimal_places(step: f64) -> usize {
 
 /// Arrow / spin results keep the grid's precision ("2.20" with step 0.01).
 pub(crate) fn format_numeric_for_step(v: f64, limits: &NumericLimits) -> String {
+    // `step="any"` has no grid precision to keep: a decimal `min` must not
+    // cut the result to min's decimals (Graph review of #49: min="0.5"
+    // step="any" from 0.75 wrote "1.8", not "1.75").
+    if limits.unconstrained {
+        return format_numeric(v);
+    }
+    let v = no_negative_zero(v);
     let decimals = result_decimals(limits, 0.0);
     if decimals == 0 {
         return format_numeric(v);
