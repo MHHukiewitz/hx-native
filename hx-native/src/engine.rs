@@ -35,11 +35,11 @@ use crate::memory::estimate_surface_engine_bytes;
 use crate::paint::{paint_damage_into, paint_rgba};
 use crate::pending::{PendingEntry, PendingState, PendingTimeout, QueuedRelease};
 use crate::scroll::{
-    all_bars, author_padding_right_css, bar_geometry, bar_hit, can_scroll, container_damage_rect,
-    containers_at, gutter_css, is_scroll_container, max_offset_y, offset_y as scroll_offset_y,
-    padding_box_css as scroll_padding_box, page_px, paint_scrollbars, scroll_ancestors,
-    scroll_containers, set_offset_y, visible_element_from_point, wants_gutter, BarGeom, BarPart,
-    PressedArrow,
+    all_bars, author_padding_right_css, bar_geometry, bar_hit, bar_unoccluded, can_scroll,
+    container_damage_rect, containers_at, gutter_css, is_scroll_container, max_offset_y,
+    offset_y as scroll_offset_y, padding_box_css as scroll_padding_box, page_px, paint_scrollbars,
+    scroll_ancestors, scroll_containers, set_offset_y, visible_element_from_point, wants_gutter,
+    BarGeom, BarPart, PressedArrow,
 };
 use crate::select_ui::{
     collect_select_nids, control_rect_of, list_row_at, open_select_state, paint_select_overlays,
@@ -1579,16 +1579,19 @@ impl LiveSurface {
         self.doc.resolve(0.0);
         self.resolve_count = self.resolve_count.saturating_add(1);
         let mut passes = 1;
-        if self.reserve_new_gutters() {
+        // Gutters are sticky and only ever added, so this terminates; a
+        // gutter that makes a nested container overflow (narrower content)
+        // is reserved in the same frame. Bounded so a pathological tree
+        // costs at most GUTTER_MAX_PASSES extra layouts per frame.
+        const GUTTER_MAX_PASSES: u64 = 3;
+        while passes <= GUTTER_MAX_PASSES && self.reserve_new_gutters() {
             self.doc.resolve(0.0);
             self.resolve_count = self.resolve_count.saturating_add(1);
             passes += 1;
-            // A gutter can make another container overflow (narrower
-            // content): never loop here; the next resolve picks it up.
-            if self.containers_needing_gutter().next().is_some() {
-                self.gutter_followup = true;
-                self.paint_dirty = true;
-            }
+        }
+        if self.containers_needing_gutter().next().is_some() {
+            self.gutter_followup = true;
+            self.paint_dirty = true;
         }
         self.settle_scroll_offsets();
         passes
@@ -1654,7 +1657,7 @@ impl LiveSurface {
         let css = gutter_css(self.gutters.iter());
         let sheet = self
             .doc
-            .make_stylesheet(css, style::stylesheets::Origin::Author);
+            .make_stylesheet(css, style::stylesheets::Origin::UserAgent);
         self.doc.add_stylesheet_for_node(sheet, node);
     }
 
@@ -3052,7 +3055,12 @@ impl LiveSurface {
             .focused_id
             .as_deref()
             .and_then(|id| self.doc.get_element_by_id(id))?;
-        for nid in scroll_ancestors(&self.doc, focused) {
+        // The focused element may itself be the container (tabindex).
+        let mut chain = scroll_ancestors(&self.doc, focused);
+        if is_scroll_container(&self.doc, focused) {
+            chain.insert(0, focused);
+        }
+        for nid in chain {
             let off = scroll_offset_y(&self.doc, nid);
             let max = max_offset_y(&self.doc, nid);
             let target = match key.key.as_str() {
@@ -3217,7 +3225,9 @@ impl LiveSurface {
 
         // Issue #26: engine-drawn scrollbar (arrows, track, thumb).
         if button == PointerButton::Primary {
-            if let Some((geom, part)) = bar_hit(&self.doc, x, y) {
+            if let Some((geom, part)) =
+                bar_hit(&self.doc, x, y).filter(|(g, _)| bar_unoccluded(&self.doc, g.nid, x, y))
+            {
                 if self.open_select.is_some() {
                     self.close_select();
                 }

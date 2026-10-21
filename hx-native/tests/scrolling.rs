@@ -1063,3 +1063,197 @@ fn first_overflow_costs_at_most_one_extra_layout_pass() {
     assert!(out.skipped);
     assert_eq!(eng.style_layout_pass_count(), p2);
 }
+
+// ---------------------------------------------------------------------------
+// Round 4 (Graph review of 451f4eb): conditions 1-3 and follow-ups 4-5.
+// Cases adapted from Graph's probes (`zz_graph_probes.rs`).
+
+fn act(out: &InputOutcome) -> Option<&str> {
+    match out {
+        InputOutcome::Action { name, .. } => Some(name.as_str()),
+        _ => None,
+    }
+}
+
+fn click(eng: &mut Engine, x: f32, y: f32) -> InputOutcome {
+    let _ = eng.input(mv(x, y));
+    let _ = eng.input(down(x, y));
+    eng.input(up(x, y))
+}
+
+fn gpage(style: &str, body: &str) -> String {
+    format!(
+        r##"<!DOCTYPE html><html><head><style>
+* {{ margin:0; padding:0; box-sizing:border-box; }}
+body {{ width:400px; height:300px; overflow:hidden; background:#fff; font-family:"DejaVu Sans",sans-serif; font-size:12px; }}
+.sc {{ position:absolute; left:10px; top:10px; width:200px; height:100px; overflow-y:auto; background:#eee; }}
+.r {{ display:block; width:100%; height:20px; border:0; background:#ccd; text-align:left; font-size:12px; }}
+{style}
+</style></head><body>{body}</body></html>"##
+    )
+}
+
+fn content_w(eng: &Engine, id: &str) -> f32 {
+    eng.test_content_box(id).expect(id).2
+}
+
+/// Condition 1: the gutter rule sits in the user-agent origin as
+/// `!important`, which beats author `!important` (important origins
+/// reverse) as well as every normal author rule, inline included.
+#[test]
+fn gutter_rule_beats_author_normal_and_important_padding() {
+    let cases = [
+        (
+            "author #id normal",
+            "#box{padding-right:4px}",
+            r#"<div id="box" class="sc">ROWS</div>"#,
+        ),
+        (
+            "inline normal",
+            "",
+            r#"<div id="box" class="sc" style="padding-right:4px">ROWS</div>"#,
+        ),
+        (
+            "author #id !important",
+            "#box{padding-right:4px !important}",
+            r#"<div id="box" class="sc">ROWS</div>"#,
+        ),
+        (
+            "author .class !important",
+            ".sc{padding-right:4px !important}",
+            r#"<div id="box" class="sc">ROWS</div>"#,
+        ),
+        (
+            "inline !important",
+            "",
+            r#"<div id="box" class="sc" style="padding-right:4px !important">ROWS</div>"#,
+        ),
+    ];
+    for (name, css, body) in cases {
+        let html = gpage(css, &body.replace("ROWS", &rows("b", 20)));
+        let mut eng = boot_with(&html, small_vp());
+        let _ = frame(&mut eng, small_vp());
+        assert_eq!(
+            content_w(&eng, "box"),
+            200.0 - 4.0 - 16.0,
+            "{name}: author 4 px kept and 16 px gutter added"
+        );
+        let row = bx(&eng, "b0");
+        let bar = eng.test_scrollbar("box").expect("bar").2;
+        assert!(row.0 + row.2 <= bar.0, "{name}: bar never covers content");
+    }
+}
+
+/// Condition 2: a gutter needed only because another container's gutter
+/// narrowed it is reserved in the same frame (bounded loop), not left with
+/// a bar over its content until some unrelated change.
+#[test]
+fn second_order_gutter_is_reserved_in_the_same_frame() {
+    let boxes: String = (0..20)
+        .map(|_| r#"<div style="width:50px;height:20px;background:#88f"></div>"#)
+        .collect();
+    let html = gpage(
+        "#outer{height:150px} #inner{height:100px;overflow-y:auto;display:flex;flex-wrap:wrap;align-content:flex-start;background:#ddd}",
+        &format!(
+            r#"<div id="outer" class="sc"><div id="inner">{boxes}</div><div style="height:300px">tail</div></div>"#
+        ),
+    );
+    let mut eng = Engine::new(cfg());
+    eng.declare_actions(ACTIONS);
+    eng.load_html(&html).unwrap();
+    let p0 = eng.style_layout_pass_count();
+    let out = eng.paint(small_vp()).unwrap();
+    assert!(!out.skipped);
+    assert_eq!(content_w(&eng, "outer"), 184.0, "outer gutter");
+    assert_eq!(
+        content_w(&eng, "inner"),
+        168.0,
+        "inner gutter in the same frame"
+    );
+    let passes = eng.style_layout_pass_count() - p0;
+    assert!(
+        passes <= 4,
+        "bounded: 1 + at most 3 gutter passes, got {passes}"
+    );
+    // Settled: no follow-up frame, and partial == full.
+    let p1 = eng.style_layout_pass_count();
+    assert!(eng.paint(small_vp()).unwrap().skipped);
+    assert_eq!(eng.style_layout_pass_count(), p1);
+    let part = eng.last_frame().unwrap().clone();
+    let full = full_frame(&mut eng, small_vp());
+    assert_eq!(part.pixels, full.pixels);
+}
+
+/// Condition 3: PageUp / PageDown / Home / End when the focused element is
+/// the scroll container itself (`tabindex` panel).
+#[test]
+fn page_keys_scroll_a_focused_container_itself() {
+    let inner: String = (0..30)
+        .map(|i| format!(r#"<div class="r">Row {i}</div>"#))
+        .collect();
+    let html = gpage(
+        "",
+        &format!(r#"<div id="box" class="sc" tabindex="0">{inner}</div>"#),
+    );
+    let mut eng = boot_with(&html, small_vp());
+    eng.test_set_focus("box");
+    assert_eq!(eng.input(key("PageDown")), scrolled("box"));
+    assert_eq!(top(&eng, "box"), 80.0, "one page = 100 - 20");
+    assert_eq!(eng.input(key("End")), scrolled("box"));
+    assert_eq!(top(&eng, "box"), max(&eng, "box"));
+    assert_eq!(eng.input(key("PageUp")), scrolled("box"));
+    assert_eq!(eng.input(key("Home")), scrolled("box"));
+    assert_eq!(top(&eng, "box"), 0.0);
+}
+
+/// Follow-up 4: rows scrolled away above a list must not take the click or
+/// hover of an element placed before the list (a column header).
+#[test]
+fn scrolled_away_rows_do_not_steal_clicks_or_hover_from_a_header_above() {
+    let html = gpage(
+        "#box{top:40px;height:120px;width:180px}",
+        &format!(
+            r#"<button id="above" hx-post="act.do" hx-trigger="click" style="position:absolute;left:10px;top:0;width:180px;height:30px">Above</button><div id="box" class="sc">{}</div>"#,
+            rows("b", 30)
+        ),
+    );
+    let mut eng = boot_with(&html, small_vp());
+    let _ = eng.input(wheel(100.0, 100.0, -200.0, WheelUnit::Pixel));
+    let _ = frame(&mut eng, small_vp());
+    assert!(top(&eng, "box") >= 200.0);
+    assert_eq!(
+        eng.input(mv(100.0, 15.0)),
+        InputOutcome::Hover {
+            id: Some("above".into())
+        }
+    );
+    let out = click(&mut eng, 100.0, 15.0);
+    assert_eq!(act(&out), Some("act.do"), "{out:?}");
+}
+
+/// Follow-up 5 (hits): a dialog drawn above a container's bar takes the
+/// click, not the bar.
+#[test]
+fn dialog_over_a_scrollbar_takes_the_click() {
+    let html = gpage(
+        "#box{height:120px;width:180px}",
+        &format!(
+            r#"<div id="box" class="sc">{}</div><div id="dlg" style="position:absolute;left:150px;top:20px;width:100px;height:60px;background:#f00"><button id="ok" hx-post="act.do" hx-trigger="click" style="display:block;width:100%;height:100%;border:0;background:#f00">OK</button></div>"#,
+            rows("b", 30)
+        ),
+    );
+    let mut eng = boot_with(&html, small_vp());
+    let bar = eng.test_scrollbar("box").expect("bar").2;
+    let (x, y) = (bar.0 + 8.0, 75.0);
+    let out = click(&mut eng, x, y);
+    assert_eq!(act(&out), Some("act.do"), "{out:?}");
+    assert_eq!(
+        top(&eng, "box"),
+        0.0,
+        "the bar under the dialog did not page"
+    );
+    // Outside the dialog the bar still works (the press pages).
+    assert_eq!(eng.input(down(x, 100.0)), scrolled("box"));
+    let _ = eng.input(up(x, 100.0));
+    assert!(top(&eng, "box") > 0.0);
+}

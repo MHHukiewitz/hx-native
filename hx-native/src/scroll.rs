@@ -226,16 +226,46 @@ pub(crate) fn intersect(a: ControlRect, b: ControlRect) -> ControlRect {
 /// instead, so an invisible row never takes a click.
 pub(crate) fn visible_element_from_point(doc: &HtmlDocument, x: f32, y: f32) -> Option<NodeId> {
     let hit = doc.element_from_point(x, y)?;
-    let mut result = hit;
-    // Innermost first; the outermost container the point is outside of wins.
-    for a in scroll_ancestors(doc, hit) {
-        if padding_box_css(doc, a).is_some_and(|pb| !pb.contains(x, y)) {
-            if let Some(p) = doc.get_node(a).and_then(|n| n.parent) {
-                result = p;
-            }
+    if !clipped_at(doc, hit, x, y) {
+        return Some(hit);
+    }
+    // Blitz returned scrolled-away content. Find the last element in document
+    // order (paint-order approximation; z-index ignored) whose own box holds
+    // the point and that is not clipped there; fall back to the root.
+    let mut best = None;
+    let mut stack = vec![doc.root_node().id];
+    while let Some(nid) = stack.pop() {
+        let Some(node) = doc.get_node(nid) else {
+            continue;
+        };
+        for &c in node.children.iter().rev() {
+            stack.push(c);
+        }
+        if !node.is_element() || !hittable(node) {
+            continue;
+        }
+        let inside = element_border_box_css(doc, nid)
+            .is_some_and(|(bx, by, bw, bh)| x >= bx && y >= by && x < bx + bw && y < by + bh);
+        if inside && !clipped_at(doc, nid, x, y) {
+            best = Some(nid);
         }
     }
-    Some(result)
+    best.or(Some(doc.root_node().id))
+}
+
+fn clipped_at(doc: &HtmlDocument, nid: NodeId, x: f32, y: f32) -> bool {
+    scroll_ancestors(doc, nid)
+        .into_iter()
+        .any(|a| padding_box_css(doc, a).is_some_and(|pb| !pb.contains(x, y)))
+}
+
+fn hittable(node: &blitz_dom::Node) -> bool {
+    use style::computed_values::pointer_events::T as Pe;
+    use style::computed_values::visibility::T as Vis;
+    node.primary_styles().is_none_or(|s| {
+        s.clone_pointer_events() != Pe::None
+            && !matches!(s.clone_visibility(), Vis::Hidden | Vis::Collapse)
+    })
 }
 
 /// Which part of a scrollbar a point is on.
@@ -385,6 +415,23 @@ pub(crate) fn bar_hit(doc: &HtmlDocument, x: f32, y: f32) -> Option<(BarGeom, Ba
         .into_iter()
         .rev()
         .find_map(|g| g.part_at(x, y).map(|p| (g, p)))
+}
+
+/// Whether the topmost element at `(x, y)` is `nid` or inside it, i.e. no
+/// later-painted element (a dialog, a tooltip) covers the bar there.
+pub(crate) fn bar_unoccluded(doc: &HtmlDocument, nid: NodeId, x: f32, y: f32) -> bool {
+    let Some(mut cur) = doc.element_from_point(x, y) else {
+        return true;
+    };
+    loop {
+        if cur == nid {
+            return true;
+        }
+        match doc.get_node(cur).and_then(|n| n.parent) {
+            Some(p) => cur = p,
+            None => return false,
+        }
+    }
 }
 
 /// Vertical scroll containers under `(x, y)`, innermost first, that are
