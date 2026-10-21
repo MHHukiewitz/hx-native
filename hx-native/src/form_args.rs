@@ -169,6 +169,7 @@ pub(crate) fn step_precise(current: f64, dir: i32, limits: &NumericLimits) -> f6
     let current = clamp_safe_number(current);
     let min = limits.min.unwrap_or(-MAX_SAFE_NUMBER);
     let max = limits.max.unwrap_or(MAX_SAFE_NUMBER);
+    let max = max.max(min);
 
     if limits.unconstrained {
         let next = current + dir as f64 * limits.step;
@@ -258,17 +259,26 @@ pub(crate) struct NumericLimits {
 
 pub(crate) fn numeric_limits(node: &Node) -> NumericLimits {
     let is_range = is_range_input(node);
+    // Markup is host input: `parse::<f64>` accepts "NaN" / "inf", and
+    // nothing orders min/max. Drop non-finite values and, like HTML, treat a
+    // max below min as max = min, so `f64::clamp` below can never panic.
     let min = attr(node, "min")
         .and_then(|s| parse_f64(&s))
+        .filter(|v| v.is_finite())
         .or(if is_range { Some(0.0) } else { None });
     let max = attr(node, "max")
         .and_then(|s| parse_f64(&s))
+        .filter(|v| v.is_finite())
         .or(if is_range { Some(100.0) } else { None });
+    let max = match (min, max) {
+        (Some(lo), Some(hi)) if hi < lo => Some(lo),
+        _ => max,
+    };
     let step_attr = attr(node, "step");
     let unconstrained = step_attr.as_deref() == Some("any");
     let step = step_attr
         .and_then(|s| parse_f64(&s))
-        .filter(|s| *s > 0.0)
+        .filter(|s| s.is_finite() && *s > 0.0)
         .unwrap_or(1.0);
     NumericLimits {
         min,
@@ -282,6 +292,7 @@ fn clamp_snap(value: f64, limits: &NumericLimits) -> f64 {
     let value = clamp_safe_number(value);
     let min = limits.min.unwrap_or(-MAX_SAFE_NUMBER);
     let max = limits.max.unwrap_or(MAX_SAFE_NUMBER);
+    let max = max.max(min);
     let base = limits.min.unwrap_or(0.0);
     let stepped = if limits.step > 0.0 && !limits.unconstrained {
         base + ((value - base) / limits.step).round() * limits.step
@@ -459,11 +470,18 @@ pub(crate) fn format_numeric(v: f64) -> String {
     }
     let rounded = v.round();
     if (v - rounded).abs() < 1e-12 && rounded.abs() <= MAX_SAFE_NUMBER {
+        // `{:.0}` keeps the sign of -0.0 ("-0"); the old i64 path wrote "0".
+        if rounded == 0.0 {
+            return "0".to_string();
+        }
         return format!("{rounded:.0}");
     }
     // Deterministic trim of trailing zeros.
     let s = format!("{v:.10}");
     let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s == "-0" {
+        return "0".to_string();
+    }
     s.to_string()
 }
 
@@ -509,5 +527,20 @@ mod tests {
         assert_eq!(format_numeric(MAX_SAFE_NUMBER), "9007199254740992");
         assert_eq!(format_numeric(-MAX_SAFE_NUMBER), "-9007199254740992");
         assert_eq!(format_numeric(1e-10), "0.0000000001");
+        assert_eq!(format_numeric(-0.0), "0");
+        assert_eq!(format_numeric(-1e-13), "0");
+    }
+
+    /// Graph re-review (60e0753): a reversed range must clamp, not panic.
+    #[test]
+    fn clamp_snap_reversed_bounds_do_not_panic() {
+        let lim = NumericLimits {
+            min: Some(10.0),
+            max: Some(0.0),
+            step: 1.0,
+            unconstrained: false,
+        };
+        assert_eq!(format_numeric(clamp_snap(3.0, &lim)), "10");
+        assert_eq!(format_numeric(super::step_precise(3.0, 1, &lim)), "10");
     }
 }

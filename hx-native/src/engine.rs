@@ -1512,7 +1512,17 @@ impl LiveSurface {
         // sees `actions_changed` (or `initial`) again and re-calls
         // `input_limits` instead of silently skipping the retry.
         if initial || actions_changed {
-            self.refresh_input_limits(slices)?;
+            if let Err(err) = self.refresh_input_limits(slices) {
+                // Fail closed: sections may already be swapped in above, so
+                // give them the last good limits and this packet's greying
+                // before reporting the error. The version is still not
+                // recorded, so the next sync retries `input_limits`.
+                if !dirty_sections.is_empty() {
+                    self.reapply_cached_limits();
+                }
+                self.apply_action_states(slices.action_states(), true);
+                return Err(err);
+            }
         }
 
         self.slice_versions = current;

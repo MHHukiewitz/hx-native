@@ -127,8 +127,23 @@ fn engine_err(surface: Option<SurfaceId>, error: EngineError) -> WorkerError {
 /// Owned slice + fragment snapshot the host sends to the worker.
 ///
 /// `#[non_exhaustive]` (PR27 round 2): future fields (e.g. a prospective
-/// `input_rules`) must not break downstream struct literals. Build one with
-/// `SyncPacket { field: ..., ..Default::default() }` (it derives `Default`).
+/// `input_rules`) must not break downstream code. Outside this crate a
+/// `#[non_exhaustive]` struct cannot be built with a struct literal, not even
+/// `SyncPacket { field, ..Default::default() }` (E0639), so start from
+/// `SyncPacket::default()` and assign fields:
+///
+/// ```
+/// use hx_native::{InputLimits, SyncPacket};
+///
+/// let mut packet = SyncPacket::default();
+/// packet.versions.insert("actions".into(), 1);
+/// packet.input_limits = vec![(
+///     "settings.apply".into(),
+///     "fee".into(),
+///     InputLimits::new(0.0, 10.0, Some(1.0)),
+/// )];
+/// assert!(packet.actions.is_empty());
+/// ```
 #[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct SyncPacket {
