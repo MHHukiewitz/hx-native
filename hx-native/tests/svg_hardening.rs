@@ -198,7 +198,7 @@ fn non_data_hrefs_are_refused_on_every_element() {
     for (el, attr, href) in [
         ("linearGradient", "xlink:href", "#g0"),
         ("linearGradient", "href", "/tmp/x.svg"),
-        ("pattern", "href", "#p0"),
+        ("radialGradient", "href", "#p0"),
         ("a", "href", "https://example.com/"),
         ("a", "xlink:href", "file:///etc/hostname"),
         ("g", "href", "x.png"),

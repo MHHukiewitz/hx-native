@@ -46,9 +46,9 @@ use crate::select_ui::{
     select_damage_rects, select_row_damage_rect, select_ua_stylesheet, OpenSelect, SELECT_MAX_ROWS,
 };
 use crate::svg::{
-    check_svg_attribute, classify_url, css_forbidden_property, css_urls, forbidden_element,
-    probe_decode, spawn_svg_warm_up, DataSvg, DataSvgProvider, RasterImage, SvgRejection,
-    DATA_IMAGE_MAX_TOTAL_PIXELS, SVG_MAX_DEPTH,
+    check_svg_attribute, classify_url, css_mentions, css_urls, forbidden_element, probe_decode,
+    spawn_svg_warm_up, DataSvg, DataSvgProvider, RasterImage, SvgRejection,
+    DATA_IMAGE_MAX_TOTAL_PIXELS, SVG_MAX_DEPTH, SVG_SHEET_FORBIDDEN_PROPERTIES,
 };
 use crate::text_edit::{
     apply_group_display_all, apply_unfocused_display, backspace, caret_device_rect, commit_field,
@@ -5668,6 +5668,27 @@ fn inline_svg_depth(doc: &HtmlDocument, node: &blitz_dom::Node) -> Option<usize>
     svg_depth
 }
 
+/// `node` is a `<clipPath>` (any prefix or case) or inside one. Walks
+/// parents without recursion.
+fn inside_clip_path(doc: &HtmlDocument, node: &blitz_dom::Node) -> bool {
+    let mut cur = Some(node);
+    while let Some(n) = cur {
+        if let Some(el) = n.element_data() {
+            let name = &*el.name.local;
+            if name
+                .rsplit(':')
+                .next()
+                .unwrap_or(name)
+                .eq_ignore_ascii_case("clipPath")
+            {
+                return true;
+            }
+        }
+        cur = n.parent.and_then(|p| doc.get_node(p));
+    }
+    false
+}
+
 /// Issue #23 SVG gate on one element of loaded HTML or a swap fragment.
 /// Inside an inline `<svg>` (any element, in any namespace, under any
 /// prefix, because Blitz serialises the subtree by local name for usvg):
@@ -5711,13 +5732,20 @@ fn validate_svg_content(
         // allowed raster type; every other href must be data: too. `href`,
         // `xlink:href` and prefixed spellings share the local name; all are
         // checked when several are present.
+        let in_clip_path = inside_clip_path(doc, node);
         for (name, value) in attrs {
-            if let Some(img) = check_svg_attribute(tag, name, value).map_err(reject)? {
+            if let Some(img) =
+                check_svg_attribute(tag, name, value, in_clip_path).map_err(reject)?
+            {
                 images.push((label(), img));
             }
         }
-        if tag.eq_ignore_ascii_case("style") {
-            if let Some(p) = css_forbidden_property(&node.text_content()) {
+        // usvg takes every element whose local name is `style` as a sheet
+        // (roxmltree `has_tag_name("style")` ignores the namespace), so
+        // `<svg:style>` and `<x:style>` are sheets too (Graph, #52 round 4).
+        let tag_local = tag.rsplit(':').next().unwrap_or(tag);
+        if tag_local.eq_ignore_ascii_case("style") {
+            if let Some(p) = css_mentions(&node.text_content(), SVG_SHEET_FORBIDDEN_PROPERTIES) {
                 return Err(reject(SvgRejection::ForbiddenProperty {
                     property: p.to_string(),
                 }));

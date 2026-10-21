@@ -55,17 +55,39 @@ pub const DATA_SVG_MAX_BYTES: usize = 64 * 1024;
 ///   allowed under the rules in [`SVG_IMAGE_MIME_TYPES`].)
 /// - `use`: one kilobyte of nested `<use>` fans out to 1e5 nodes (1.6 s to
 ///   load in release, Graph on #52). Mainnet's icons do not use it.
+/// - `marker`: usvg copies a marker's content to every vertex of the path
+///   that uses it, and a marker may hold a path with other markers, so
+///   nested markers fan out like `<use>` (and an `<image>` in a marker is
+///   decoded at every vertex on every paint while the budget counts it
+///   once; Graph on #52 round 4). Mainnet's icons do not use it.
+/// - `mask`, `pattern`: anyrender_svg paints neither, but usvg converts
+///   their content again for every element that uses them with the default
+///   `objectBoundingBox` units, and content may use further masks or
+///   patterns: 3 KB nested five deep took 5.5-6.9 s and 170-250 MB to load
+///   in release (Graph on #52 round 4). Refused rather than half-supported.
+///   `clipPath` stays (anyrender_svg paints a single-path clip), but a
+///   `clip-path` on a `<clipPath>` or inside one, or in a `<style>` sheet,
+///   is refused for the same reason.
 ///
 /// Names are matched on the local part (after any `prefix:`), ASCII
 /// case-insensitively, in every namespace: `<é:text>`, `<svg:text>`,
 /// `<TEXT>` and a `<text>` under `<foreignObject>` are all refused.
-pub const FORBIDDEN_SVG_ELEMENTS: &[&str] = &["text", "tspan", "textPath", "feImage", "use"];
+pub const FORBIDDEN_SVG_ELEMENTS: &[&str] = &[
+    "text", "tspan", "textPath", "feImage", "use", "marker", "mask", "pattern",
+];
 
 /// SVG properties that make an SVG invalid, as an attribute, in a `style`
 /// attribute or in a `<style>` sheet. A 147-byte `stroke-dasharray="0.01"`
 /// over a 1e7-long path makes the paint try to allocate 7.5 GB and aborts
 /// the process (Graph on #52); Mainnet uses no dashes.
 pub const FORBIDDEN_SVG_PROPERTIES: &[&str] = &["stroke-dasharray", "stroke-dashoffset"];
+
+/// Properties refused in an SVG `<style>` sheet (which can reach any
+/// element, including the content of a `<clipPath>`) and inside a
+/// `<clipPath>`: [`FORBIDDEN_SVG_PROPERTIES`] plus `clip-path`, so clip
+/// paths cannot nest and fan out (Graph on #52 round 4).
+pub(crate) const SVG_SHEET_FORBIDDEN_PROPERTIES: &[&str] =
+    &["stroke-dasharray", "stroke-dashoffset", "clip-path"];
 
 /// Deepest element nesting an SVG may have, counted from its root `<svg>`
 /// (which is depth 1). Checked by a non-recursive scan before the XML parse,
@@ -245,32 +267,56 @@ pub(crate) fn forbidden_element(name: &str) -> Option<&'static str> {
         .copied()
 }
 
-/// The forbidden property a CSS text sets or mentions, if any. Comments are
-/// dropped, escapes decoded and case folded first, so `STROKE-DASH\61rray`
-/// and `stroke-/**/dasharray` are caught; any mention fails closed.
+/// The first of [`FORBIDDEN_SVG_PROPERTIES`] a CSS text mentions (tests).
+#[cfg(test)]
 pub(crate) fn css_forbidden_property(css: &str) -> Option<&'static str> {
+    css_mentions(css, FORBIDDEN_SVG_PROPERTIES)
+}
+
+/// The first of `names` a CSS text sets or mentions, if any. Escapes are
+/// decoded and case folded first, so `STROKE-DASH\61rray` is caught. The
+/// text is checked twice, once with comments dropped (`stroke-/**/dasharray`)
+/// and once with them kept: a `/*` inside a CSS string (`"/*"`) is not a
+/// comment to usvg's CSS parser, so dropping it here could hide a live
+/// declaration (Graph, #52 round 4). Any mention in either view fails closed.
+pub(crate) fn css_mentions(css: &str, names: &[&'static str]) -> Option<&'static str> {
     let bytes = css.as_bytes();
-    let mut norm = Vec::with_capacity(bytes.len());
+    let mut stripped = Vec::with_capacity(bytes.len());
+    let mut kept = Vec::with_capacity(bytes.len());
     let mut j = 0;
     while j < bytes.len() {
         if bytes[j] == b'/' && bytes.get(j + 1) == Some(&b'*') {
+            kept.extend_from_slice(b"/*");
             j += 2;
             while j < bytes.len() && !(bytes[j] == b'*' && bytes.get(j + 1) == Some(&b'/')) {
-                j += 1;
+                if bytes[j] == b'\\' {
+                    j += 1;
+                    read_css_escape(bytes, &mut j, &mut kept);
+                } else {
+                    kept.push(bytes[j]);
+                    j += 1;
+                }
             }
+            kept.extend_from_slice(b"*/");
             j += 2;
         } else if bytes[j] == b'\\' {
             j += 1;
-            read_css_escape(bytes, &mut j, &mut norm);
+            let at = kept.len();
+            read_css_escape(bytes, &mut j, &mut kept);
+            stripped.extend_from_slice(&kept[at..]);
         } else {
-            norm.push(bytes[j]);
+            stripped.push(bytes[j]);
+            kept.push(bytes[j]);
             j += 1;
         }
     }
-    let norm = String::from_utf8_lossy(&norm).to_ascii_lowercase();
-    FORBIDDEN_SVG_PROPERTIES
+    let views = [
+        String::from_utf8_lossy(&stripped).to_ascii_lowercase(),
+        String::from_utf8_lossy(&kept).to_ascii_lowercase(),
+    ];
+    names
         .iter()
-        .find(|p| norm.contains(**p))
+        .find(|p| views.iter().any(|v| v.contains(**p)))
         .copied()
 }
 
@@ -283,19 +329,22 @@ pub(crate) fn check_svg_attribute(
     element: &str,
     attr: &str,
     value: &str,
+    in_clip_path: bool,
 ) -> Result<Option<RasterImage>, SvgRejection> {
     let local = attr.rsplit(':').next().unwrap_or(attr);
     let lower = local.to_ascii_lowercase();
-    if let Some(p) = FORBIDDEN_SVG_PROPERTIES
-        .iter()
-        .find(|p| lower.contains(**p))
-    {
+    let refused = if in_clip_path {
+        SVG_SHEET_FORBIDDEN_PROPERTIES
+    } else {
+        FORBIDDEN_SVG_PROPERTIES
+    };
+    if let Some(p) = refused.iter().find(|p| lower.contains(**p)) {
         return Err(SvgRejection::ForbiddenProperty {
             property: p.to_string(),
         });
     }
     if local.eq_ignore_ascii_case("style") {
-        if let Some(p) = css_forbidden_property(value) {
+        if let Some(p) = css_mentions(value, refused) {
             return Err(SvgRejection::ForbiddenProperty {
                 property: p.to_string(),
             });
@@ -403,7 +452,10 @@ pub(crate) fn check_xml_tree(
     let mut images = Vec::new();
     for node in doc.descendants() {
         if node.is_text() {
-            if let Some(p) = node.text().and_then(css_forbidden_property) {
+            if let Some(p) = node
+                .text()
+                .and_then(|t| css_mentions(t, SVG_SHEET_FORBIDDEN_PROPERTIES))
+            {
                 return Err(SvgRejection::ForbiddenProperty {
                     property: p.to_string(),
                 });
@@ -426,8 +478,11 @@ pub(crate) fn check_xml_tree(
                 element: element.to_string(),
             });
         }
+        let in_clip_path = node
+            .ancestors()
+            .any(|n| n.is_element() && n.tag_name().name().eq_ignore_ascii_case("clipPath"));
         for a in node.attributes() {
-            if let Some(img) = check_svg_attribute(name, a.name(), a.value())? {
+            if let Some(img) = check_svg_attribute(name, a.name(), a.value(), in_clip_path)? {
                 images.push(img);
             }
         }
@@ -510,6 +565,13 @@ pub(crate) fn check_raster(mime: &str, data: Vec<u8>) -> Result<RasterImage, Svg
     let Some(dims) = dims else {
         return Err(corrupt("unreadable image header"));
     };
+    if actual == "image/png" {
+        if let Some(c) = png_refused_chunk(&data) {
+            return Err(corrupt(&format!(
+                "PNG {c} chunk refused (inflated on every paint); strip the colour profile"
+            )));
+        }
+    }
     let mut pixels = 0;
     for (w, h) in dims {
         if w == 0 || h == 0 {
@@ -573,12 +635,36 @@ fn le24(d: &[u8], i: usize) -> Option<u64> {
     Some(b[0] as u64 | (b[1] as u64) << 8 | (b[2] as u64) << 16)
 }
 
+/// PNG chunks whose payload the `png` crate inflates on every decode,
+/// whatever the image size: a 61 KB 16x16 PNG whose `iCCP` inflates to
+/// 60 MB costs about 38 ms and +60 MB on every paint in release (Graph, #52
+/// round 4). The header cap cannot see it, so the chunk is refused.
+/// (`zTXt` and compressed `iTXt` of the same size measured no cost: the
+/// decoder does not inflate them.)
+const PNG_REFUSED_CHUNKS: &[&[u8; 4]] = &[b"iCCP"];
+
 /// PNG: the IHDR chunk must come first.
 fn png_dimensions(d: &[u8]) -> Option<(u64, u64)> {
     if be32(d, 8)? != 13 || d.get(12..16)? != b"IHDR" {
         return None;
     }
     Some((be32(d, 16)?, be32(d, 20)?))
+}
+
+/// The first of [`PNG_REFUSED_CHUNKS`] anywhere in a PNG, walking every
+/// chunk (the file is at most [`DATA_SVG_MAX_BYTES`]).
+fn png_refused_chunk(d: &[u8]) -> Option<&'static str> {
+    let mut i = 8usize;
+    while let (Some(len), Some(kind)) = (be32(d, i), d.get(i + 4..i + 8)) {
+        if let Some(c) = PNG_REFUSED_CHUNKS.iter().find(|c| &c[..] == kind) {
+            return std::str::from_utf8(&c[..]).ok();
+        }
+        if kind == b"IEND" {
+            return None;
+        }
+        i = i.checked_add(12)?.checked_add(usize::try_from(len).ok()?)?;
+    }
+    None
 }
 
 /// GIF: the logical screen and every image descriptor (frame), walking the
@@ -1252,7 +1338,7 @@ mod tests {
             assert!(css_forbidden_property(css).is_some(), "{css}");
         }
         assert_eq!(css_forbidden_property("stroke:red;stroke-width:2"), None);
-        let attr = |e, a, v| check_svg_attribute(e, a, v).map(|o| o.is_some());
+        let attr = |e, a, v| check_svg_attribute(e, a, v, false).map(|o| o.is_some());
         assert!(matches!(
             attr("path", "stroke-dasharray", "1"),
             Err(SvgRejection::ForbiddenProperty { .. })
@@ -1309,6 +1395,10 @@ mod tests {
             check_raster("image/png", png_header(256, 257)),
             too_large(256, 257)
         );
+        // GIF (Graph #52 r4): the largest frame counts, not the screen.
+        let mut gif = b"GIF89a\x01\x00\x01\x00\x00\x00\x00".to_vec();
+        gif.extend_from_slice(b"\x2C\x00\x00\x00\x00\x02\x00\x02\x00\x00\x02\x00\x3B");
+        assert_eq!(check_raster("image/gif", gif).unwrap().pixels, 4);
         // Side (Graph #52 r2): within the area cap, a side over 4096 is
         // refused; vello_cpu panics on every paint above 65535.
         assert!(check_raster("image/png", png_header(4096, 16)).is_ok());
