@@ -164,11 +164,46 @@ impl From<String> for Reason {
 }
 
 /// Published by the host as the reserved `actions` slice.
+///
+/// `#[non_exhaustive]` (Graph review 17:01, one-time breaking change
+/// alongside adding `RequiresChange` — see docs/REQUIREMENTS.md): every
+/// downstream exhaustive match on `ActionState` needs a `_` arm from here
+/// on, the same as `InputEvent` / `InputOutcome` already require.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ActionState {
     Enabled,
     /// One plain string; the crate never invents copy.
     Disabled {
+        reason: String,
+    },
+    /// Issue #15 (locked by Mike, Floor 2026-10-19 22:02 America/Asuncion):
+    /// greyed exactly like `Disabled` while the named `<form id>`'s live
+    /// control values equal their baseline (clean). The first edit that
+    /// changes a value ungreys it; editing back to the baseline greys it
+    /// again. Re-evaluated locally on every value change, no Game round
+    /// trip. `form` not in the document -> treated as `Enabled` (debug warn).
+    RequiresChange {
+        form: String,
+        reason: String,
+    },
+}
+
+/// Issue #15: an input-level dependency rule, keyed under the action that
+/// posts the form owning the dependent input (not its own reserved slice).
+///
+/// `#[non_exhaustive]` (Graph review, PR #24 follow-up): unlike `ActionState`,
+/// this enum is young enough that downstream exhaustive matches should not
+/// be allowed to silently become exhaustive again when a new rule kind is
+/// added later — every match needs a wildcard arm from the start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InputRule {
+    /// Grey the dependent input (same three attributes as `Disabled`) while
+    /// the named checkbox in the same form has `checked != checked`.
+    EnabledWhen {
+        input: String,
+        checked: bool,
         reason: String,
     },
 }
@@ -184,6 +219,11 @@ pub trait SliceSource {
     fn version(&self, name: &str) -> Option<u64>;
     /// Only for the reserved `actions` slice (greyed-before-click).
     fn action_states(&self) -> Vec<(String, ActionState)>;
+    /// Issue #15: dependent-input rules, keyed by the action whose form owns
+    /// the input. `(action, input name, rule)`. Default empty (non-breaking).
+    fn input_rules(&self) -> Vec<(String, String, InputRule)> {
+        Vec::new()
+    }
 }
 
 /// Input the host (UI) converts from egui/winit. Raw: no platform remapping.
