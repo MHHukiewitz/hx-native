@@ -18,7 +18,7 @@ use crate::dialect::{validate_loaded_attrs, ElementBinding, SwapMode, SyncMode};
 use crate::ellipsis::{prepare_ellipsis_for_paint, EllipsisCache, EllipsisShaper};
 use crate::error::EngineError;
 use crate::focus::{focusable_ids, ids_in_document_order, step_focus};
-use crate::fonts::bundled_font_context;
+use crate::fonts::{bundled_font_context, HostFonts};
 use crate::form_args::{
     capture_applied_controls, capture_form_controls, clamp_snap_value, closest_form,
     collect_action_args, collect_applied_control_nids, format_numeric, is_number_input,
@@ -172,6 +172,9 @@ impl Surface {
 /// Parsed document plus all per-document interaction and paint state.
 struct LiveSurface {
     doc: HtmlDocument,
+    /// Issue #28: this engine's validated host fonts (shared Blobs), used by
+    /// the ellipsis shaper so truncation measures with the same faces.
+    fonts: Arc<HostFonts>,
     bindings: HashMap<String, ElementBinding>,
     /// section_id -> subscribed slice names
     sections: HashMap<String, Vec<String>>,
@@ -303,6 +306,11 @@ struct RenderResult {
 
 pub struct Engine {
     config: EngineConfig,
+    /// Issue #28: validated `config.fonts`, decoded once; one Blob per face.
+    fonts: Arc<HostFonts>,
+    /// Issue #28: set when `Engine::new` got invalid `config.fonts`; returned
+    /// by every surface build so the engine never paints with a partial set.
+    font_error: Option<EngineError>,
     declared_actions: HashSet<String>,
     surfaces: BTreeMap<SurfaceId, Surface>,
     requests: RequestLedger,
@@ -324,9 +332,37 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Build an engine, validating [`EngineConfig::fonts`] (issue #28) up
+    /// front: bytes that are not a readable font, an empty family, a weight
+    /// outside `1..=1000`, or a duplicate (family case-insensitive, weight,
+    /// style) return [`EngineError::InvalidFont`]. Prefer this over
+    /// [`Engine::new`] when the config carries host fonts.
+    pub fn try_new(config: EngineConfig) -> Result<Self, EngineError> {
+        let fonts = HostFonts::build(&config.fonts)?;
+        Ok(Self::with_fonts(config, Ok(fonts)))
+    }
+
+    /// Infallible constructor. With invalid [`EngineConfig::fonts`] it does
+    /// not panic: the [`EngineError::InvalidFont`] is returned by every later
+    /// `load_html` / `open_surface` (and a rebuild), so nothing ever paints
+    /// with a partial font set. Use [`Engine::try_new`] to get it at build time.
     pub fn new(config: EngineConfig) -> Self {
+        let fonts = HostFonts::build(&config.fonts);
+        Self::with_fonts(config, fonts)
+    }
+
+    pub(crate) fn with_fonts(
+        config: EngineConfig,
+        fonts: Result<Arc<HostFonts>, EngineError>,
+    ) -> Self {
+        let (fonts, font_error) = match fonts {
+            Ok(f) => (f, None),
+            Err(e) => (Arc::new(HostFonts::default()), Some(e)),
+        };
         Self {
             config,
+            fonts,
+            font_error,
             declared_actions: HashSet::new(),
             surfaces: BTreeMap::new(),
             requests: RequestLedger {
@@ -383,8 +419,11 @@ impl Engine {
         viewport: Viewport,
         opts: SurfaceOpts,
     ) -> Result<(), EngineError> {
+        if let Some(err) = &self.font_error {
+            return Err(err.clone());
+        }
         let size = SurfaceSize::from_viewport(&viewport);
-        let mut live = LiveSurface::build(&self.declared_actions, html, size)?;
+        let mut live = LiveSurface::build(&self.declared_actions, html, size, &self.fonts)?;
         if !opts.visible {
             let result = live.render(size, self.config.paint_mode)?;
             self.style_layout_passes = self
@@ -443,8 +482,12 @@ impl Engine {
             }
             if surface.live.is_none() {
                 let t0 = Instant::now();
-                let live =
-                    LiveSurface::build(&self.declared_actions, &surface.source_html, surface.size)?;
+                let live = LiveSurface::build(
+                    &self.declared_actions,
+                    &surface.source_html,
+                    surface.size,
+                    &self.fonts,
+                )?;
                 surface.live = Some(live);
                 self.rebuild_count = self.rebuild_count.saturating_add(1);
                 self.last_rebuild_ns = t0.elapsed().as_nanos() as u64;
@@ -1370,10 +1413,11 @@ impl LiveSurface {
         declared_actions: &HashSet<String>,
         html: &str,
         size: SurfaceSize,
+        fonts: &Arc<HostFonts>,
     ) -> Result<Self, EngineError> {
         let layout_viewport = (size.width, size.height);
         let layout_scale = size.scale;
-        let mut doc = parse_html_document_scaled(html, layout_viewport, layout_scale);
+        let mut doc = parse_html_document_scaled(html, layout_viewport, layout_scale, fonts);
 
         // HTML contract §2: strict dialect on loaded HTML, then index bindings.
         let known_ids = collect_element_ids(&doc);
@@ -1418,6 +1462,7 @@ impl LiveSurface {
             consume_escape_keyup: false,
             ellipsis_cache: EllipsisCache::default(),
             ellipsis_shaper: None,
+            fonts: Arc::clone(fonts),
             resolve_count: 1,
             fail_next_paint: false,
             panic_next_paint: false,
@@ -1530,7 +1575,9 @@ impl LiveSurface {
         target_nid: NodeId,
         swap: SwapMode,
     ) -> Result<(), EngineError> {
-        let frag_doc = parse_html_document(html, self.layout_viewport);
+        // Validation-only parse (ids / dialect); never laid out or painted,
+        // so it does not need the host fonts.
+        let frag_doc = parse_html_document(html, self.layout_viewport, &HostFonts::default());
         let mut known_ids = collect_element_ids(&self.doc);
         for id in ids_removed_by_swap(&self.doc, target_nid, swap) {
             known_ids.remove(&id);
@@ -4578,6 +4625,7 @@ impl LiveSurface {
             &mut self.doc,
             &mut self.ellipsis_cache,
             &mut self.ellipsis_shaper,
+            &self.fonts,
         );
 
         if self.panic_next_paint {
@@ -4816,12 +4864,19 @@ fn index_bindings(
     Ok((bindings, sections))
 }
 
-fn parse_html_document(html: &str, layout_viewport: (u32, u32)) -> HtmlDocument {
-    parse_html_document_scaled(html, layout_viewport, 1.0)
+fn parse_html_document(html: &str, layout_viewport: (u32, u32), fonts: &HostFonts) -> HtmlDocument {
+    parse_html_document_scaled(html, layout_viewport, 1.0, fonts)
 }
 
-fn parse_html_document_scaled(html: &str, layout_viewport: (u32, u32), scale: f64) -> HtmlDocument {
-    let font_ctx = bundled_font_context();
+/// `net_provider: None`: CSS `@font-face` (and every other resource) is
+/// never fetched (issue #28); host fonts come only from `EngineConfig::fonts`.
+fn parse_html_document_scaled(
+    html: &str,
+    layout_viewport: (u32, u32),
+    scale: f64,
+    fonts: &HostFonts,
+) -> HtmlDocument {
+    let font_ctx = bundled_font_context(fonts);
     let (w, h) = layout_viewport;
     HtmlDocument::from_html(
         html,

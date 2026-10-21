@@ -90,7 +90,7 @@ use parley::layout::{Alignment, AlignmentOptions, Layout};
 use parley::style::TextStyle;
 use parley::{BaseDirection, LayoutContext};
 
-use crate::fonts::bundled_font_context;
+use crate::fonts::{bundled_font_context, HostFonts};
 use crate::stylo_text_style::{
     base_direction, text_align, text_align_last, text_style_from_computed,
 };
@@ -142,17 +142,18 @@ pub(crate) struct EllipsisShaper {
 }
 
 impl EllipsisShaper {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(fonts: &HostFonts) -> Self {
         Self {
-            font_ctx: bundled_font_context(),
+            font_ctx: bundled_font_context(fonts),
             layout_ctx: LayoutContext::new(),
         }
     }
 }
 
+/// Bundled DejaVu only (no host fonts).
 impl Default for EllipsisShaper {
     fn default() -> Self {
-        Self::new()
+        Self::new(&HostFonts::default())
     }
 }
 
@@ -215,6 +216,7 @@ pub(crate) fn prepare_ellipsis_for_paint<'a>(
     doc: &'a mut HtmlDocument,
     cache: &mut EllipsisCache,
     shaper: &mut Option<EllipsisShaper>,
+    fonts: &HostFonts,
 ) -> EllipsisPaintSession<'a> {
     let scale = doc.viewport().scale().max(0.000_1);
     let candidates = find_ellipsis_candidates(doc, scale);
@@ -228,7 +230,7 @@ pub(crate) fn prepare_ellipsis_for_paint<'a>(
         return session;
     }
 
-    let shaper = shaper.get_or_insert_with(EllipsisShaper::new);
+    let shaper = shaper.get_or_insert_with(|| EllipsisShaper::new(fonts));
     for cand in candidates {
         let Some(prep) = prepare_one(session.doc, cache, shaper, &cand, scale) else {
             continue;

@@ -432,6 +432,7 @@ fn boot_engine(phys_w: u32, phys_h: u32, budget: u64) -> (Engine, MemSlices, Fra
         pending_timeout_frames: 120,
         paint_mode: PaintMode::Exact,
         hidden_surface_budget_bytes: budget,
+        fonts: Vec::new(),
     });
     eng.declare_actions(&["time.set_speed", "act.do", "win.open"]);
     let chrome_view = Viewport::with_scale(phys_w, phys_h, 1.0);

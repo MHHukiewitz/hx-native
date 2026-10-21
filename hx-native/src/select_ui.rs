@@ -320,7 +320,12 @@ fn blit_label(
         DocumentConfig {
             viewport: Some(BlitzViewport::new(dw, dh, scale as f32, ColorScheme::Light)),
             html_parser_provider: Some(Arc::new(HtmlProvider)),
-            font_ctx: Some(crate::fonts::bundled_font_context()),
+            // Rows always paint in bundled `sans-serif` (DejaVu); host fonts
+            // (issue #28) are not used for the open list. The row cache is
+            // process-wide, so it must not depend on one engine's fonts.
+            font_ctx: Some(crate::fonts::bundled_font_context(
+                &crate::fonts::HostFonts::default(),
+            )),
             style_threading: StyleThreading::Sequential,
             incremental: Some(false),
             ..Default::default()
