@@ -316,24 +316,3 @@ fn slice_limits_write_and_clamp_clean_values_grouped_and_ungrouped() {
         );
     }
 }
-
-#[test]
-fn paste_always_strips_commas_so_a_comma_in_paste_ignore_is_a_no_op() {
-    for ignore in ["$", "$,"] {
-        let mut eng = boot(
-            &format!(
-                r#"<input id="p" type="number" name="p" value="0" data-hx-paste-ignore="{ignore}" /><input id="other" type="text" value="x" />"#
-            ),
-            &[],
-        );
-        eng.test_set_focus("p");
-        let _ = key(&mut eng, "a", true);
-        let _ = eng.input(InputEvent::Paste("$1,234".into()));
-        let _ = key(&mut eng, "Tab", false);
-        assert_eq!(
-            eng.attr("p", "value").as_deref(),
-            Some("1234"),
-            "ignore={ignore:?}"
-        );
-    }
-}

@@ -733,10 +733,14 @@ mod tests {
             step: 0.1,
             unconstrained: false,
         };
+        let mut seen = Vec::new();
         for _ in 0..3 {
             v = super::step_precise(v, 1, &tenth);
+            seen.push(v);
         }
-        assert_eq!(v, 0.4);
+        // 3 × 0.1 is 0.30000000000000004 in f64.
+        assert_eq!(seen, [0.2, 0.3, 0.4]);
+        assert_eq!(super::step_precise(4.09, 1, &fee), 4.1);
         // Min with more decimals than step: the grid keeps min's decimals.
         let off = NumericLimits {
             min: Some(0.005),
@@ -754,6 +758,8 @@ mod tests {
             unconstrained: true,
         };
         assert_eq!(super::step_precise(0.7, 1, &any), 1.7);
+        // 0.14 + 1 is 1.1400000000000001 in f64.
+        assert_eq!(super::step_precise(0.14, 1, &any), 1.14);
         assert_eq!(super::step_precise(1234567.89, 1, &any), 1234568.89);
     }
 
