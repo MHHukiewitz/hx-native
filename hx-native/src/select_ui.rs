@@ -1,4 +1,4 @@
-//! Engine-drawn Win95 `<select>` drop list (issue #14).
+//! Engine-drawn `<select>` drop list (issue #14); colours from `--hx-*`.
 //!
 //! Markup stays a plain `<select>` / `<option>`. Blitz beta.4 hides options
 //! (`option { display: none }`) via the UA sheet from [`select_ua_stylesheet`]
@@ -18,6 +18,7 @@ use crate::form_controls::{
     select_options, select_selected_index, select_selected_text, FormControlRef,
 };
 use crate::paint::paint_rgba;
+use crate::scroll::{palette_for, Palette};
 use crate::types::RgbaImage;
 
 type SelectRowCacheKey = (String, String, String, u32, u32);
@@ -30,21 +31,19 @@ static SELECT_ROW_CACHE: LazyLock<Mutex<SelectRowCache>> =
 /// Max visible rows in the open drop list (no scrolling in v1).
 pub const SELECT_MAX_ROWS: usize = 8;
 
-/// Row height in CSS pixels (Win95-ish).
+/// Row height in CSS pixels.
 pub const SELECT_ROW_H: f32 = 18.0;
 
 /// Width of the ▼ button strip on the closed control.
 pub const SELECT_BUTTON_W: f32 = 16.0;
 
-/// Win95 palette as RGBA8.
-const NAVY: [u8; 4] = [0x00, 0x00, 0x80, 0xFF];
-const WHITE: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
-const FACE: [u8; 4] = [0xC0, 0xC0, 0xC0, 0xFF];
-const BLACK: [u8; 4] = [0x00, 0x00, 0x00, 0xFF];
-const WHITE_FACE: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
-const SHADOW: [u8; 4] = [0x80, 0x80, 0x80, 0xFF];
+/// `#rrggbb` for a label colour (row labels are rasterized through Blitz).
+fn css_hex(c: [u8; 4]) -> String {
+    format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
+}
 
 /// Extra UA CSS so the selected option's text shows inside the closed control.
+/// Colours are the neutral `--hx-*` defaults; the host's CSS overrides them.
 pub fn select_ua_stylesheet() -> UserAgentStylesheet {
     UserAgentStylesheet::parse(
         r#"
@@ -54,12 +53,11 @@ select {
     min-height: 20px;
     min-width: 64px;
     padding: 1px 18px 1px 4px;
-    border-top: 2px solid #808080;
-    border-left: 2px solid #808080;
-    border-right: 2px solid #ffffff;
-    border-bottom: 2px solid #ffffff;
-    background-color: #ffffff;
-    color: #000000;
+    border: 2px solid;
+    border-color: var(--hx-bevel-sh, #8c8c8c) var(--hx-bevel-hi, #ffffff)
+        var(--hx-bevel-hi, #ffffff) var(--hx-bevel-sh, #8c8c8c);
+    background-color: var(--hx-select-bg, #ffffff);
+    color: var(--hx-select-ink, #000000);
     font-family: sans-serif;
     font-size: 12px;
     vertical-align: middle;
@@ -224,12 +222,14 @@ pub fn paint_select_overlays(
     };
     for &nid in selects {
         if let Some(rect) = control_rect_of(doc, nid) {
+            // Issue #35: colours from the select's `--hx-*` variables.
+            let pal = palette_for(doc, nid);
             match crate::scroll::ancestor_clip_css(doc, nid) {
-                None => paint_dropdown_button(frame, &rect, scale),
+                None => paint_dropdown_button(frame, &rect, scale, &pal),
                 // Issue #26: a select inside a scroll container is clipped to
                 // its padding box like the rest of the scrolled content.
                 Some(clip) => paint_clipped(frame, &rect, clip, scale, |f| {
-                    paint_dropdown_button(f, &rect, scale)
+                    paint_dropdown_button(f, &rect, scale, &pal)
                 }),
             }
         }
@@ -240,7 +240,8 @@ pub fn paint_select_overlays(
     };
     let opts = select_options(doc, open.select_nid);
     let rows = opts.len().min(SELECT_MAX_ROWS);
-    paint_open_list(frame, open, &opts[..rows], scale, hover_row);
+    let pal = palette_for(doc, open.select_nid);
+    paint_open_list(frame, open, &opts[..rows], scale, hover_row, &pal);
 }
 
 /// Run `paint` but keep every pixel outside `clip` (CSS px) as it was.
@@ -286,20 +287,20 @@ fn paint_clipped(
     }
 }
 
-fn paint_dropdown_button(frame: &mut RgbaImage, control: &ControlRect, scale: f64) {
+fn paint_dropdown_button(frame: &mut RgbaImage, control: &ControlRect, scale: f64, pal: &Palette) {
     let btn = ControlRect {
         x: control.x + control.w - SELECT_BUTTON_W,
         y: control.y,
         w: SELECT_BUTTON_W,
         h: control.h,
     };
-    fill_rect(frame, &btn, scale, FACE);
+    fill_rect(frame, &btn, scale, pal.face);
     // Raised border
-    stroke_raised(frame, &btn, scale);
+    stroke_raised(frame, &btn, scale, pal);
     // ▼ glyph as a small filled triangle (no text shaping dependency).
     let cx = btn.x + btn.w * 0.5;
     let cy = btn.y + btn.h * 0.5;
-    fill_triangle_down(frame, cx, cy, 4.0, scale, BLACK);
+    fill_triangle_down(frame, cx, cy, 4.0, scale, pal.ink);
 }
 
 fn paint_open_list(
@@ -308,14 +309,15 @@ fn paint_open_list(
     opts: &[crate::form_controls::SelectOption],
     scale: f64,
     hover_row: Option<usize>,
+    pal: &Palette,
 ) {
     let list = open.list_rect;
-    fill_rect(frame, &list, scale, WHITE_FACE);
+    fill_rect(frame, &list, scale, pal.select_bg);
     // Sunken outer border
-    draw_hline(frame, list.x, list.y, list.w, scale, SHADOW);
-    draw_vline(frame, list.x, list.y, list.h, scale, SHADOW);
-    draw_hline(frame, list.x, list.y + list.h - 1.0, list.w, scale, WHITE);
-    draw_vline(frame, list.x + list.w - 1.0, list.y, list.h, scale, WHITE);
+    draw_hline(frame, list.x, list.y, list.w, scale, pal.sh);
+    draw_vline(frame, list.x, list.y, list.h, scale, pal.sh);
+    draw_hline(frame, list.x, list.y + list.h - 1.0, list.w, scale, pal.hi);
+    draw_vline(frame, list.x + list.w - 1.0, list.y, list.h, scale, pal.hi);
 
     for (i, opt) in opts.iter().enumerate() {
         let row = ControlRect {
@@ -326,11 +328,14 @@ fn paint_open_list(
         };
         let highlighted = Some(i) == hover_row || i == open.highlight;
         if highlighted {
-            fill_rect(frame, &row, scale, NAVY);
+            fill_rect(frame, &row, scale, pal.select_hl);
         }
-        let fg = if highlighted { "#ffffff" } else { "#000000" };
-        let bg = if highlighted { "#000080" } else { "#ffffff" };
-        blit_label(frame, &row, scale, &opt.text, bg, fg);
+        let (bg, fg) = if highlighted {
+            (pal.select_hl, pal.select_bg)
+        } else {
+            (pal.select_bg, pal.select_ink)
+        };
+        blit_label(frame, &row, scale, &opt.text, &css_hex(bg), &css_hex(fg));
     }
 }
 
@@ -419,11 +424,11 @@ fn fill_rect(frame: &mut RgbaImage, rect: &ControlRect, scale: f64, color: [u8; 
     }
 }
 
-fn stroke_raised(frame: &mut RgbaImage, rect: &ControlRect, scale: f64) {
-    draw_hline(frame, rect.x, rect.y, rect.w, scale, WHITE);
-    draw_vline(frame, rect.x, rect.y, rect.h, scale, WHITE);
-    draw_hline(frame, rect.x, rect.y + rect.h - 1.0, rect.w, scale, SHADOW);
-    draw_vline(frame, rect.x + rect.w - 1.0, rect.y, rect.h, scale, SHADOW);
+fn stroke_raised(frame: &mut RgbaImage, rect: &ControlRect, scale: f64, pal: &Palette) {
+    draw_hline(frame, rect.x, rect.y, rect.w, scale, pal.hi);
+    draw_vline(frame, rect.x, rect.y, rect.h, scale, pal.hi);
+    draw_hline(frame, rect.x, rect.y + rect.h - 1.0, rect.w, scale, pal.sh);
+    draw_vline(frame, rect.x + rect.w - 1.0, rect.y, rect.h, scale, pal.sh);
 }
 
 fn draw_hline(frame: &mut RgbaImage, x: f32, y: f32, w: f32, scale: f64, color: [u8; 4]) {

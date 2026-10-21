@@ -264,7 +264,8 @@ fn mock34_panel_scrolls_with_proportional_win95_bar() {
     assert_eq!(thumb.3, want, "thumb sized to the visible share");
     assert_eq!(thumb.1, track.1, "thumb at top when offset is 0");
 
-    // Pixels: raised bevel (--raise), ink triangle, 1 px checker track.
+    // Pixels (fixture `--hx-*` mapping): raised bevel, ink triangle, 1 px
+    // --hx-track / --hx-track-alt checker.
     assert_eq!(
         px(&img, upr.0, upr.1),
         [0xFF, 0xFF, 0xFF, 0xFF],
@@ -273,7 +274,7 @@ fn mock34_panel_scrolls_with_proportional_win95_bar() {
     assert_eq!(
         px(&img, upr.0 + 15.0, upr.1 + 15.0),
         [0x00, 0x00, 0x00, 0xFF],
-        "bottom-right = --edge-dk (Win95 #000 fallback, issue #35)"
+        "bottom-right = --hx-bevel-dk (fixture maps it to --edge-dk, issue #35)"
     );
     assert_eq!(
         px(&img, upr.0 + 14.0, upr.1 + 14.0),
@@ -312,7 +313,7 @@ fn mock34_panel_scrolls_with_proportional_win95_bar() {
     assert_eq!(
         px(&img, thumb.0 + 8.0, thumb.1 + 8.0),
         [0xC0, 0xC0, 0xC0, 0xFF],
-        "thumb face --bg"
+        "thumb face --hx-face"
     );
 }
 
@@ -456,7 +457,7 @@ fn arrows_track_and_thumb_drag() {
     assert_eq!(
         px(&img, dnr.0, dnr.1),
         [0x00, 0x00, 0x00, 0xFF],
-        "pressed: --press top-left = --edge-dk"
+        "pressed: top-left = --hx-bevel-dk"
     );
     assert_eq!(eng.input(up(dx, dy)), InputOutcome::None);
     let (_, img) = frame(&mut eng, vp34());

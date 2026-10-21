@@ -24,8 +24,8 @@ use crate::fonts::{bundled_font_context, HostFonts};
 use crate::form_args::{
     capture_applied_controls, capture_form_controls, clamp_snap_value, closest_form,
     collect_action_args, collect_applied_control_nids, format_numeric, is_number_input,
-    is_numeric_input, parse_f64, range_to_end, set_range_value_from_x, step_numeric_value,
-    write_value_attr, NumericLimits, MAX_SAFE_NUMBER,
+    is_numeric_input, parse_f64, range_page_toward_x, range_to_end, set_range_value_from_x,
+    step_numeric_value, write_value_attr, NumericLimits, MAX_SAFE_NUMBER,
 };
 use crate::form_controls::{
     activate_checkable, checkbox_checked_by_name, control_is_disabled, form_control_at_point,
@@ -261,15 +261,18 @@ struct LiveSurface {
     /// so `PointerUp` can fire `change` once and suppress `click`.
     range_drag_released: Option<String>,
     /// Issue #35: pointer offset from the thumb centre for the active range
-    /// drag (0 when the press landed on the track and the thumb jumped).
+    /// drag (a press on the thumb grabs it in place).
     range_grab: f32,
+    /// Issue #35: the active range press landed on the groove and paged one
+    /// block toward the pointer; moves and the release do not drag.
+    range_paging: bool,
     /// Issue #35: the range's value when the press began; the release fires
     /// `change` only when the value differs (HTML: no change, no event).
     range_press_value: Option<String>,
     /// Issue #35: engine-drawn slider geometry painted last frame; a change
     /// damages that slider's old and new rects only.
     last_sliders: Vec<SliderGeom>,
-    /// Open Win95 `<select>` drop list (engine-drawn overlay).
+    /// Open `<select>` drop list (engine-drawn overlay).
     open_select: Option<OpenSelect>,
     /// Hovered row in the open list (document coords from last move).
     select_hover_row: Option<usize>,
@@ -1583,6 +1586,7 @@ impl LiveSurface {
             range_drag_id: None,
             range_drag_released: None,
             range_grab: 0.0,
+            range_paging: false,
             range_press_value: None,
             last_sliders: Vec::new(),
             open_select: None,
@@ -3190,7 +3194,7 @@ impl LiveSurface {
             return self.on_scroll_drag_move(drag, y);
         }
         if let Some(ref rid) = self.range_drag_id.clone() {
-            if !self.element_is_disabled_id(rid) {
+            if !self.range_paging && !self.element_is_disabled_id(rid) {
                 let _ = self.apply_range_from_x(rid, x);
             }
         }
@@ -3373,13 +3377,21 @@ impl LiveSurface {
             if let Some(ref c) = ctrl {
                 if c.kind == FormControlKind::Range && !control_is_disabled(&self.doc, c.node_id) {
                     if let Some(ref eid) = c.element_id {
-                        // Issue #35: a press on the thumb grabs it in place;
-                        // a press on the track jumps the thumb under it.
-                        self.range_grab = slider_geometry(&self.doc, c.node_id)
-                            .map(|g| grab_offset(&g, x, y))
-                            .unwrap_or(0.0);
+                        // Issue #35: a press on the thumb grabs it in place
+                        // and drags; a press on the groove pages one block
+                        // toward the pointer (Win95 trackbar; one page per
+                        // press, no hold-to-repeat in v1).
+                        let geom = slider_geometry(&self.doc, c.node_id);
+                        let on_thumb = geom.as_ref().is_some_and(|g| g.thumb_contains(x, y));
                         self.range_press_value = self.attr(eid, "value");
-                        self.apply_range_from_x(eid, x);
+                        self.range_paging = !on_thumb;
+                        if on_thumb {
+                            self.range_grab = geom.map(|g| grab_offset(&g, x, y)).unwrap_or(0.0);
+                            self.apply_range_from_x(eid, x);
+                        } else {
+                            self.range_grab = 0.0;
+                            self.apply_range_page(eid, x);
+                        }
                         self.range_drag_id = Some(eid.clone());
                     }
                 }
@@ -3421,7 +3433,7 @@ impl LiveSurface {
                 // Issue #35: the release only repaints when the value moves
                 // (`apply_range_from_x` marks dirty and syncs outputs then);
                 // an unmoved release costs no frame.
-                if !self.element_is_disabled_id(rid) {
+                if !self.range_paging && !self.element_is_disabled_id(rid) {
                     self.apply_range_from_x(rid, x);
                 }
                 let now = self.attr(rid, "value");
@@ -4253,6 +4265,18 @@ impl LiveSurface {
             .filter_map(|eid| self.doc.get_element_by_id(eid))
             .collect();
         collect_action_args(&self.doc, source_id, &rule_greyed)
+    }
+
+    /// Issue #35: a groove press pages the value one block toward `x`.
+    fn apply_range_page(&mut self, id: &str, x: f32) -> bool {
+        self.ensure_resolved();
+        let changed = range_page_toward_x(&mut self.doc, id, x);
+        if changed {
+            let _ = sync_outputs_for(&mut self.doc, id);
+            self.mark_dom_dirty();
+            self.mark_paint_dirty();
+        }
+        changed
     }
 
     fn apply_range_from_x(&mut self, id: &str, x: f32) -> bool {
@@ -5248,7 +5272,7 @@ impl LiveSurface {
         paint_field_bevels(&self.doc, &mut frame, scale);
         paint_sliders(&self.doc, &mut frame, scale);
 
-        // Issue #26: engine-drawn Win95 scrollbars (under select overlays).
+        // Issue #26: engine-drawn scrollbars (under select overlays).
         paint_scrollbars(&self.doc, &mut frame, scale, self.scroll_pressed);
 
         // Engine-drawn select face button + open list (above Blitz content).

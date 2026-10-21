@@ -358,6 +358,53 @@ pub fn set_range_value_from_x(doc: &mut HtmlDocument, id: &str, x: f32, grab: f3
     write_value_attr(doc, nid, &format_numeric(snapped))
 }
 
+/// Issue #35: the page block of a range: `max(step, (max - min) / 10)`,
+/// the tenth snapped to a whole number of steps (Win95 trackbar paging).
+pub(crate) fn range_page_block(limits: &NumericLimits) -> f64 {
+    let min = limits.min.unwrap_or(0.0);
+    let max = limits.max.unwrap_or(100.0).max(min);
+    let tenth = (max - min) / 10.0;
+    if limits.unconstrained || limits.step.is_nan() || limits.step <= 0.0 {
+        return tenth;
+    }
+    let step = limits.step;
+    ((tenth / step).round() * step).max(step)
+}
+
+/// Issue #35: a press on the groove left / right of the thumb moves the
+/// value one page block toward `x` (document CSS px), clamped and snapped.
+/// A press on the thumb's own column does nothing. Returns `true` when the
+/// attribute changed.
+pub fn range_page_toward_x(doc: &mut HtmlDocument, id: &str, x: f32) -> bool {
+    let Some(nid) = doc.get_element_by_id(id) else {
+        return false;
+    };
+    let (limits, current) = {
+        let Some(node) = doc.get_node(nid) else {
+            return false;
+        };
+        if !is_range_input(node) {
+            return false;
+        }
+        let limits = numeric_limits(node);
+        let current = crate::slider::range_value(node, &limits);
+        (limits, current)
+    };
+    let Some(geom) = crate::slider::slider_geometry(doc, nid) else {
+        return false;
+    };
+    let dir = if x < geom.thumb.x {
+        -1.0
+    } else if x >= geom.thumb.x + geom.thumb.w {
+        1.0
+    } else {
+        return false;
+    };
+    let block = range_page_block(&limits);
+    let next = range_snap(current + dir * block, &limits);
+    write_value_attr(doc, nid, &format_numeric(next))
+}
+
 /// Issue #35: Home / End on a range — write `min` (or `max` snapped onto
 /// the step grid). Returns `true` when the attribute changed.
 pub(crate) fn range_to_end(doc: &mut HtmlDocument, nid: NodeId, to_max: bool) -> bool {

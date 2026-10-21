@@ -34,8 +34,9 @@ button.default{font-weight:700;outline:1px solid #000;outline-offset:-4px}
 .set .row .k{width:136px;line-height:13px}
 .set .gap{height:6px}
 /* Issue #35: look tokens, mock 34b and its sliders from Mainnet 9fc61473 (_tokens.css values;
-   the engine reads --bg, the --edge tokens, --ink and --scroll-track for its slider and scrollbar). */
+   the host maps its own tokens onto the crate-owned --hx variables below; the engine reads nothing else). */
 :root{--bg:#c0c0c0;--ink:#000;--edge-hi:#ffffff;--edge-lt:#dfdfdf;--edge-sh:#808080;--edge-dk:#000000;--field:inset -1px -1px var(--edge-hi),inset 1px 1px var(--edge-sh),inset -2px -2px var(--edge-lt),inset 2px 2px var(--edge-dk);--dither:var(--bg) repeating-conic-gradient(var(--edge-hi) 0 25%,var(--bg) 0 50%) 0 0/2px 2px;--scroll-track:var(--dither)}
+:root{--hx-face:var(--bg);--hx-ink:var(--ink);--hx-bevel-hi:var(--edge-hi);--hx-bevel-lt:var(--edge-lt);--hx-bevel-sh:var(--edge-sh);--hx-bevel-dk:var(--edge-dk);--hx-track:var(--bg);--hx-track-alt:var(--edge-hi);--hx-select-bg:#fff;--hx-select-ink:var(--ink);--hx-select-hl:#000080}
 input[type=range].trk{appearance:none;-webkit-appearance:none;width:110px;height:24px;margin:0;padding:0 0 6px;box-sizing:border-box;background:repeating-linear-gradient(90deg,var(--edge-dk) 0 1px,transparent 1px 10px) 5px 100%/101px 4px no-repeat}
 .val{display:inline-block;width:64px;min-width:40px;height:20px;line-height:16px;padding:2px 4px;text-align:right;background:#fff;box-shadow:var(--field);border:0;font:inherit;color:var(--ink)}
 .set .foot{flex:0 0 auto;display:flex;align-items:center;gap:6px;padding-top:6px}

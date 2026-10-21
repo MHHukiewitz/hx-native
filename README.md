@@ -4,6 +4,48 @@
 
 **Status:** requirements locked 2026-10-19 ([docs/REQUIREMENTS.md](docs/REQUIREMENTS.md)). Crate `hx-native` (lib `hx_native`) implements the Layer 1 headless engine (dialect, triggers, pending/`hx-sync`, `vello_cpu` paint). Mainnet G1 upload + chrome wiring are tracked separately in [issue #1](https://github.com/MHHukiewitz/hx-native/issues/1).
 
+## Engine-drawn controls
+
+hx-native draws a control only when Blitz cannot paint it at all: the range slider, the scrollbar and the `<select>` ▼ button and drop list. It carries no game-specific styling; theming belongs to your CSS. Every colour and size of these controls comes from the variables below, read as computed on the control (so inline styles, classes, inheritance and a runtime-swapped `<style>` all work). These are the only custom properties the engine reads. Unset, each one falls back to a neutral grey default.
+
+| Variable | Used for | Default |
+|---|---|---|
+| `--hx-face` | slider thumb, scrollbar buttons and thumb, select button | `#d4d4d4` |
+| `--hx-ink` | arrow glyphs, slider focus dots | `#000000` |
+| `--hx-bevel-hi` | outer light edge | `#ffffff` |
+| `--hx-bevel-lt` | inner light edge | `#e8e8e8` |
+| `--hx-bevel-sh` | inner shadow edge, select border (top / left) | `#8c8c8c` |
+| `--hx-bevel-dk` | outer dark edge | `#404040` |
+| `--hx-track` | scrollbar track | `#e8e8e8` |
+| `--hx-track-alt` | if set, the track is a 1 px checker of `--hx-track` and this (`none` = solid) | unset |
+| `--hx-select-bg` | select field and drop-list background, highlighted row text | `#ffffff` |
+| `--hx-select-ink` | select field and drop-list text | `#000000` |
+| `--hx-select-hl` | highlighted drop-list row | `#505050` |
+| `--hx-thumb-w` | slider thumb width | `11px` |
+| `--hx-groove-h` | slider groove height | `4px` |
+
+Map them from your own design tokens. Mainnet's Win95 look, for example:
+
+```css
+:root {
+  --hx-face: var(--bg);           /* #c0c0c0 */
+  --hx-ink: var(--ink);           /* #000 */
+  --hx-bevel-hi: var(--edge-hi);  /* #fff */
+  --hx-bevel-lt: var(--edge-lt);  /* #dfdfdf */
+  --hx-bevel-sh: var(--edge-sh);  /* #808080 */
+  --hx-bevel-dk: var(--edge-dk);  /* #000 */
+  --hx-track: var(--bg);
+  --hx-track-alt: var(--edge-hi); /* 1 px dither */
+  --hx-select-bg: #fff;
+  --hx-select-ink: var(--ink);
+  --hx-select-hl: #000080;
+  --hx-thumb-w: 11px;
+  --hx-groove-h: 4px;
+}
+```
+
+Everything else (text fields, buttons, checkboxes, borders, shadows, `text-align`) is plain CSS painted by Blitz; the engine only corrects two Blitz beta.4 bugs on single-line inputs so your computed CSS shows (`text-align` and the order of multiple inset `box-shadow`s). See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md), "Range slider and number fields (issue #35)".
+
 ## License
 
 Licensed under either of

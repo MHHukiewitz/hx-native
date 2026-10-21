@@ -1,12 +1,14 @@
-//! Engine-drawn Win95 range slider (issue #35).
+//! Engine-drawn range slider (issue #35); colours and sizes from `--hx-*`.
 //!
 //! Blitz `=0.3.0-beta.4` paints no track or thumb for `<input type=range>`
 //! (blitz-paint only draws checkbox / radio controls), and Stylo's servo
 //! selector parser rejects `::-webkit-slider-*`, so an author's slider CSS
-//! never applies. The look is fixed here instead: a sunken 4 px track across
-//! the content box and a raised 11×20 thumb placed from `value` / `min` /
-//! `max`, drawn over the Blitz raster after paint (like the #26 scrollbars and
-//! the #14 select face). Pseudo-element CSS is ignored by design.
+//! never applies. The engine draws the shape instead: a sunken groove across
+//! the content box and a raised thumb (content-box height) placed from
+//! `value` / `min` / `max`, over the Blitz raster after paint (like the #26
+//! scrollbars and the #14 select face). Colours come from the `--hx-*`
+//! variables, thumb width and groove height from `--hx-thumb-w` /
+//! `--hx-groove-h` (defaults 11 px / 4 px). Pseudo-element CSS is ignored.
 //!
 //! The value ↔ x mapping lives here too, so the pointer path and the painter
 //! can never disagree: the thumb's centre sits on the value, and a pointer x
@@ -19,15 +21,13 @@ use style::computed_values::visibility::T as Visibility;
 use crate::damage::{element_border_box_css, IntRect};
 use crate::form_args::{is_range_input, numeric_limits, parse_f64};
 use crate::form_controls::control_is_disabled;
-use crate::scroll::{ancestor_clip_css, intersect, palette_for, Canvas, Palette};
+use crate::scroll::{ancestor_clip_css, hx_px, intersect, palette_for, Canvas, Palette};
 use crate::select_ui::ControlRect;
 use crate::types::RgbaImage;
 
-/// Thumb width in CSS px (Win95 trackbar thumb).
+/// Default thumb width in CSS px (`--hx-thumb-w`).
 pub(crate) const THUMB_W: f32 = 11.0;
-/// Thumb height in CSS px.
-pub(crate) const THUMB_H: f32 = 20.0;
-/// Track (channel) height in CSS px.
+/// Default groove height in CSS px (`--hx-groove-h`).
 pub(crate) const TRACK_H: f32 = 4.0;
 
 /// UA rules: drop Blitz's empty input box under the engine-drawn slider and
@@ -64,10 +64,9 @@ pub(crate) struct SliderGeom {
     pub disabled: bool,
     /// Scroll-container clip (`None` = unclipped).
     pub clip: Option<ControlRect>,
-    /// Focused: Win95 dotted focus rectangle around the content box.
+    /// Focused: dotted focus rectangle around the content box.
     pub focused: bool,
-    /// Colours from the `--bg` / `--hi` / `--sh` / `--dk` / `--panel` /
-    /// `--ink` tokens computed on the input (Win95 defaults when missing).
+    /// Colours from the `--hx-*` variables computed on the input.
     pub pal: Palette,
 }
 
@@ -101,7 +100,7 @@ impl SliderGeom {
 
     /// Left edge of the thumb's travel and its length (CSS px).
     fn travel(&self) -> (f32, f32) {
-        (self.content.x, (self.content.w - THUMB_W).max(0.0))
+        (self.content.x, (self.content.w - self.thumb.w).max(0.0))
     }
 }
 
@@ -115,15 +114,19 @@ pub(crate) fn value_ratio(doc: &HtmlDocument, nid: NodeId) -> Option<f64> {
     let limits = numeric_limits(node);
     let min = limits.min.unwrap_or(0.0);
     let max = limits.max.unwrap_or(100.0).max(min);
-    let value = node
-        .attr(blitz_dom::local_name!("value"))
-        .and_then(parse_f64)
-        .filter(|v| v.is_finite())
-        .unwrap_or(min);
+    let value = range_value(node, &limits);
     if max - min <= 0.0 {
         return Some(0.0);
     }
     Some(((value - min) / (max - min)).clamp(0.0, 1.0))
+}
+
+/// A range's `value` attribute, or `min` when missing or unparseable.
+pub(crate) fn range_value(node: &blitz_dom::Node, limits: &crate::form_args::NumericLimits) -> f64 {
+    node.attr(blitz_dom::local_name!("value"))
+        .and_then(parse_f64)
+        .filter(|v| v.is_finite())
+        .unwrap_or(limits.min.unwrap_or(0.0))
 }
 
 /// Slider geometry for a rendered, visible range input.
@@ -149,21 +152,27 @@ pub(crate) fn slider_geometry(doc: &HtmlDocument, nid: NodeId) -> Option<SliderG
         h: (bh - b.top - b.bottom - p.top - p.bottom).max(0.0),
     };
     let ratio = value_ratio(doc, nid)? as f32;
-    let travel = (content.w - THUMB_W).max(0.0);
-    // Mock 34b (9fc61473) pads the box for its tick row, leaving an 18 px
-    // content box: the thumb fills the content height, at most 20 px.
-    let thumb_h = content.h.clamp(0.0, THUMB_H);
+    // Sizes come from CSS: the thumb is as tall as the content box (author
+    // height / padding), its width and the groove height are `--hx-thumb-w`
+    // and `--hx-groove-h` (defaults 11 px and 4 px).
+    let thumb_w = hx_px(doc, nid, "hx-thumb-w")
+        .unwrap_or(THUMB_W)
+        .min(content.w);
+    let groove_h = hx_px(doc, nid, "hx-groove-h")
+        .unwrap_or(TRACK_H)
+        .min(content.h);
+    let travel = (content.w - thumb_w).max(0.0);
     let thumb = ControlRect {
         x: content.x + (ratio * travel).round(),
-        y: content.y + ((content.h - thumb_h) / 2.0).round(),
-        w: THUMB_W,
-        h: thumb_h,
+        y: content.y,
+        w: thumb_w,
+        h: content.h,
     };
     let track = ControlRect {
         x: content.x,
-        y: content.y + ((content.h - TRACK_H) / 2.0).floor(),
+        y: content.y + ((content.h - groove_h) / 2.0).floor(),
         w: content.w,
-        h: TRACK_H,
+        h: groove_h,
     };
     Some(SliderGeom {
         nid,
@@ -204,14 +213,14 @@ pub(crate) fn ratio_for_x(g: &SliderGeom, x: f32, grab: f32) -> f64 {
     if travel <= 0.0 {
         return 0.0;
     }
-    (((x - grab) - left - THUMB_W / 2.0) / travel).clamp(0.0, 1.0) as f64
+    (((x - grab) - left - g.thumb.w / 2.0) / travel).clamp(0.0, 1.0) as f64
 }
 
 /// Pointer offset from the thumb centre when the press lands on the thumb
 /// (the thumb is grabbed in place), else 0 (the thumb jumps under the pointer).
 pub(crate) fn grab_offset(g: &SliderGeom, x: f32, y: f32) -> f32 {
     if g.thumb_contains(x, y) {
-        x - (g.thumb.x + THUMB_W / 2.0)
+        x - (g.thumb.x + g.thumb.w / 2.0)
     } else {
         0.0
     }
@@ -230,9 +239,9 @@ pub(crate) fn paint_sliders(doc: &HtmlDocument, frame: &mut RgbaImage, scale: f6
         }
         // Thumb: `--bg` face + `--raise`; disabled = dithered face.
         if g.disabled {
-            cv.checker(g.thumb);
+            cv.checker(g.thumb, g.pal.face, g.pal.hi);
         } else {
-            cv.fill(g.thumb, g.pal.bg);
+            cv.fill(g.thumb, g.pal.face);
         }
         cv.raise_bevel(g.thumb);
     }

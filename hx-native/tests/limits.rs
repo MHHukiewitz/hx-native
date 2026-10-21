@@ -348,8 +348,10 @@ fn drag_past_max_clamps_posted_args_to_slice_limit() {
     let mut frags = Frags::default();
     eng.sync(&slices, &mut frags).unwrap();
 
+    // Grab the thumb (value 5 of 0..10: centre at 5.5 + 0.5 × 189 ≈ 100);
+    // issue #35: a press on the groove would page instead of dragging.
     let _ = eng.input(InputEvent::PointerDown {
-        x: 10.0,
+        x: 100.0,
         y: 12.0,
         button: PointerButton::Primary,
         mods: Modifiers::default(),

@@ -1,9 +1,11 @@
-//! Issue #35: engine-drawn Win95 range slider, plus the typed number field's
+//! Issue #35: engine-drawn range slider, plus the typed number field's
 //! `text-align` and four-sided `--field` bevel.
 //!
 //! Blitz beta.4 paints no track or thumb for `<input type=range>` and drops
-//! `::-webkit-slider-*`; the engine draws a sunken 4 px track and a raised
-//! 11x20 thumb whose centre sits on the value. Range and number stay in sync
+//! `::-webkit-slider-*`; the engine draws a sunken groove and a raised thumb
+//! whose centre sits on the value. Every colour comes from the crate-owned
+//! `--hx-*` variables; [`HOST_MAP`] is the Win95 mapping a host such as
+//! Mainnet supplies in its own CSS (the engine itself has neutral defaults). Range and number stay in sync
 //! through the host (a `change` re-renders both), never inside the engine.
 
 use std::collections::HashMap;
@@ -15,12 +17,16 @@ const ACTIONS: &[&str] = &["set.d", "settings.set"];
 const WHITE: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
 const FACE: [u8; 4] = [0xC0, 0xC0, 0xC0, 0xFF];
 const SH: [u8; 4] = [0x80, 0x80, 0x80, 0xFF];
-/// `--edge-dk` Win95 literal (Mainnet `_tokens.css` 9fc61473).
+/// `--hx-bevel-dk` in [`HOST_MAP`].
 const DK: [u8; 4] = [0x00, 0x00, 0x00, 0xFF];
 const PANEL: [u8; 4] = [0xDF, 0xDF, 0xDF, 0xFF];
 /// The `FIELD` bevel's own dark colour (box-shadow literal, not a token).
 const FIELD_DK: [u8; 4] = [0x0A, 0x0A, 0x0A, 0xFF];
 const INK: [u8; 4] = [0x00, 0x00, 0x00, 0xFF];
+
+/// The host's `--hx-*` mapping (Win95 look; lives in host CSS, never in the
+/// engine). Every [`page`] carries it; [`page_bare`] does not.
+const HOST_MAP: &str = ":root{--hx-face:#c0c0c0;--hx-ink:#000;--hx-bevel-hi:#fff;--hx-bevel-lt:#dfdfdf;--hx-bevel-sh:#808080;--hx-bevel-dk:#000;--hx-track:#c0c0c0;--hx-track-alt:#fff;--hx-select-bg:#fff;--hx-select-ink:#000;--hx-select-hl:#000080}";
 
 const FIELD: &str = "box-shadow:inset -1px -1px #fff,inset 1px 1px #808080,inset -2px -2px #dfdfdf,inset 2px 2px #0a0a0a";
 
@@ -40,6 +46,11 @@ fn vp() -> Viewport {
 /// Page with a white body; `body` is raw markup. Sliders `.trk` are 111 px
 /// wide (100 px of thumb travel) at x = 20.
 fn page(css: &str, body: &str) -> String {
+    page_bare(&format!("{HOST_MAP}\n{css}"), body)
+}
+
+/// [`page`] without the host's `--hx-*` mapping: the engine defaults show.
+fn page_bare(css: &str, body: &str) -> String {
     format!(
         r#"<!DOCTYPE html><html><head><style>
 *{{margin:0;padding:0;box-sizing:border-box}}
@@ -239,18 +250,58 @@ fn drag_maps_to_a_stepped_value_and_a_thumb_press_grabs_in_place() {
 }
 
 #[test]
-fn track_click_lands_on_the_stepped_value_under_the_pointer() {
+fn a_groove_press_pages_one_block_toward_the_pointer_and_never_drags() {
+    // 0..100 step 10: block = max(10, tenth 10 snapped to 10) = 10.
     let mut eng = boot(&drag_page("0", ""));
-    // 63 % of the travel, away from the thumb (at 20..31).
+    // 63 % of the travel, right of the thumb (at 20..31): one page, no jump.
     let x = 20.0 + 5.5 + 63.0;
     let out = eng.input(down(x, 50.0));
     assert!(action(&out).is_none());
-    assert_eq!(value(&eng, "d"), "60");
-    let out = eng.input(up(x, 50.0));
+    assert_eq!(value(&eng, "d"), "10", "one block, not the pointer value");
+    // Moving the held pointer does not drag the thumb after a groove press.
+    let _ = eng.input(mv(x + 20.0, 50.0));
+    assert_eq!(value(&eng, "d"), "10", "a groove press never drags");
+    let out = eng.input(up(x + 20.0, 50.0));
     let (_, args, _) = action(&out).expect("one change on release");
-    assert_eq!(args, &[("d".to_string(), "60".to_string())]);
+    assert_eq!(args, &[("d".to_string(), "10".to_string())]);
+    settle(&mut eng, &out);
     let _ = frame(&mut eng);
-    assert_eq!(slider(&eng, "d").2 .0, 80.0, "thumb jumped to 60%");
+    assert_eq!(slider(&eng, "d").2 .0, 30.0, "thumb at 10%");
+    // A press left of the thumb pages back down.
+    let _ = eng.input(down(22.0, 50.0));
+    assert_eq!(value(&eng, "d"), "0");
+    let out = eng.input(up(22.0, 50.0));
+    assert_eq!(
+        action(&out).expect("change").1,
+        &[("d".to_string(), "0".to_string())]
+    );
+    settle(&mut eng, &out);
+    // At min, a press left of the thumb moves nothing and fires no change.
+    let _ = eng.input(down(20.0, 50.0));
+    let out = eng.input(up(20.0, 50.0));
+    assert!(action(&out).is_none(), "clamped page: no change");
+}
+
+#[test]
+fn the_page_block_is_a_tenth_of_the_range_snapped_to_the_step_but_at_least_one_step() {
+    for (step, expect) in [
+        ("3", ["9", "18"]),
+        ("30", ["30", "60"]),
+        ("0.5", ["10", "20"]),
+    ] {
+        let html = page(
+            "#d{top:40px}",
+            &format!(
+                r#"<input id="d" class="trk" type="range" min="0" max="100" step="{step}" value="0">"#
+            ),
+        );
+        let mut eng = boot(&html);
+        for want in expect {
+            let _ = eng.input(down(125.0, 50.0));
+            let _ = eng.input(up(125.0, 50.0));
+            assert_eq!(value(&eng, "d"), want, "step {step}");
+        }
+    }
 }
 
 #[test]
@@ -328,7 +379,8 @@ impl FragmentSource for Frags {
 
 #[test]
 fn slider_honours_the_issue16_limits_from_the_actions_slice() {
-    // Markup says 0..100 step 10; the slice says 2..8 step 2 and wins.
+    // Markup carries 0..100 step 10 (allowed since round 2); the slice says
+    // 2..8 step 2 and wins wherever both are present.
     let mut eng = boot(&drag_page("50", ""));
     let slices = Slices {
         versions: HashMap::from([("actions".into(), 1)]),
@@ -353,7 +405,9 @@ fn slider_honours_the_issue16_limits_from_the_actions_slice() {
         &[("d".to_string(), "2".to_string())]
     );
     settle(&mut eng, &out);
-    // A track click at 40% lands on the slice grid: 2 + 0.4 × 6 = 4.4 → 4.
+    // A groove press right of the thumb pages one slice block: the tenth
+    // (0.6) snaps to 0 steps, so the block is one slice step (2): 2 → 4.
+    // The markup's own step 10 would have given 10.
     let x = 20.0 + 5.5 + 40.0;
     let _ = eng.input(down(x, cy));
     let out = eng.input(up(x, cy));
@@ -614,18 +668,18 @@ fn assert_same(a: &RgbaImage, b: &RgbaImage, what: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// Look tokens (Mainnet `_tokens.css` 9fc61473): colours come from the
-// computed custom properties on the control, so a host swaps looks at runtime.
+// `--hx-*` variables: colours come from the computed custom properties on the
+// control, so a host swaps looks at runtime with plain CSS.
 
-/// A Win98-ish skin (every token set) or none (Win95 fallbacks), around a
-/// slider and an `overflow-y: scroll` container.
+/// A Win98-ish skin (every variable set) or none (the page's [`HOST_MAP`]),
+/// around a slider and an `overflow-y: scroll` container.
 fn skin_html(vars: &str) -> String {
     format!(
         r#"<div style="{vars}"><input id="r" class="trk" type="range" min="0" max="10" value="5" style="top:40px"><div id="sc" style="position:absolute;left:200px;top:10px;width:120px;height:80px;overflow-y:scroll"><div style="height:300px"></div></div></div>"#
     )
 }
 
-const SKIN: &str = "--bg:rgb(212, 208, 200);--edge-hi:#fefefe;--edge-lt:#e0e0e0;--edge-sh:#7f7f7f;--edge-dk:#404040;--ink:#102030;--scroll-track:#a0a0a0";
+const SKIN: &str = "--hx-face:rgb(212, 208, 200);--hx-bevel-hi:#fefefe;--hx-bevel-lt:#e0e0e0;--hx-bevel-sh:#7f7f7f;--hx-bevel-dk:#404040;--hx-ink:#102030;--hx-track:#a0a0a0;--hx-track-alt:none";
 
 #[test]
 fn look_tokens_colour_the_slider_and_bar_and_a_token_change_repaints() {
@@ -645,50 +699,62 @@ fn look_tokens_colour_the_slider_and_bar_and_a_token_change_repaints() {
     let skin_face = [212, 208, 200, 0xFF];
     let skin_dk = [0x40, 0x40, 0x40, 0xFF];
     // Slider: thumb (70..81 x 40..60) face, edges; groove rows.
-    assert_eq!(px(&img, 75.0, 50.0), skin_face, "thumb face = --bg");
+    assert_eq!(px(&img, 75.0, 50.0), skin_face, "thumb face = --hx-face");
     assert_eq!(
         px(&img, 70.0, 40.0),
         [0xFE, 0xFE, 0xFE, 0xFF],
-        "thumb --edge-hi"
+        "thumb --hx-bevel-hi"
     );
-    assert_eq!(px(&img, 80.0, 59.0), skin_dk, "thumb --edge-dk");
+    assert_eq!(px(&img, 80.0, 59.0), skin_dk, "thumb --hx-bevel-dk");
     assert_eq!(
         px(&img, 79.0, 58.0),
         [0x7F, 0x7F, 0x7F, 0xFF],
-        "thumb --edge-sh"
+        "thumb --hx-bevel-sh"
     );
     assert_eq!(
         px(&img, 71.0, 41.0),
         [0xE0, 0xE0, 0xE0, 0xFF],
-        "thumb --edge-lt"
+        "thumb --hx-bevel-lt"
     );
-    assert_eq!(px(&img, 100.0, 49.0), skin_dk, "groove row 2 = --edge-dk");
-    // Bar: x 304..320; up button 10..26, track solid --scroll-track.
-    assert_eq!(px(&img, 319.0, 25.0), skin_dk, "up button --edge-dk");
-    assert_eq!(px(&img, 308.0, 14.0), skin_face, "up button face = --bg");
+    assert_eq!(
+        px(&img, 100.0, 49.0),
+        skin_dk,
+        "groove row 2 = --hx-bevel-dk"
+    );
+    // Bar: x 304..320; up button 10..26, track solid --hx-track.
+    assert_eq!(px(&img, 319.0, 25.0), skin_dk, "up button --hx-bevel-dk");
+    assert_eq!(
+        px(&img, 308.0, 14.0),
+        skin_face,
+        "up button face = --hx-face"
+    );
     assert_eq!(
         px(&img, 310.0, 60.0),
         [0xA0, 0xA0, 0xA0, 0xFF],
-        "--scroll-track"
+        "--hx-track"
     );
     assert_eq!(
         px(&img, 311.0, 60.0),
         [0xA0, 0xA0, 0xA0, 0xFF],
-        "solid, no checker"
+        "--hx-track-alt: none = solid"
     );
 
-    // Host drops the skin: every token is missing → Win95 literals, repainted
+    // Host drops the skin: the :root mapping applies again, repainted
     // on a partial frame that equals a full repaint.
     *slices.versions.get_mut("settings").unwrap() += 1;
     frags.bodies.insert("sec-skin".into(), skin_html(""));
     eng.sync(&slices, &mut frags).expect("sync");
     let partial = frame(&mut eng);
-    assert_eq!(px(&partial, 75.0, 50.0), FACE, "thumb face fallback");
-    assert_eq!(px(&partial, 80.0, 59.0), DK, "--edge-dk fallback #000");
-    assert_eq!(px(&partial, 70.0, 40.0), WHITE, "--edge-hi fallback");
-    assert_eq!(px(&partial, 71.0, 41.0), PANEL, "--edge-lt fallback");
-    assert_eq!(px(&partial, 319.0, 25.0), DK, "bar --edge-dk fallback");
-    // Track fallback: the 1 px --bg / --edge-hi checker.
+    assert_eq!(px(&partial, 75.0, 50.0), FACE, "thumb face from :root");
+    assert_eq!(px(&partial, 80.0, 59.0), DK, "--hx-bevel-dk from :root");
+    assert_eq!(px(&partial, 70.0, 40.0), WHITE, "--hx-bevel-hi from :root");
+    assert_eq!(px(&partial, 71.0, 41.0), PANEL, "--hx-bevel-lt from :root");
+    assert_eq!(
+        px(&partial, 319.0, 25.0),
+        DK,
+        "bar --hx-bevel-dk from :root"
+    );
+    // :root sets --hx-track-alt: the 1 px --hx-track / --hx-track-alt checker.
     let (a, b) = (px(&partial, 310.0, 60.0), px(&partial, 311.0, 60.0));
     assert!(
         (a == FACE && b == WHITE) || (a == WHITE && b == FACE),
@@ -700,8 +766,8 @@ fn look_tokens_colour_the_slider_and_bar_and_a_token_change_repaints() {
 
 #[test]
 fn a_swapped_theme_stylesheet_repaints_slider_and_bar_without_touching_them() {
-    // The look swap a host would do at runtime: only a `<style>` with the
-    // `:root` tokens is swapped; the slider and scroller nodes are untouched.
+    // The look swap a host would do at runtime: only a `<style>` overriding
+    // the `:root` `--hx-*` variables is swapped; the slider and scroller nodes are untouched.
     let html = page(
         "",
         r##"<section id="sec-theme" hx-trigger="slice:settings" hx-target="#theme" hx-swap="innerHTML"><div id="theme"></div></section><input id="r" class="trk" type="range" min="0" max="10" value="5" style="top:40px"><div id="sc" style="position:absolute;left:200px;top:10px;width:120px;height:80px;overflow-y:scroll"><div style="height:300px"></div></div>"##,
@@ -711,7 +777,7 @@ fn a_swapped_theme_stylesheet_repaints_slider_and_bar_without_touching_them() {
     assert_eq!(
         px(&img, 75.0, 50.0),
         FACE,
-        "Win95 fallback before the theme"
+        "page :root mapping before the theme"
     );
     assert_eq!(px(&img, 319.0, 25.0), DK);
     let mut slices = Slices {
@@ -747,7 +813,7 @@ fn a_swapped_theme_stylesheet_repaints_slider_and_bar_without_touching_them() {
     );
     let full = full_frame(&mut eng);
     assert_same(&partial, &full, "theme swap partial == full");
-    // And back: the theme is removed, the Win95 literals return.
+    // And back: the theme is removed, the page's mapping returns.
     *slices.versions.get_mut("settings").unwrap() += 1;
     frags.bodies.insert("sec-theme".into(), String::new());
     eng.sync(&slices, &mut frags).expect("sync");
@@ -845,7 +911,7 @@ fn mock34b_fixture_draws_every_slider_beside_a_real_value_field() {
     assert_eq!(
         px(&img, thumb.0 + 10.0, thumb.1 + 17.0),
         DK,
-        "thumb --edge-dk"
+        "thumb --hx-bevel-dk"
     );
     // The mock's own tick row (author background, painted by Blitz) stays,
     // in the 4 px under the content box.
@@ -878,4 +944,103 @@ fn mock34b_fixture_draws_every_slider_beside_a_real_value_field() {
     eng.mark_theme_or_stylesheet_changed();
     let full = eng.paint(vp34()).unwrap().rgba.expect("full");
     assert_same(&partial, &full, "mock 34b slider drag partial == full");
+}
+
+// ---------------------------------------------------------------------------
+// Neutral engine defaults and the `<select>` dropdown.
+
+const SELECT_HTML: &str = r#"<select id="sel" name="s" style="position:absolute;left:20px;top:120px;width:120px;height:22px"><option value="a" selected="">Alpha</option><option value="b">Beta</option></select>"#;
+
+#[test]
+fn without_host_variables_every_engine_drawn_control_uses_the_neutral_greys() {
+    let html = page_bare("", &format!(r#"{}{SELECT_HTML}"#, skin_html("")));
+    let mut eng = boot(&html);
+    let img = frame(&mut eng);
+    let face = [0xD4, 0xD4, 0xD4, 0xFF];
+    let dk = [0x40, 0x40, 0x40, 0xFF];
+    let sh = [0x8C, 0x8C, 0x8C, 0xFF];
+    assert_eq!(px(&img, 75.0, 50.0), face, "thumb face default");
+    assert_eq!(px(&img, 80.0, 59.0), dk, "thumb dk default");
+    assert_eq!(px(&img, 70.0, 40.0), WHITE, "thumb hi default");
+    assert_eq!(px(&img, 319.0, 25.0), dk, "bar dk default");
+    assert_eq!(px(&img, 308.0, 14.0), face, "bar face default");
+    let track = [0xE8, 0xE8, 0xE8, 0xFF];
+    assert_eq!(px(&img, 310.0, 60.0), track, "solid track default");
+    assert_eq!(
+        px(&img, 311.0, 60.0),
+        track,
+        "no checker without --hx-track-alt"
+    );
+    assert_eq!(px(&img, 126.0, 124.0), face, "select button face default");
+    assert_eq!(
+        px(&img, 20.0, 130.0),
+        sh,
+        "select UA border = --hx-bevel-sh default"
+    );
+}
+
+#[test]
+fn overriding_hx_variables_recolours_the_select_button_and_open_list() {
+    let html = page(
+        "",
+        &format!(
+            r##"<section id="sec-theme" hx-trigger="slice:settings" hx-target="#theme" hx-swap="innerHTML"><div id="theme"></div></section>{SELECT_HTML}"##
+        ),
+    );
+    let mut eng = boot(&html);
+    let img = frame(&mut eng);
+    assert_eq!(px(&img, 126.0, 124.0), FACE, "button --hx-face from :root");
+    assert_eq!(
+        px(&img, 20.0, 130.0),
+        SH,
+        "UA border --hx-bevel-sh from :root"
+    );
+    // Open the list (focus + Alt+ArrowDown): row 0 highlighted, row 1 plain.
+    eng.test_set_focus("sel");
+    let _ = eng.input(key_mods(
+        "ArrowDown",
+        Modifiers {
+            alt: true,
+            ..Default::default()
+        },
+    ));
+    let img = frame(&mut eng);
+    let navy = [0x00, 0x00, 0x80, 0xFF];
+    assert_eq!(px(&img, 136.0, 150.0), navy, "highlight --hx-select-hl");
+    assert_eq!(px(&img, 136.0, 170.0), WHITE, "row --hx-select-bg");
+
+    // Runtime theme swap: only a `<style>` overriding the variables.
+    let slices = Slices {
+        versions: HashMap::from([("settings".into(), 1)]),
+        limits: Vec::new(),
+    };
+    let mut frags = Frags::default();
+    frags.bodies.insert(
+        "sec-theme".into(),
+        "<style>:root{--hx-face:#d4d0c8;--hx-select-hl:#3a6ea5;--hx-select-bg:#ffffe0;--hx-bevel-sh:#7f7f7f}</style>".into(),
+    );
+    eng.sync(&slices, &mut frags).expect("sync");
+    let partial = frame(&mut eng);
+    assert_eq!(
+        px(&partial, 126.0, 124.0),
+        [0xD4, 0xD0, 0xC8, 0xFF],
+        "button face follows --hx-face"
+    );
+    assert_eq!(
+        px(&partial, 136.0, 150.0),
+        [0x3A, 0x6E, 0xA5, 0xFF],
+        "highlight follows --hx-select-hl"
+    );
+    assert_eq!(
+        px(&partial, 136.0, 170.0),
+        [0xFF, 0xFF, 0xE0, 0xFF],
+        "row follows --hx-select-bg"
+    );
+    assert_eq!(
+        px(&partial, 20.0, 130.0),
+        [0x7F, 0x7F, 0x7F, 0xFF],
+        "UA border follows --hx-bevel-sh"
+    );
+    let full = full_frame(&mut eng);
+    assert_same(&partial, &full, "select theme swap partial == full");
 }

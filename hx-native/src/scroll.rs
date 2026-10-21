@@ -4,9 +4,9 @@
 //! its paint, hit testing and our damage geometry already translate by it.
 //! hx-native owns everything around it: which container a wheel / key /
 //! scrollbar press moves, clamping after layout, keeping an offset by element
-//! id across fragment swaps, and the engine-drawn Win95 scrollbar (Blitz's
+//! id across fragment swaps, and the engine-drawn classic scrollbar (Blitz's
 //! own overlay thumb is behind the `scrollbars` feature, which stays off: it
-//! fades on a wall-clock timer and is not the Win95 look).
+//! fades on a wall-clock timer and is not the classic look).
 //!
 //! The engine also reserves the 16 px scrollbar gutter (Blitz beta.4 layout
 //! hard-codes Taffy's `scrollbar_width` to 0): see [`gutter_css`] and
@@ -25,69 +25,100 @@ use crate::types::{RgbaImage, SCROLLBAR_WIDTH_PX, SCROLL_ROW_PX};
 /// Minimum thumb length in CSS px (HTML_CONTRACT §4).
 pub(crate) const THUMB_MIN_PX: f32 = 8.0;
 
-/// Win95 literals from Mainnet `_tokens.css` 9fc61473 (look-token fallbacks).
-pub(crate) const BG: [u8; 4] = [0xC0, 0xC0, 0xC0, 0xFF];
-pub(crate) const HI: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
-pub(crate) const SH: [u8; 4] = [0x80, 0x80, 0x80, 0xFF];
-pub(crate) const EDGE_DK: [u8; 4] = [0x00, 0x00, 0x00, 0xFF];
-pub(crate) const PANEL: [u8; 4] = [0xDF, 0xDF, 0xDF, 0xFF];
+/// Neutral defaults for the `--hx-*` control variables (issue #35). They are
+/// plain documented greys, not any game's look: a host themes engine-drawn
+/// controls only through its own CSS (README "Engine-drawn controls").
+pub(crate) const FACE: [u8; 4] = [0xD4, 0xD4, 0xD4, 0xFF];
+pub(crate) const BEVEL_HI: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
+pub(crate) const BEVEL_LT: [u8; 4] = [0xE8, 0xE8, 0xE8, 0xFF];
+pub(crate) const BEVEL_SH: [u8; 4] = [0x8C, 0x8C, 0x8C, 0xFF];
+pub(crate) const BEVEL_DK: [u8; 4] = [0x40, 0x40, 0x40, 0xFF];
 pub(crate) const INK: [u8; 4] = [0x00, 0x00, 0x00, 0xFF];
+pub(crate) const TRACK: [u8; 4] = [0xE8, 0xE8, 0xE8, 0xFF];
+pub(crate) const SELECT_BG: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
+pub(crate) const SELECT_HL: [u8; 4] = [0x50, 0x50, 0x50, 0xFF];
 
-/// Win95 chrome colours for engine-drawn controls (scrollbar, slider),
-/// read from the Mainnet `_tokens.css` look tokens (9fc61473) as computed on
-/// the control (issue #35): `--bg` face, `--edge-hi` highlight, `--edge-lt`
-/// 3D light, `--edge-sh` shadow, `--edge-dk` dark shadow, `--ink` glyphs and
-/// focus dots, `--scroll-track` the scrollbar track. A missing or
-/// unparseable token falls back to the Win95 literal, so a host swaps Win
-/// 3.1 / 95 / 98 looks at runtime by changing the tokens.
+/// Colours of engine-drawn controls (slider, scrollbar, `<select>` button and
+/// list), from the crate-owned `--hx-*` custom properties as computed on the
+/// control (stylo `ComputedValues::custom_properties`, `var()` substituted).
+/// hx-native reads no other custom property names. A missing or unparseable
+/// variable gives the neutral default above.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Palette {
-    pub bg: [u8; 4],
+    /// `--hx-face`: thumb, scrollbar buttons and thumb, select button.
+    pub face: [u8; 4],
+    /// `--hx-bevel-hi` / `-lt` / `-sh` / `-dk`: outer light, inner light,
+    /// inner shadow, outer shadow of raised / sunken edges.
     pub hi: [u8; 4],
     pub lt: [u8; 4],
     pub sh: [u8; 4],
     pub dk: [u8; 4],
+    /// `--hx-ink`: arrow glyphs, focus dots.
     pub ink: [u8; 4],
-    /// `--scroll-track`: `None` = the Win95 1 px face / highlight checker
-    /// (also when the token is the `--dither` background, not a colour).
-    pub track: Option<[u8; 4]>,
+    /// `--hx-track`: scrollbar track.
+    pub track: [u8; 4],
+    /// `--hx-track-alt`: when set, the track is a 1 px checker of
+    /// `--hx-track` and this colour; unset = solid `--hx-track`.
+    pub track_alt: Option<[u8; 4]>,
+    /// `--hx-select-bg` / `--hx-select-ink`: open list rows; `--hx-select-hl`:
+    /// highlighted row (its text is `--hx-select-bg`).
+    pub select_bg: [u8; 4],
+    pub select_ink: [u8; 4],
+    pub select_hl: [u8; 4],
 }
 
 impl Default for Palette {
     fn default() -> Self {
         Self {
-            bg: BG,
-            hi: HI,
-            lt: PANEL,
-            sh: SH,
-            dk: EDGE_DK,
+            face: FACE,
+            hi: BEVEL_HI,
+            lt: BEVEL_LT,
+            sh: BEVEL_SH,
+            dk: BEVEL_DK,
             ink: INK,
-            track: None,
+            track: TRACK,
+            track_alt: None,
+            select_bg: SELECT_BG,
+            select_ink: INK,
+            select_hl: SELECT_HL,
         }
     }
 }
 
-/// The palette from `nid`'s computed custom properties (stylo
-/// `ComputedValues::custom_properties`, `var()` already substituted).
-pub(crate) fn palette_for(doc: &HtmlDocument, nid: NodeId) -> Palette {
-    let mut pal = Palette::default();
-    let Some(style) = doc.get_node(nid).and_then(|n| n.primary_styles()) else {
-        return pal;
-    };
+/// A computed `--hx-*` custom property on `nid`, as its CSS text.
+pub(crate) fn hx_var(doc: &HtmlDocument, nid: NodeId, name: &str) -> Option<String> {
+    let style = doc.get_node(nid)?.primary_styles()?;
     let props = style.custom_properties();
-    let token = |name: &str| -> Option<[u8; 4]> {
-        props
-            .get_for_cssom(&style::Atom::from(name))
-            .and_then(|v| parse_css_color(&v.to_variable_value().css))
-    };
-    pal.bg = token("bg").unwrap_or(pal.bg);
-    pal.hi = token("edge-hi").unwrap_or(pal.hi);
-    pal.lt = token("edge-lt").unwrap_or(pal.lt);
-    pal.sh = token("edge-sh").unwrap_or(pal.sh);
-    pal.dk = token("edge-dk").unwrap_or(pal.dk);
-    pal.ink = token("ink").unwrap_or(pal.ink);
-    pal.track = token("scroll-track");
-    pal
+    props
+        .get_for_cssom(&style::Atom::from(name))
+        .map(|v| v.to_variable_value().css.clone())
+}
+
+/// A `--hx-*` length in CSS px (`<n>px` or a bare number), if positive.
+pub(crate) fn hx_px(doc: &HtmlDocument, nid: NodeId, name: &str) -> Option<f32> {
+    let t = hx_var(doc, nid, name)?;
+    let t = t.trim();
+    let n = t.strip_suffix("px").unwrap_or(t).trim();
+    n.parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0)
+}
+
+/// The palette from `nid`'s `--hx-*` variables.
+pub(crate) fn palette_for(doc: &HtmlDocument, nid: NodeId) -> Palette {
+    let d = Palette::default();
+    let c = |name: &str| hx_var(doc, nid, name).and_then(|t| parse_css_color(&t));
+    Palette {
+        face: c("hx-face").unwrap_or(d.face),
+        hi: c("hx-bevel-hi").unwrap_or(d.hi),
+        lt: c("hx-bevel-lt").unwrap_or(d.lt),
+        sh: c("hx-bevel-sh").unwrap_or(d.sh),
+        dk: c("hx-bevel-dk").unwrap_or(d.dk),
+        ink: c("hx-ink").unwrap_or(d.ink),
+        track: c("hx-track").unwrap_or(d.track),
+        track_alt: c("hx-track-alt"),
+        select_bg: c("hx-select-bg").unwrap_or(d.select_bg),
+        select_ink: c("hx-select-ink").unwrap_or(d.select_ink),
+        select_hl: c("hx-select-hl").unwrap_or(d.select_hl),
+    }
 }
 
 /// Opaque sRGB from a token value: `#rgb`, `#rrggbb`, `#rgba`, `#rrggbbaa`,
@@ -382,7 +413,7 @@ pub(crate) enum BarPart {
     Thumb,
 }
 
-/// Win95 scrollbar geometry for one container, CSS document px.
+/// Classic scrollbar geometry for one container, CSS document px.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub(crate) struct BarGeom {
     pub nid: NodeId,
@@ -608,15 +639,15 @@ pub(crate) fn paint_scrollbars(
         let mut cv = Canvas::new(frame, scale, g.clip, g.pal);
         let pal = g.pal;
         let enabled = g.thumb.is_some();
-        // Track: 1 px checker of --bg and --hi, phase from the track origin
-        // (`repeating-conic-gradient(#fff 0 25%, #c0c0c0 0 50%) 0 0/2px 2px`).
-        match pal.track {
-            Some(c) => cv.fill(g.track, c),
-            None => cv.checker(g.track),
+        // Track: solid `--hx-track`, or a 1 px checker of `--hx-track` and
+        // `--hx-track-alt` (phase from the track origin) when that is set.
+        match pal.track_alt {
+            Some(alt) => cv.checker(g.track, pal.track, alt),
+            None => cv.fill(g.track, pal.track),
         }
         for (part, rect) in [(BarPart::Up, g.up), (BarPart::Down, g.down)] {
             let is_pressed = pressed.is_some_and(|p| p.nid == g.nid && p.part == part);
-            cv.fill(rect, pal.bg);
+            cv.fill(rect, pal.face);
             if is_pressed {
                 cv.press_bevel(rect);
             } else {
@@ -627,13 +658,13 @@ pub(crate) fn paint_scrollbars(
             if enabled {
                 cv.arrow(rect, up, shift, pal.ink);
             } else {
-                // Win95 disabled glyph: grey with a white emboss.
+                // Classic disabled glyph: grey with a white emboss.
                 cv.arrow(rect, up, 1.0, pal.hi);
                 cv.arrow(rect, up, 0.0, pal.sh);
             }
         }
         if let Some(t) = g.thumb {
-            cv.fill(t, pal.bg);
+            cv.fill(t, pal.face);
             cv.raise_bevel(t);
         }
     }
@@ -704,17 +735,14 @@ impl<'a> Canvas<'a> {
         }
     }
 
-    pub(crate) fn checker(&mut self, r: ControlRect) {
+    /// 1 px checker of `a` (even) and `b` (odd), phase from `r`'s origin.
+    pub(crate) fn checker(&mut self, r: ControlRect, a: [u8; 4], b: [u8; 4]) {
         let d = self.device(r);
         for y in d.y..d.y + d.h {
             for x in d.x..d.x + d.w {
                 let lx = ((x as f64 + 0.5) / self.scale - r.x as f64).floor() as i64;
                 let ly = ((y as f64 + 0.5) / self.scale - r.y as f64).floor() as i64;
-                let c = if (lx + ly).rem_euclid(2) == 1 {
-                    self.pal.hi
-                } else {
-                    self.pal.bg
-                };
+                let c = if (lx + ly).rem_euclid(2) == 1 { b } else { a };
                 self.put(x, y, c);
             }
         }
@@ -786,7 +814,7 @@ impl<'a> Canvas<'a> {
         self.right(r, 1.0, self.pal.hi);
     }
 
-    /// Win95 focus rectangle: 1 device px dotted line (every other pixel,
+    /// Classic focus rectangle: 1 device px dotted line (every other pixel,
     /// phase from the rect origin) along the edges of `r`, in `--ink`.
     pub(crate) fn dotted_rect(&mut self, r: ControlRect) {
         let d = self.device(r);
@@ -809,7 +837,7 @@ impl<'a> Canvas<'a> {
         }
     }
 
-    /// Win95 arrow glyph: 4 rows of 1/3/5/7 px, centred in a 16x16 button.
+    /// Classic arrow glyph: 4 rows of 1/3/5/7 px, centred in a 16x16 button.
     pub(crate) fn arrow(&mut self, r: ControlRect, up: bool, shift: f32, c: [u8; 4]) {
         let cx = (r.x + (r.w / 2.0).floor() - 1.0 + shift).floor();
         let top = (r.y + (r.h / 2.0).floor() - 2.0 + shift).floor();
