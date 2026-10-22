@@ -1,6 +1,8 @@
 # Test fonts (issue #28)
 
-`DejaVuSans-Bold.ttf` is DejaVu Sans Bold from the upstream DejaVu 2.37
+DejaVu Sans Bold moved to `assets/fonts/DejaVuSans-Bold.ttf` in issue #56:
+it is now bundled into the library as the fallback bold face. It is DejaVu
+Sans Bold from the upstream DejaVu 2.37
 release (`dejavu-fonts-ttf-2.37.tar.bz2`,
 https://github.com/dejavu-fonts/dejavu-fonts/releases/tag/version_2_37),
 unmodified. sha256:
@@ -8,8 +10,8 @@ unmodified. sha256:
 
 It is under the same Bitstream Vera / DejaVu licence as the bundled
 `assets/fonts/DejaVuSans.ttf` (see `LICENSE-DejaVu.txt` here, the upstream
-`LICENSE` file, and `assets/fonts/LICENSE-DejaVu.txt`). It is used only by
-the crate's tests and is not compiled into the library.
+`LICENSE` file, and `assets/fonts/LICENSE-DejaVu.txt`). The tests keep
+using it from `assets/fonts/` as a host face.
 
 `DejaVuSans-subset-collection1.woff2` (5628 bytes) is a WOFF2-compressed
 one-face TrueType collection (`ttcf`) made from the bundled
