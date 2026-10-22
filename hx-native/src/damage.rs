@@ -499,6 +499,32 @@ pub(crate) fn collect_style_damaged(doc: &HtmlDocument) -> Vec<NodeId> {
     out
 }
 
+/// The nearest ancestor of an inline-flow element that is not itself inline
+/// (the block whose inline layout, or anonymous block, paints the element's
+/// text) and has bounds in `snapshot`. `None` for a non-inline element.
+fn inline_layout_host(
+    doc: &HtmlDocument,
+    nid: NodeId,
+    snapshot: &BoundsSnapshot,
+) -> Option<NodeId> {
+    let is_inline = |id: NodeId| {
+        doc.get_node(id)
+            .and_then(|n| n.primary_styles())
+            .is_some_and(|s| s.get_box().clone_display().is_inline_flow())
+    };
+    if !is_inline(nid) {
+        return None;
+    }
+    let mut cur = doc.get_node(nid)?.parent;
+    while let Some(id) = cur {
+        if !is_inline(id) && snapshot.contains_key(&id) {
+            return Some(id);
+        }
+        cur = doc.get_node(id)?.parent;
+    }
+    None
+}
+
 fn own_changed(a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)) -> bool {
     const EPS: f64 = 0.01;
     (a.0 - b.0).abs() > EPS
@@ -519,10 +545,21 @@ pub(crate) fn compute_raw_damage(
     previous: &BoundsSnapshot,
     style_damaged: &[NodeId],
 ) -> Vec<IntRect> {
-    let style_set: std::collections::HashSet<NodeId> = style_damaged.iter().copied().collect();
+    let mut style_set: std::collections::HashSet<NodeId> = style_damaged.iter().copied().collect();
     let mut rects: Vec<IntRect> = Vec::new();
 
     let current = snapshot_bounds(doc, scale);
+
+    // An inline element (`<a>` in a `<p>`) has no box of its own: its text is
+    // laid out and painted by the block that holds the inline layout (the
+    // paragraph, or an anonymous block of its container). Restyling it (a
+    // colour or `text-shadow` change from greying) must damage that block's
+    // ink, before and after, or the old pixels stay (#60 review, P7/P10/P15).
+    let hosts: Vec<NodeId> = style_set
+        .iter()
+        .filter_map(|&nid| inline_layout_host(doc, nid, &current))
+        .collect();
+    style_set.extend(hosts);
 
     // Disappeared nodes: old ink.
     for (nid, prev) in previous {
