@@ -416,7 +416,7 @@ pub enum WheelUnit {
 pub const SCROLL_ROW_PX: f32 = 20.0;
 /// Rows per wheel line (browsers scroll about three lines per notch).
 pub const SCROLL_LINE_ROWS: f32 = 3.0;
-/// Width of the engine-drawn Win95 scrollbar in CSS px (HTML_CONTRACT §4).
+/// Width of the engine-drawn scrollbar in CSS px (HTML_CONTRACT §4).
 pub const SCROLLBAR_WIDTH_PX: f32 = 16.0;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

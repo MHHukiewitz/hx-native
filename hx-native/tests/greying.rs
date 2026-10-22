@@ -159,10 +159,12 @@ fn drag(eng: &mut Engine, from: (f32, f32), to: (f32, f32)) -> InputOutcome {
     })
 }
 
-/// x for `value` on a range track spanning `min..=max` (box left + ratio*width).
+/// x for `value` on a range spanning `min..=max`: the thumb centre on the
+/// engine-drawn slider (issue #35), which travels `width - 11` px between
+/// half-thumb insets.
 fn range_x_for(eng: &Engine, id: &str, value: f64, min: f64, max: f64) -> f32 {
     let (bx, _, bw, _) = eng.test_element_box(id).unwrap();
-    bx + ((value - min) / (max - min)) as f32 * bw
+    bx + 5.5 + ((value - min) / (max - min)) as f32 * (bw - 11.0)
 }
 
 fn range_y(eng: &Engine, id: &str) -> f32 {
