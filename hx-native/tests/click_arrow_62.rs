@@ -196,7 +196,12 @@ const TABLE: &[(&str, &str, &str, &str, bool, &str)] = &[
 
 /// The acceptance table: from a typed, uncommitted value, keyboard
 /// (ArrowUp/Down, then Enter) and click (▲/▼) give the same committed value
-/// and exactly one `change`, carrying that value.
+/// and exactly one `change`, carrying that value, unless that value is the
+/// one already sent (the committed start). Designer, HTML_CONTRACT §2
+/// Ruling 5 (Mainnet b6f2c892, hx-native #81): the box's value is compared
+/// with the last value sent, not with the typed text, so "on grid ▼" (typed
+/// `3` ▼ to the sent `2`) and "fee off grid ▼" (typed `4.105` ▼ to the sent
+/// `4.1`) send nothing on either path. Before that ruling every row sent one.
 #[test]
 fn keyboard_and_click_agree_from_typed_values() {
     println!("| case | typed | want | keyboard | click | changes (key / click) |");
@@ -212,8 +217,13 @@ fn keyboard_and_click_agree_from_typed_values() {
         );
         assert_eq!(k.value.as_deref(), Some(*want), "keyboard {name}");
         assert_eq!(c.value.as_deref(), Some(*want), "click {name}");
-        assert_eq!(k.changes, vec![want.to_string()], "keyboard change {name}");
-        assert_eq!(c.changes, vec![want.to_string()], "click change {name}");
+        let sends: Vec<String> = if want == start {
+            vec![]
+        } else {
+            vec![want.to_string()]
+        };
+        assert_eq!(k.changes, sends, "keyboard change {name}");
+        assert_eq!(c.changes, sends, "click change {name}");
     }
 }
 
@@ -221,11 +231,14 @@ fn keyboard_and_click_agree_from_typed_values() {
 /// focused with its raw editable text; leaving the box then shows the
 /// unfocused display of the committed value, with no second `change`.
 /// Before #81 the click blurred, so the display was checked right away.
+/// The fee row ends on the sent `4.1`, so it sends nothing (Ruling 5,
+/// Mainnet b6f2c892; before that ruling it sent `4.1`).
 #[test]
 fn click_commit_shows_the_unfocused_display() {
+    let fee_sends: &[&str] = &[];
     for (attrs, start, typed, up, raw, shown, want) in [
-        (GROUPED, "2", "1234.5", true, "1235", "1,235", "1235"),
-        (FEE, "4.1", "4.105", false, "4.10", "4.10", "4.1"),
+        (GROUPED, "2", "1234.5", true, "1235", "1,235", &["1235"][..]),
+        (FEE, "4.1", "4.105", false, "4.10", "4.10", fee_sends),
     ] {
         let mut e = boot(attrs, start, PaintMode::Exact);
         let mut ch = Vec::new();
@@ -235,7 +248,7 @@ fn click_commit_shows_the_unfocused_display() {
         assert_eq!(e.test_editor_display("n").as_deref(), Some(raw));
         click(&mut e, 10.0, 46.0, &mut ch);
         assert_eq!(e.test_editor_display("n").as_deref(), Some(shown));
-        assert_eq!(ch, [want]);
+        assert_eq!(ch, want);
     }
 }
 

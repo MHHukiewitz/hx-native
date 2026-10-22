@@ -223,6 +223,7 @@ fn g2_decimals_and_step_any() {
         ("term", "0", true, "1", "1"),
     ] {
         let mut e = boot(1.0);
+        let sent = val(&e, id);
         let mut ch = vec![];
         type_in(&mut e, id, typed, &mut ch);
         arrow(&mut e, id, up, &mut ch);
@@ -238,7 +239,15 @@ fn g2_decimals_and_step_any() {
             val(&e, id)
         );
         assert_eq!(val(&e, id), want, "{id} {typed}");
-        assert_eq!(ch, vec![c(id, want)], "{id} {typed}");
+        // Ruling 5 (Mainnet b6f2c892, #81): ending on the sent value sends
+        // nothing (fee typed `6.125` ▼ to the sent `6.12`); before that
+        // ruling every row sent one `change`.
+        let sends = if want == sent {
+            vec![]
+        } else {
+            vec![c(id, want)]
+        };
+        assert_eq!(ch, sends, "{id} {typed}");
         assert_eq!(disp.as_deref(), Some(shown), "{id} {typed} shown");
     }
 }

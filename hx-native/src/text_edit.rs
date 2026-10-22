@@ -852,22 +852,6 @@ pub fn step_and_regroup(doc: &mut HtmlDocument, nid: NodeId, dir: i32) -> bool {
     changed
 }
 
-/// Issue #81 Q4: true when one more `dir` step would leave the number box
-/// where it is, because min or max (the step grid's last point inside them)
-/// holds it there.
-pub fn number_held_at_limit(doc: &HtmlDocument, nid: NodeId, dir: i32) -> bool {
-    use crate::form_args::step_precise;
-
-    let Some(node) = doc.get_node(nid) else {
-        return false;
-    };
-    let limits = numeric_limits(node);
-    let Some(current) = attr(node, "value").and_then(|s| parse_f64(&s)) else {
-        return false;
-    };
-    format_numeric(step_precise(current, dir, &limits)) == format_numeric(current)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

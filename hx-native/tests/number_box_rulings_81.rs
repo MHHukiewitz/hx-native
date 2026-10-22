@@ -15,6 +15,8 @@
 //!    has sends no `change` (Q4). A host that forwards key releases
 //!    (`EngineConfig::key_releases`) gets one `change` on key release and
 //!    none on keydown (Q1); a host without them still gets one.
+//! 7. (Ruling 5, Mainnet master b6f2c892) Generally: an arrow interaction
+//!    that ends on the last value sent sends no `change`, limit or not.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -626,6 +628,77 @@ fn step_back_onto_the_reported_limit_sends_no_change() {
         assert_eq!(val(&e), "0");
         assert!(ch.is_empty(), "key_releases={key_releases}: {ch:?}");
     }
+}
+
+/// Ruling 5 (Mainnet b6f2c892): the box's value is compared with the last
+/// value sent, not with the typed text, on every path that ends an arrow
+/// interaction, limit or not: typed `3` (or `4`) over the sent `2`, stepped
+/// back to `2`, sends nothing.
+#[test]
+fn ending_on_the_sent_value_sends_nothing_on_every_arrow_path() {
+    // Mouse press (click).
+    let mut e = boot(WHOLE, "2");
+    let mut ch = Vec::new();
+    type_into(&mut e, "3", &mut ch);
+    click(&mut e, DOWN, &mut ch);
+    assert_eq!(val(&e), "2");
+    assert!(ch.is_empty(), "click: {ch:?}");
+    // Press released off the arrow (Q3).
+    let mut e = boot(WHOLE, "2");
+    let mut ch = Vec::new();
+    type_into(&mut e, "3", &mut ch);
+    down(&mut e, DOWN, &mut ch);
+    up(&mut e, OTHER, &mut ch);
+    assert_eq!(val(&e), "2");
+    assert!(ch.is_empty(), "release off the arrow: {ch:?}");
+    // Hold release: typed `4`, ▼ steps to `3` on press and `2` at 400 ms.
+    let mut e = boot(WHOLE, "2");
+    let mut ch = Vec::new();
+    type_into(&mut e, "4", &mut ch);
+    down(&mut e, DOWN, &mut ch);
+    e.test_hold_spin_for(Duration::from_millis(450));
+    assert_eq!(val(&e), "2");
+    up(&mut e, DOWN, &mut ch);
+    assert!(ch.is_empty(), "hold release: {ch:?}");
+    // Keydown step (key_releases off) and key release (key_releases on).
+    for key_releases in [false, true] {
+        let mut e = boot_with(WHOLE, "2", key_releases);
+        let mut ch = Vec::new();
+        type_into(&mut e, "3", &mut ch);
+        feed(&mut e, press("ArrowDown"), &mut ch);
+        feed(&mut e, release("ArrowDown"), &mut ch);
+        assert_eq!(val(&e), "2");
+        assert!(ch.is_empty(), "key_releases={key_releases}: {ch:?}");
+        // A later step away from the sent value still reports once.
+        feed(&mut e, press("ArrowDown"), &mut ch);
+        feed(&mut e, release("ArrowDown"), &mut ch);
+        assert_eq!(ch, ["1"], "key_releases={key_releases}");
+    }
+}
+
+/// Enter and blur already compare with the last value sent (#62's
+/// `value_at_change`): typing away and back to the sent value sends nothing.
+#[test]
+fn enter_and_blur_compare_with_the_sent_value() {
+    let mut e = boot(WHOLE, "2");
+    let mut ch = Vec::new();
+    type_into(&mut e, "5", &mut ch);
+    retype(&mut e, "2", &mut ch);
+    feed(&mut e, press("Enter"), &mut ch);
+    assert!(ch.is_empty(), "Enter: {ch:?}");
+    retype(&mut e, "7", &mut ch);
+    retype(&mut e, "2", &mut ch);
+    click(&mut e, OTHER, &mut ch);
+    assert!(ch.is_empty(), "blur: {ch:?}");
+    // After an arrow `change` the sent value is the stepped one.
+    let mut e = boot(WHOLE, "2");
+    let mut ch = Vec::new();
+    e.test_set_focus("n");
+    click(&mut e, UP, &mut ch);
+    assert_eq!(ch, ["3"]);
+    retype(&mut e, "3", &mut ch);
+    feed(&mut e, press("Enter"), &mut ch);
+    assert_eq!(ch, ["3"], "Enter on the stepped value");
 }
 
 // ---------- 7. Q1: one change on key release ----------

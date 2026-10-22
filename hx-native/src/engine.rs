@@ -244,9 +244,9 @@ struct LiveSurface {
     /// Issue #81 (Designer ruling 2): a ▲/▼ press held on a number box's
     /// arrow, stepping on press and repeating until the release.
     spin_hold: Option<SpinHold>,
-    /// Issue #81: the number box (and arrow direction) whose ArrowUp/
+    /// Issue #81: the number box whose ArrowUp/
     /// ArrowDown steps sent no `change` yet; the key release reports once.
-    key_hold: Option<(String, i32)>,
+    key_hold: Option<String>,
     focus: FocusState,
     /// Physical viewport size used for layout / hit-testing (updated on paint).
     layout_viewport: (u32, u32),
@@ -372,7 +372,7 @@ struct SpinHold {
     repeats: u32,
     /// The value the game last got for the box when the press began (the
     /// last `change`, or the value at focus): the release reports only a
-    /// value that differs from it (issue #81 Q4).
+    /// value that differs from it (issue #81, Ruling 5).
     reported: String,
 }
 
@@ -3861,11 +3861,7 @@ impl LiveSurface {
                 if self.spin_hold.as_ref().is_some_and(|h| h.target_nid == nid) {
                     self.spin_hold = None;
                 }
-                if self
-                    .key_hold
-                    .as_ref()
-                    .is_some_and(|(k, _)| *k == session.id)
-                {
+                if self.key_hold.as_ref().is_some_and(|k| *k == session.id) {
                     self.key_hold = None;
                 }
             }
@@ -4070,8 +4066,8 @@ impl LiveSurface {
     /// Issue #81: the release of a ▲/▼ press. The box keeps the focus and the
     /// stepped value, which becomes the committed value (Esc and a refused
     /// comma come back to it), and one `change` reports it. A press or hold
-    /// that min or max held at the value the game already has sends no
-    /// `change` (Designer, #81 Q4: no preview refresh for nothing).
+    /// that ends on the last value sent to the game sends no `change`
+    /// (Designer, HTML_CONTRACT §2 Ruling 5: no preview refresh for nothing).
     /// A box greyed during the hold sends nothing; a box without an `id`
     /// reports the arrow's click instead, as before.
     fn release_spin_hold(&mut self, ctx: &mut ActionCtx<'_>, arrow: &str) -> InputOutcome {
@@ -4105,25 +4101,24 @@ impl LiveSurface {
             self.mark_dom_dirty();
             self.queue_text_field_damage(hold.target_nid);
         }
-        let held = self.attr(&tid, "value").unwrap_or_default() == hold.reported
-            && crate::text_edit::number_held_at_limit(&self.doc, hold.target_nid, hold.dir);
+        // Ruling 5 (b6f2c892): the box's value against the last value sent.
+        let already_sent = self.attr(&tid, "value").unwrap_or_default() == hold.reported;
         self.mark_committed(hold.target_nid, &tid);
-        if held {
+        if already_sent {
             return InputOutcome::None;
         }
         self.fire_change(ctx, &tid)
     }
 
-    /// Issue #81 Q4 (Designer, HTML_CONTRACT §2 Ruling 4): the box being
-    /// edited sits at the value the game last got and min or max holds it
-    /// there for a `dir` step, so an arrow `change` would report nothing new
-    /// (no preview refresh). A step that lands back on the reported value
-    /// away from the limits (typed `3`, ▼ to the reported `2`) still reports.
-    fn held_at_reported(&self, nid: NodeId, id: &str, dir: i32) -> bool {
+    /// Issue #81 (Designer, HTML_CONTRACT §2 Ruling 5, Mainnet b6f2c892):
+    /// the box being edited ends an arrow interaction on the last value sent
+    /// to the game, so its `change` would report nothing new (no preview
+    /// refresh). The test is the box's value against that sent value, never
+    /// the typed text: typed `3` stepped ▼ to the sent `2` sends nothing, as
+    /// does ▲ at max or ▼ at min.
+    fn at_sent_value(&self, nid: NodeId, id: &str) -> bool {
         self.text_edit.as_ref().is_some_and(|s| {
-            s.node_id == nid
-                && self.attr(id, "value").unwrap_or_default() == s.value_at_change
-                && crate::text_edit::number_held_at_limit(&self.doc, nid, dir)
+            s.node_id == nid && self.attr(id, "value").unwrap_or_default() == s.value_at_change
         })
     }
 
@@ -4216,11 +4211,7 @@ impl LiveSurface {
         let session = self.text_edit.take()?;
         // Issue #81: this commit reports any key-repeat steps, so the key
         // release that may follow has nothing left to send.
-        if self
-            .key_hold
-            .as_ref()
-            .is_some_and(|(k, _)| *k == session.id)
-        {
+        if self.key_hold.as_ref().is_some_and(|k| *k == session.id) {
             self.key_hold = None;
         }
         let _ = commit_field(&mut self.doc, session.node_id, &session.value_at_focus);
@@ -4259,17 +4250,17 @@ impl LiveSurface {
 
     /// Issue #81: the key release after ArrowUp/ArrowDown steps that sent no
     /// `change` yet (key repeat, or every keydown under
-    /// `EngineConfig::key_releases`). One `change` unless min or max holds
-    /// the box at the value the game already has (Q4); a blur or Enter before
+    /// `EngineConfig::key_releases`). One `change` unless the box ends on the
+    /// last value sent (Ruling 5); a blur or Enter before
     /// the release reports it instead and clears the hold.
     fn release_key_hold(&mut self, ctx: &mut ActionCtx<'_>) -> Option<InputOutcome> {
-        let (fid, dir) = self.key_hold.take()?;
+        let fid = self.key_hold.take()?;
         let session = self.text_edit.clone().filter(|s| s.id == fid)?;
         if self.element_is_disabled_id(&fid) {
             return Some(InputOutcome::None);
         }
-        // Q4: min/max held the box at the value the game already has.
-        if self.held_at_reported(session.node_id, &fid, dir) {
+        // Ruling 5: the box ends on the last value sent.
+        if self.at_sent_value(session.node_id, &fid) {
             return Some(InputOutcome::None);
         }
         self.mark_committed(session.node_id, &fid);
@@ -4835,13 +4826,13 @@ impl LiveSurface {
             // when the host forwards key releases (`EngineConfig::
             // key_releases`); the key release reports the value once.
             if is_number && (repeat || ctx.key_releases) {
-                self.key_hold = Some((fid, dir));
+                self.key_hold = Some(fid);
                 return Some(InputOutcome::None);
             }
-            // Issue #81 Q4: a step that min or max held at the value the
-            // game already has (a typed `12` ArrowUp with max 10, after `10`
-            // was sent) sends no `change`.
-            let unmoved = self.held_at_reported(nid, &fid, dir);
+            // Issue #81 Ruling 5: a step that ends on the last value sent
+            // (▲ at max, a typed `3` ArrowDown to the sent `2`) sends no
+            // `change`.
+            let unmoved = self.at_sent_value(nid, &fid);
             // Issue #62: this `change` reports the stepped value, so the
             // Enter / blur that commits it must not report it again, and
             // (issue #81) Esc and a refused comma come back to it.
