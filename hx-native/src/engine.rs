@@ -3251,6 +3251,23 @@ impl LiveSurface {
     }
 
     fn input(&mut self, ctx: &mut ActionCtx<'_>, ev: InputEvent) -> InputOutcome {
+        // Issue #88: every pointer event hit-tests the layout, so it first
+        // resolves the DOM as it stands. A `sync` may have swapped sections
+        // since the last paint; a release used to hit-test form controls
+        // against the pre-swap layout (a stale click, or a panic in blitz-dom
+        // when the pressed node was removed). The resolve carries its restyle
+        // damage to the next paint (`ensure_resolved`), and that paint diffs
+        // geometry against the last painted bounds, so partial repaint still
+        // equals full repaint.
+        if matches!(
+            ev,
+            InputEvent::PointerMove { .. }
+                | InputEvent::PointerDown { .. }
+                | InputEvent::PointerUp { .. }
+                | InputEvent::Wheel { .. }
+        ) {
+            self.ensure_resolved();
+        }
         match ev {
             InputEvent::Text(s) => self.on_text(s, false),
             InputEvent::Paste(s) => self.on_paste(s),
@@ -3286,7 +3303,6 @@ impl LiveSurface {
     /// Issue #26: wheel scrolls the innermost container under the pointer
     /// that can move that way. No chaining of a remainder to a parent.
     fn on_wheel(&mut self, pos: (f32, f32), delta: (f32, f32), unit: WheelUnit) -> InputOutcome {
-        self.ensure_resolved();
         let (x, y) = pos;
         if !delta.1.is_finite() || delta.1 == 0.0 {
             return InputOutcome::None;
@@ -3466,7 +3482,6 @@ impl LiveSurface {
     /// when the hovered element actually changes, so a still pointer keeps the
     /// clean-frame skip.
     fn on_pointer_move(&mut self, x: f32, y: f32) -> InputOutcome {
-        self.ensure_resolved();
         if let Some(drag) = self.scroll_drag {
             return self.on_scroll_drag_move(drag, y);
         }
@@ -3526,7 +3541,6 @@ impl LiveSurface {
         button: PointerButton,
         mods: Modifiers,
     ) -> InputOutcome {
-        self.ensure_resolved();
         self.range_drag_released = None;
         // Issue #85: any press ends a click run unless it continues it below.
         // Arrow presses are not text clicks (Designer, HTML_CONTRACT §2
