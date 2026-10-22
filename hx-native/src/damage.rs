@@ -322,6 +322,17 @@ pub(crate) fn ink_box_device(
     nid: NodeId,
     scale: f64,
 ) -> Option<(f64, f64, f64, f64)> {
+    ink_box_device_with(doc, nid, scale, true)
+}
+
+/// [`ink_box_device`]; `text_shadows` false skips the text-shadow pad walk
+/// (the caller checked that no node has a `text-shadow`).
+fn ink_box_device_with(
+    doc: &HtmlDocument,
+    nid: NodeId,
+    scale: f64,
+    text_shadows: bool,
+) -> Option<(f64, f64, f64, f64)> {
     let node = doc.get_node(nid)?;
     if !node.is_element() {
         return None;
@@ -394,7 +405,13 @@ pub(crate) fn ink_box_device(
     // Issue #57: text-shadow (painted by `text_shadow.rs`) moves text ink by
     // each shadow offset, so a shadow that appears, moves or goes away stays
     // inside this element's damage.
-    if let Some((l, t, r, b)) = crate::text_shadow::text_shadow_ink_pad(doc, nid, scale) {
+    let pad = if text_shadows {
+        crate::text_shadow::bump(|c| c.pads_walked += 1);
+        crate::text_shadow::text_shadow_ink_pad(doc, nid, scale)
+    } else {
+        None
+    };
+    if let Some((l, t, r, b)) = pad {
         x0 -= l;
         y0 -= t;
         x1 += r;
@@ -413,6 +430,12 @@ pub(crate) fn snapshot_bounds(doc: &HtmlDocument, scale: f64) -> BoundsSnapshot 
     // so scrolling only damages the container, not the rows scrolled away
     // beyond it (which Blitz does not paint).
     let any_scroller = !crate::scroll::scroll_containers(doc).is_empty();
+    // #60 review: a page without any `text-shadow` skips the per-element
+    // run walk of the text-shadow damage pad.
+    let text_shadows = crate::text_shadow::document_has_text_shadow(doc);
+    if !text_shadows {
+        crate::text_shadow::bump(|c| c.pads_skipped += 1);
+    }
     let root = doc.root_node().id;
     let mut stack = vec![root];
     while let Some(nid) = stack.pop() {
@@ -427,7 +450,7 @@ pub(crate) fn snapshot_bounds(doc: &HtmlDocument, scale: f64) -> BoundsSnapshot 
         }
         if let (Some(own), Some(ink)) = (
             own_box_device(doc, nid, scale),
-            ink_box_device(doc, nid, scale),
+            ink_box_device_with(doc, nid, scale, text_shadows),
         ) {
             let ink = if any_scroller {
                 clip_ink_to_scrollers(doc, nid, scale, ink)

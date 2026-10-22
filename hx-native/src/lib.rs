@@ -45,6 +45,8 @@ pub use memory::{
 };
 pub use pending::PendingTimeout;
 #[doc(hidden)]
+pub use text_shadow::{take_text_shadow_counters_for_test, TextShadowCounters};
+#[doc(hidden)]
 pub use tile_coalesce::{
     clear_tile_cache_for_test, set_tile_coalesce_for_test, take_tile_coalesce_counters_for_test,
     TileCoalesceCounters,

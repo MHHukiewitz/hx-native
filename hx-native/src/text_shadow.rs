@@ -20,8 +20,10 @@
 //! author CSS, not engine chrome.
 //!
 //! Not drawn (documented limits): shadows with a non-zero blur radius (the
-//! whole shadow is skipped, the others on the run still paint), and text
-//! inside `<input>` / `<textarea>` editors (not an inline layout). A run whose
+//! whole shadow is skipped, the others on the run still paint), underlines
+//! and other text decorations (painted as fills, not glyph runs), list
+//! markers, and text inside `<input>` / `<textarea>` editors (not an inline
+//! layout). A run whose
 //! origin does not match the recorded one within half a device pixel fails
 //! safe: it paints without a shadow.
 //!
@@ -106,11 +108,71 @@ fn node_shadows(doc: &HtmlDocument, node_id: NodeId, scale: f64) -> Option<Arc<[
     (!out.is_empty()).then(|| out.into())
 }
 
+/// Fast-path counters for tests (per thread, since the last take).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextShadowCounters {
+    /// `ShadowTable::build` calls that found no `text-shadow` and skipped the
+    /// glyph-run walk.
+    pub tables_skipped: u64,
+    /// `ShadowTable::build` calls that walked the glyph runs.
+    pub tables_built: u64,
+    /// Bounds snapshots that skipped the text-shadow damage pad for every
+    /// element (no `text-shadow` in the document).
+    pub pads_skipped: u64,
+    /// Element ink boxes that walked their runs for the damage pad.
+    pub pads_walked: u64,
+}
+
+impl TextShadowCounters {
+    const ZERO: Self = Self {
+        tables_skipped: 0,
+        tables_built: 0,
+        pads_skipped: 0,
+        pads_walked: 0,
+    };
+}
+
+thread_local! {
+    static COUNTERS: std::cell::Cell<TextShadowCounters> =
+        const { std::cell::Cell::new(TextShadowCounters::ZERO) };
+}
+
+pub(crate) fn bump(f: impl FnOnce(&mut TextShadowCounters)) {
+    COUNTERS.with(|c| {
+        let mut v = c.get();
+        f(&mut v);
+        c.set(v);
+    });
+}
+
+/// Test hook: read and reset the per-thread fast-path counters.
+#[doc(hidden)]
+pub fn take_text_shadow_counters_for_test() -> TextShadowCounters {
+    COUNTERS.with(|c| c.replace(TextShadowCounters::ZERO))
+}
+
+/// Whether any node (including anonymous blocks and `::before` /
+/// `::after`, which live only in the node slab) has a non-empty computed
+/// `text-shadow`. One style read per node and no layout walk, so a page
+/// without shadows skips the shadow table and the damage pad (#60 review).
+/// Detached nodes may count too; that only costs the slow path.
+pub(crate) fn document_has_text_shadow(doc: &HtmlDocument) -> bool {
+    doc.tree().iter().any(|(_, n)| {
+        n.primary_styles()
+            .is_some_and(|s| !s.get_inherited_text().text_shadow.0.is_empty())
+    })
+}
+
 impl ShadowTable {
-    /// Record every shadowed run. Cheap when no node has a `text-shadow`:
-    /// one style read per glyph run, no hashing.
+    /// Record every shadowed run. A document without any `text-shadow`
+    /// returns an empty table after one style read per node.
     pub(crate) fn build(doc: &HtmlDocument, scale: f64) -> Self {
         let mut table = Self::default();
+        if !document_has_text_shadow(doc) {
+            bump(|c| c.tables_skipped += 1);
+            return table;
+        }
+        bump(|c| c.tables_built += 1);
         let mut stack = vec![doc.root_node().id];
         while let Some(nid) = stack.pop() {
             let Some(node) = doc.get_node(nid) else {
