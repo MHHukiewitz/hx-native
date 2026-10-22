@@ -2059,6 +2059,25 @@ impl LiveSurface {
         // Issue #26: an offset survives the swap when an element with the
         // same id does (restored + clamped at the next layout).
         self.record_scroll_offsets_in(target_id);
+        // Issue #68 (Graph review of #69): only a swap that replaces the
+        // focused field (or an ancestor) re-seeds its editor. Mark it before
+        // mutating, while the old node is still in the tree: NodeIds recycle,
+        // so `reconcile_text_edit` cannot tell a replacement from the id alone.
+        let replaces_focused = self.text_edit.as_ref().is_some_and(|s| {
+            let mut cur = Some(s.node_id);
+            while let Some(nid) = cur {
+                if nid == target_id {
+                    return swap == SwapMode::OuterHtml || nid != s.node_id;
+                }
+                cur = self.doc.get_node(nid).and_then(|n| n.parent);
+            }
+            false
+        });
+        if replaces_focused {
+            if let Some(s) = self.text_edit.as_mut() {
+                s.needs_prepare = true;
+            }
+        }
 
         match swap {
             SwapMode::InnerHtml => {
@@ -3672,6 +3691,13 @@ impl LiveSurface {
                 self.focus.focused_id = None;
             }
             self.doc.clear_focus();
+            return;
+        }
+        // Issue #68 (Graph review of #69): the same, unreplaced node (an
+        // unrelated swap, or greying attributes written on other controls)
+        // keeps its editor as it is: the Tab selection, the caret and the
+        // value at focus (Esc and the commit's `change` compare against it).
+        if nid == session.node_id && !session.needs_prepare {
             return;
         }
         // Same-id replacement: rebind node_id; defer prepare_focus_display until
