@@ -476,12 +476,32 @@ pub fn delete_selection(doc: &mut HtmlDocument, nid: NodeId) {
 /// `transform: translate(-50%, -50%)` panel (absolute_position alone ignores
 /// transforms).
 pub fn place_caret_at(doc: &mut HtmlDocument, nid: NodeId, x: f32, y: f32) {
-    let Some(node) = doc.get_node(nid) else {
+    let Some((lx, ly)) = editor_point(doc, nid, x, y) else {
         return;
     };
-    let Some((bx, by, _, _)) = crate::damage::element_border_box_css(doc, nid) else {
+    doc.with_text_input(nid, |mut driver| {
+        driver.move_to_point(lx, ly);
+    });
+}
+
+/// Issue #85 (Designer, HTML_CONTRACT §2 Ruling 7): select the word under a
+/// document-space double-click (CSS px), as Blitz's own double-click does
+/// (`PlainEditorDriver::select_word_at_point`).
+pub fn select_word_at(doc: &mut HtmlDocument, nid: NodeId, x: f32, y: f32) {
+    let Some((lx, ly)) = editor_point(doc, nid, x, y) else {
         return;
     };
+    doc.with_text_input(nid, |mut driver| {
+        driver.select_word_at_point(lx, ly);
+    });
+}
+
+/// A document-space point (CSS px) in the editor's own layout space: inside
+/// the content box, vertically centred single-line text, horizontal scroll
+/// and the device scale applied.
+fn editor_point(doc: &HtmlDocument, nid: NodeId, x: f32, y: f32) -> Option<(f32, f32)> {
+    let node = doc.get_node(nid)?;
+    let (bx, by, _, _) = crate::damage::element_border_box_css(doc, nid)?;
     let layout = node.final_layout();
     let pad_l = layout.padding.left + layout.border.left;
     let pad_t = layout.padding.top + layout.border.top;
@@ -500,9 +520,7 @@ pub fn place_caret_at(doc: &mut HtmlDocument, nid: NodeId, x: f32, y: f32) {
     let scale = doc.viewport().scale_f64();
     let local_x = (x - bx - pad_l) as f64 * scale + scroll_x;
     let local_y = (y - by - pad_t - y_off) as f64 * scale;
-    doc.with_text_input(nid, |mut driver| {
-        driver.move_to_point(local_x as f32, local_y as f32);
-    });
+    Some((local_x as f32, local_y as f32))
 }
 
 /// Caret ink rect in device pixels, or `None` when there is no caret geometry.

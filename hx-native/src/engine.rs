@@ -53,9 +53,9 @@ use crate::text_edit::{
     apply_group_display_all, apply_unfocused_display, backspace, caret_device_rect, commit_field,
     delete_forward, delete_selection, editor_text, filter_number_insert, has_selection,
     insert_text, is_disabled, is_editable_input, move_end, move_home, move_left, move_right,
-    place_caret_at, prepare_focus_display, resolve_step_target, select_all, selected_text,
-    step_and_regroup, step_direction, sync_value_from_editor, text_outside_selection,
-    TextEditSession, CARET_BLINK_HALF_PERIOD,
+    place_caret_at, prepare_focus_display, resolve_step_target, select_all, select_word_at,
+    selected_text, step_and_regroup, step_direction, sync_value_from_editor,
+    text_outside_selection, TextEditSession, CARET_BLINK_HALF_PERIOD,
 };
 use crate::trigger::{
     filter_ctx_from_key, keydown_repeat_allowed, FilterCtx, FromTarget, TriggerEvent,
@@ -247,6 +247,9 @@ struct LiveSurface {
     /// Issue #81: the number box whose ArrowUp/
     /// ArrowDown steps sent no `change` yet; the key release reports once.
     key_hold: Option<String>,
+    /// Issue #85 (Ruling 7): the last primary press in a text field, so the
+    /// next one can count as a double- or triple-click.
+    last_text_click: Option<TextClick>,
     focus: FocusState,
     /// Physical viewport size used for layout / hit-testing (updated on paint).
     layout_viewport: (u32, u32),
@@ -356,6 +359,32 @@ struct MarkupSnapshot {
     min: Option<String>,
     max: Option<String>,
     step: Option<String>,
+}
+
+/// Issue #85: the last primary press in a text field. The next press
+/// continues the run (double-, triple-click) on the same field within
+/// [`MULTI_CLICK_SLOP_PX`] and [`MULTI_CLICK_MS`], as Blitz counts clicks.
+#[derive(Clone, Debug)]
+struct TextClick {
+    id: String,
+    x: f32,
+    y: f32,
+    at: Instant,
+    count: u32,
+}
+
+/// Issue #85: how far apart (CSS px, each axis) presses of one click run may be.
+const MULTI_CLICK_SLOP_PX: f32 = 2.0;
+/// Issue #85: the most time between presses of one click run.
+const MULTI_CLICK_MS: u128 = 500;
+
+impl TextClick {
+    fn continues(&self, id: &str, x: f32, y: f32) -> bool {
+        self.id == id
+            && (x - self.x).abs() <= MULTI_CLICK_SLOP_PX
+            && (y - self.y).abs() <= MULTI_CLICK_SLOP_PX
+            && self.at.elapsed().as_millis() <= MULTI_CLICK_MS
+    }
 }
 
 /// Issue #81 (Designer ruling 2, HTML_CONTRACT §2): one ▲/▼ press held on
@@ -1490,6 +1519,22 @@ impl Engine {
             .unwrap_or(0)
     }
 
+    /// Test helper (issue #85): make the last text-field click `age` old, as
+    /// if the next press came that much later.
+    #[doc(hidden)]
+    pub fn test_age_last_click(&mut self, age: std::time::Duration) {
+        if let Some(click) = self
+            .surfaces
+            .get_mut(&SurfaceId::DEFAULT)
+            .and_then(|s| s.live.as_mut())
+            .and_then(|l| l.last_text_click.as_mut())
+        {
+            if let Some(at) = click.at.checked_sub(age) {
+                click.at = at;
+            }
+        }
+    }
+
     /// Test helper (issue #81): make the held ▲/▼ press `held` old and run
     /// its repeat, as the next `sync` would after that long.
     #[doc(hidden)]
@@ -1658,6 +1703,7 @@ impl LiveSurface {
             press: None,
             spin_hold: None,
             key_hold: None,
+            last_text_click: None,
             focus: FocusState::default(),
             layout_viewport,
             layout_scale,
@@ -3398,6 +3444,8 @@ impl LiveSurface {
     ) -> InputOutcome {
         self.ensure_resolved();
         self.range_drag_released = None;
+        // Issue #85: any press ends a click run unless it continues it below.
+        let prev_text_click = self.last_text_click.take();
 
         // Open select: press inside the list must not hit-test the element under
         // the overlay (focus + reconcile would close the list and steal the click).
@@ -3473,7 +3521,32 @@ impl LiveSurface {
             if editable {
                 let focus_out = self.focus_text_input(ctx, eid);
                 if let Some(nid) = self.doc.get_element_by_id(eid) {
-                    place_caret_at(&mut self.doc, nid, x, y);
+                    // Issue #85 (Designer, HTML_CONTRACT §2 Ruling 7): one
+                    // click places the caret (#68), a double-click selects
+                    // the word, and a triple-click or more selects the field.
+                    // A number box's text is one number, so its "word" is the
+                    // whole field: `.` and `,` don't split it.
+                    let count = if button == PointerButton::Primary {
+                        let count = prev_text_click
+                            .filter(|c| c.continues(eid, x, y))
+                            .map_or(1, |c| c.count.saturating_add(1));
+                        self.last_text_click = Some(TextClick {
+                            id: eid.clone(),
+                            x,
+                            y,
+                            at: Instant::now(),
+                            count,
+                        });
+                        count
+                    } else {
+                        1
+                    };
+                    let is_number = self.doc.get_node(nid).is_some_and(is_number_input);
+                    match count {
+                        1 => place_caret_at(&mut self.doc, nid, x, y),
+                        2 if !is_number => select_word_at(&mut self.doc, nid, x, y),
+                        _ => select_all(&mut self.doc, nid),
+                    }
                     self.reset_caret_blink();
                     self.queue_text_field_damage(nid);
                 }
