@@ -14,7 +14,8 @@ use std::sync::{Arc, OnceLock};
 
 use blitz_dom::{decode_font_bytes, FontContext};
 use parley::fontique::{
-    Blob, Collection, CollectionOptions, FontInfoOverride, FontWeight, GenericFamily, SourceCache,
+    Blob, Collection, CollectionOptions, FontInfoOverride, FontWeight, GenericFamily, Script,
+    SourceCache,
 };
 
 use crate::error::EngineError;
@@ -41,6 +42,13 @@ pub const FONT_BOLD: &[u8] = include_bytes!("../../assets/fonts/DejaVuSans-Bold.
 pub(crate) const BUNDLED_FAMILY: &str = "DejaVu Sans";
 pub(crate) const BUNDLED_WEIGHTS: [u16; 2] = [400, 700];
 pub(crate) const BUNDLED_STYLE: FontStyle = FontStyle::Normal;
+
+/// Scripts the bundled DejaVu faces are registered for as fallback (ISO 15924
+/// tags; `Zyyy` is Common: digits, punctuation, symbols; `Zinh` is
+/// Inherited: combining marks).
+const BUNDLED_FALLBACK_SCRIPTS: &[&[u8; 4]] = &[
+    b"Latn", b"Grek", b"Cyrl", b"Zyyy", b"Zinh", b"Armn", b"Geor", b"Hebr",
+];
 
 /// `InvalidFont` reason for a font collection (a `ttcf` tag on the decoded
 /// bytes, or a file fontique reads as more than one face).
@@ -242,6 +250,16 @@ pub(crate) fn bundled_font_context(host: &HostFonts) -> FontContext {
     ] {
         ctx.collection
             .append_generic_families(generic, family_ids.iter().copied());
+    }
+    // Graph review of #61: bundled DejaVu is also the script fallback. A
+    // `font-family` list naming only unknown families (no generic) otherwise
+    // finds no font, and parley 0.12 then reuses one last-resort face, chosen
+    // without regard to weight, for every run of the paragraph: `Plain
+    // <b>Bold</b>` painted both words in one face. With a fallback, the
+    // query yields the bundled family and weight matching works per run.
+    for script in BUNDLED_FALLBACK_SCRIPTS {
+        ctx.collection
+            .append_fallbacks(Script::from_bytes(**script), family_ids.iter().copied());
     }
     for face in &host.faces {
         ctx.collection
