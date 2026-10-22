@@ -30,8 +30,8 @@ use crate::form_args::{
 };
 use crate::form_controls::{
     activate_checkable, checkbox_checked_by_name, control_is_disabled, form_control_at_point,
-    named_controls_in_form, select_options, select_radio, select_set_index, select_step,
-    sync_outputs_for, toggle_checkbox, FormControlKind, FormControlRef,
+    named_controls_in_form, radios_in_group, select_options, select_radio, select_set_index,
+    select_step, sync_outputs_for, toggle_checkbox, FormControlKind, FormControlRef,
 };
 use crate::memory::estimate_surface_engine_bytes;
 use crate::paint::{paint_damage_into, paint_rgba};
@@ -301,6 +301,12 @@ struct LiveSurface {
     /// Issue #89: text the player was typing, not committed, in the box a
     /// redraw replaced: the rebound editor gets it back (box id, text).
     kept_typing: Option<(String, String)>,
+    /// Issue #94 (Graph review): per radio group `name`, the value the last
+    /// request a radio of that group sent carried. A radio's catch-up
+    /// compares with it, since another radio of the group may have sent
+    /// after the held one's request (b, then c, then b while b is pending).
+    /// At most one entry per radio group in the document.
+    radio_sent: HashMap<String, String>,
     /// Issue #35: engine-drawn slider geometry painted last frame; a change
     /// damages that slider's old and new rects only.
     last_sliders: Vec<SliderGeom>,
@@ -1760,6 +1766,7 @@ impl LiveSurface {
             catch_up: Vec::new(),
             change_origin: None,
             kept_typing: None,
+            radio_sent: HashMap::new(),
             last_sliders: Vec::new(),
             open_select: None,
             select_hover_row: None,
@@ -4335,7 +4342,10 @@ impl LiveSurface {
         let mut kept = Vec::with_capacity(entries.len());
         for e in entries {
             if e.source_id == source_id
-                && (!e.held || self.same_control_value(&e.control_id, &e.committed, &e.sent))
+                && (!e.held || {
+                    let sent = self.effective_sent(&e.control_id, &e.sent);
+                    self.same_control_value(&e.control_id, &e.committed, &sent)
+                })
             {
                 continue;
             }
@@ -4437,24 +4447,21 @@ impl LiveSurface {
                 }
             }
             "checkbox" => {
-                let checked = control_current_value(&self.doc, node).as_deref() == Some("true");
-                if checked != (value == "true") {
-                    // A greyed box refuses the toggle; write the state.
-                    if !toggle_checkbox(&mut self.doc, nid) {
-                        self.doc.snapshot_node_state_only(nid);
-                        if let Some(el) = self
-                            .doc
-                            .get_node_mut(nid)
-                            .and_then(|n| n.element_data_mut())
-                        {
-                            blitz_dom::BaseDocument::toggle_checkbox(el);
-                        }
-                    }
-                }
+                // Write the state and the `checked` attribute: a box a swap
+                // just inserted has no checked state yet (Blitz creates it
+                // from the attribute at layout), so a toggle alone is lost.
+                // A greyed box is written too (drop to the game's value).
+                self.put_checked(nid, value == "true");
             }
             "radio" => {
                 if value == "true" {
-                    let _ = select_radio(&mut self.doc, nid);
+                    let name = attr_of(node, "name").unwrap_or_default();
+                    for other in radios_in_group(&self.doc, &name) {
+                        if other != nid {
+                            self.put_checked(other, false);
+                        }
+                    }
+                    self.put_checked(nid, true);
                 }
             }
             _ => {
@@ -4463,6 +4470,65 @@ impl LiveSurface {
         }
         let _ = sync_outputs_for(&mut self.doc, id);
         self.mark_dom_dirty();
+    }
+
+    /// Issue #94 (Graph review): set checkbox or radio `nid` checked or not,
+    /// in its live state when it has one and in its `checked` attribute, so
+    /// a node a swap just inserted (no live state until layout) keeps it.
+    fn put_checked(&mut self, nid: NodeId, checked: bool) {
+        let has_attr = self
+            .doc
+            .get_node(nid)
+            .is_some_and(|n| attr_of(n, "checked").is_some());
+        let live = self
+            .doc
+            .get_node(nid)
+            .and_then(|n| n.element_data())
+            .and_then(|el| el.checkbox_input_checked());
+        if has_attr == checked && live.is_none_or(|l| l == checked) {
+            return;
+        }
+        self.doc.snapshot_node_state_only(nid);
+        if has_attr != checked {
+            let mut mutr = self.doc.mutate();
+            if checked {
+                mutr.set_attribute(nid, qual_name!("checked"), "");
+            } else {
+                mutr.clear_attribute(nid, qual_name!("checked"));
+            }
+        }
+        if let Some(node) = self.doc.get_node_mut(nid) {
+            if let Some(el) = node.element_data_mut() {
+                if el.checkbox_input_checked().is_some() {
+                    el.set_checkbox_input_checked(checked);
+                }
+            }
+            node.mark_ancestors_dirty();
+        }
+    }
+
+    /// Issue #94 (Graph review): what radio `id` carried in the last request
+    /// any radio of its group sent, in `control_current_value`'s encoding;
+    /// `fallback` for any other control or a group nothing has sent for.
+    fn effective_sent(&self, id: &str, fallback: &str) -> String {
+        let Some(node) = self
+            .doc
+            .get_element_by_id(id)
+            .and_then(|n| self.doc.get_node(n))
+        else {
+            return fallback.to_string();
+        };
+        if value_control_kind(node) != "radio" {
+            return fallback.to_string();
+        }
+        let name = attr_of(node, "name").unwrap_or_default();
+        match self.radio_sent.get(&name) {
+            Some(v) => {
+                let mine = attr_of(node, "value").unwrap_or_else(|| "on".to_string());
+                (*v == mine).to_string()
+            }
+            None => fallback.to_string(),
+        }
     }
 
     /// Issue #94 (Designer, HTML_CONTRACT `hx-sync`, Mainnet master
@@ -5551,6 +5617,7 @@ impl LiveSurface {
         indicator_id: Option<String>,
     ) -> InputOutcome {
         let request = ctx.requests.issue(ctx.surface);
+        self.note_radio_sent(source_id, &args);
 
         self.pending.insert(PendingEntry {
             request,
@@ -5570,6 +5637,35 @@ impl LiveSurface {
             args,
             source_id: source_id.to_string(),
             trigger,
+        }
+    }
+
+    /// Issue #94 (Graph review): a radio's request records what its group
+    /// sent (see `radio_sent`); groups no longer in the document are pruned.
+    fn note_radio_sent(&mut self, source_id: &str, args: &[(String, String)]) {
+        let Some(node) = self
+            .doc
+            .get_element_by_id(source_id)
+            .and_then(|n| self.doc.get_node(n))
+        else {
+            return;
+        };
+        if value_control_kind(node) != "radio" {
+            return;
+        }
+        let Some(name) = attr_of(node, "name").filter(|n| !n.is_empty()) else {
+            return;
+        };
+        let doc = &self.doc;
+        self.radio_sent
+            .retain(|g, _| !radios_in_group(doc, g).is_empty());
+        match args.iter().find(|(k, _)| *k == name) {
+            Some((_, v)) => {
+                self.radio_sent.insert(name, v.clone());
+            }
+            None => {
+                self.radio_sent.remove(&name);
+            }
         }
     }
 
@@ -6741,3 +6837,13 @@ fn remove_class_token(class: &str, token: &str) -> String {
 // Silence unused import when local_name is only needed in some paths.
 #[allow(unused_imports)]
 use local_name as _;
+
+/// Issue #94 (Graph review): attribute `name` of element `node`.
+fn attr_of(node: &blitz_dom::node::Node, name: &str) -> Option<String> {
+    node.attrs().and_then(|attrs| {
+        attrs
+            .iter()
+            .find(|a| &*a.name.local == name)
+            .map(|a| a.value.to_string())
+    })
+}

@@ -2,9 +2,10 @@
 //! `hx-sync` row in Mainnet HTML_CONTRACT at master 188feffd, with the two
 //! rulings added at 5983ff17).
 //!
-//! Reviewed at 6387042. Every probe pins behaviour the review checked. The
-//! three `#[ignore]` probes fail at 6387042 (a checkbox untick and a radio
-//! pick lost to a catch-up); Graph's fix patch 0002 removes the `ignore`.
+//! Reviewed at 6387042. Every probe pins behaviour the review checked.
+//! `checkbox_catch_up_compares_presence` and the two radio probes fail at
+//! 6387042 (a held untick and a held radio pick are lost) and pass with
+//! Graph's fix.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -454,7 +455,6 @@ fn checks_page() -> H {
 /// toggling: tick (sent), untick + tick while pending sends nothing more;
 /// tick (sent), untick while pending sends the untick once, without the pair.
 #[test]
-#[ignore = "fails at 6387042; fixed by Graph's patch 0002"]
 fn checkbox_catch_up_compares_presence() {
     let mut h = checks_page();
     let o1 = h.click("tick");
@@ -487,7 +487,6 @@ fn checkbox_catch_up_compares_presence() {
 /// is c and the held b must catch up, or the box shows b while the game
 /// has c.
 #[test]
-#[ignore = "fails at 6387042; fixed by Graph's patch 0002"]
 fn radio_b_c_b_while_b_is_pending_ends_on_b() {
     let mut h = checks_page();
     let o1 = h.click("rb");
@@ -510,7 +509,6 @@ fn radio_b_c_b_while_b_is_pending_ends_on_b() {
 /// Review point 6: the same with an older redraw (the game's answer to c)
 /// arriving while b is held: the box keeps b.
 #[test]
-#[ignore = "fails at 6387042; fixed by Graph's patch 0002"]
 fn radio_held_b_survives_an_older_redraw() {
     let mut h = checks_page();
     let o1 = h.click("rb");
