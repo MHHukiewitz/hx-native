@@ -522,25 +522,30 @@ pub(crate) fn collect_style_damaged(doc: &HtmlDocument) -> Vec<NodeId> {
     out
 }
 
-/// The nearest ancestor of an inline-flow element that is not itself inline
-/// (the block whose inline layout, or anonymous block, paints the element's
-/// text) and has bounds in `snapshot`. `None` for a non-inline element.
+/// The nearest ancestor of an inline-flow (or `display: contents`) element
+/// that is neither (the block whose inline layout, or anonymous block, paints
+/// the element's text) and has bounds in `snapshot`. `None` for any other
+/// element. A `display: contents` box generates no box of its own (its bounds
+/// in `snapshot` are empty), so it is skipped like an inline (#60 round 2).
 fn inline_layout_host(
     doc: &HtmlDocument,
     nid: NodeId,
     snapshot: &BoundsSnapshot,
 ) -> Option<NodeId> {
-    let is_inline = |id: NodeId| {
+    let no_own_layout = |id: NodeId| {
         doc.get_node(id)
             .and_then(|n| n.primary_styles())
-            .is_some_and(|s| s.get_box().clone_display().is_inline_flow())
+            .is_some_and(|s| {
+                let d = s.get_box().clone_display();
+                d.is_inline_flow() || d.is_contents()
+            })
     };
-    if !is_inline(nid) {
+    if !no_own_layout(nid) {
         return None;
     }
     let mut cur = doc.get_node(nid)?.parent;
     while let Some(id) = cur {
-        if !is_inline(id) && snapshot.contains_key(&id) {
+        if !no_own_layout(id) && snapshot.contains_key(&id) {
             return Some(id);
         }
         cur = doc.get_node(id)?.parent;

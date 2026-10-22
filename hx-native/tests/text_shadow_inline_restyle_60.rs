@@ -68,6 +68,9 @@ fn page(css: &str, markup: &str) -> String {
 const IN_P: &str = "<p style=\"position:absolute;left:80px;top:40px;margin:0\">Text <a id=g hx-post=\"x.go\" hx-trigger=\"click\">Confirm</a> tail</p>";
 const IN_ANON: &str = "<div style=\"position:absolute;left:80px;top:40px\"><div>x</div>Text <a id=g hx-post=\"x.go\" hx-trigger=\"click\">Confirm</a> tail</div>";
 const IN_B_IN_P: &str = "<p style=\"position:absolute;left:80px;top:40px;margin:0\">Text <b>bold <a id=g hx-post=\"x.go\" hx-trigger=\"click\">Confirm</a></b> tail</p>";
+const IN_CONTENTS_IN_P: &str = "<p style=\"position:absolute;left:80px;top:40px;margin:0\">Text <span style=\"display:contents\"><a id=g hx-post=\"x.go\" hx-trigger=\"click\">Confirm</a></span> tail</p>";
+const IN_CONTENTS_DIV_IN_P: &str = "<div style=\"position:absolute;left:80px;top:40px\"><div style=\"display:contents\">Text <a id=g hx-post=\"x.go\" hx-trigger=\"click\">Confirm</a> tail</div></div>";
+const CONTENTS_SELF_IN_P: &str = "<p style=\"position:absolute;left:80px;top:40px;margin:0\">Text <span id=g hx-post=\"x.go\" hx-trigger=\"click\" style=\"display:contents\">Confirm</span> tail</p>";
 const BLOCK: &str = "<button id=g hx-post=\"x.go\" hx-trigger=\"click\" style=\"position:absolute;left:80px;top:40px\">Confirm</button>";
 const MIXED_BUTTON: &str = "<button id=g hx-post=\"x.go\" hx-trigger=\"click\" style=\"position:absolute;left:80px;top:40px\">Con<div>firm</div>ok</button>";
 
@@ -159,7 +162,9 @@ fn greying_that_adds_or_removes_a_shadow_repaints_like_a_full_paint() {
 
 /// P10: an inline `<a>` greyed with a colour-only change, a large shadow and
 /// a 1 px shadow, in a paragraph, in an anonymous block and nested in an
-/// inline `<b>` (whose own box does not paint the text either).
+/// inline `<b>` (whose own box does not paint the text either), and under a
+/// `display: contents` ancestor, which has no box and is skipped on the way
+/// up to the block that lays out the text (Graph, #60 round 2).
 #[test]
 fn inline_link_greying_colour_or_shadow_repaints_like_a_full_paint() {
     let mut bad = vec![];
@@ -182,6 +187,9 @@ fn inline_link_greying_colour_or_shadow_repaints_like_a_full_paint() {
             ("in-p", IN_P),
             ("in-anon", IN_ANON),
             ("in-b-in-p", IN_B_IN_P),
+            ("in-contents-in-p", IN_CONTENTS_IN_P),
+            ("in-contents-div", IN_CONTENTS_DIV_IN_P),
+            ("contents-self-in-p", CONTENTS_SELF_IN_P),
         ] {
             for scale in [1.0, 2.0] {
                 let r = flip(&page(css, m), PaintMode::Exact, scale, true);
