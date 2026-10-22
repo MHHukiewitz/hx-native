@@ -286,3 +286,22 @@ fn dither_box_costs_at_most_twice_a_solid_fill() {
         slow as f64 / 1e6
     );
 }
+
+#[test]
+fn sub_pixel_background_size_paints_without_panicking() {
+    // background-size below half a device pixel on the non-repeating axis:
+    // Blitz still emits one column (or row) of tiles.
+    for (bg, scale) in [
+        ("linear-gradient(90deg,#f00 50%,#00f 50%) 0 0/0.0000005px 2px repeat-y", 1.0),
+        ("linear-gradient(#f00 50%,#00f 50%) 0 0/2px 0.0000004px repeat-x", 1.0),
+        ("repeating-conic-gradient(#fff 0deg 90deg,#c0c0c0 90deg 180deg) 0 0/0.0000002px 2px repeat-y", 2.0),
+    ] {
+        let html = format!(
+            r#"<!DOCTYPE html><html><head><style>html,body{{margin:0}}#b{{position:absolute;left:4px;top:6px;width:40px;height:20px;background:#c0c0c0 {bg}}}</style></head><body><div id="b"></div></body></html>"#
+        );
+        let merged = full_paint(&html, scale, true);
+        let per_tile = full_paint(&html, scale, false);
+        let w = (300.0 * scale) as usize;
+        assert_eq!(first_diff(&merged, &per_tile, w), None, "{bg} at {scale}");
+    }
+}

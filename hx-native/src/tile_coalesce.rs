@@ -260,7 +260,11 @@ impl<'a, S: PaintScene> TileScene<'a, S> {
                     && whole(run.origin.x)
                     && whole(run.origin.y)
                     && whole(run.tile.width())
-                    && whole(run.tile.height());
+                    && whole(run.tile.height())
+                    // A tile narrower than half a pixel rounds to a 0 px raster,
+                    // which vello_cpu cannot allocate (panics).
+                    && run.tile.width().round() >= 1.0
+                    && run.tile.height().round() >= 1.0;
                 if aligned {
                     if let Some(img) = cached_tile(&run) {
                         let brush = ImageBrush::new(ImageData::clone(&img))
@@ -516,5 +520,32 @@ mod tests {
         assert_eq!(feed(&ragged), (8, 0));
         // A gap in a row ends the run there.
         assert_eq!(feed(&[(0.0, 0.0), (2.0, 0.0), (6.0, 0.0)]), (1, 1));
+    }
+
+    #[test]
+    fn sub_pixel_tiles_replay_instead_of_rasterizing_a_0px_tile() {
+        // A column of 5e-7 x 2 px tiles counts as "whole" (within EPS) but
+        // rounds to a 0 px wide raster.
+        clear_tile_cache_for_test();
+        let g = checker();
+        let px = render_to_buffer::<VelloCpuImageRenderer, _>(
+            |s| {
+                let mut t = TileScene::new(s);
+                t.enabled = true;
+                for row in 0..6 {
+                    t.fill(
+                        Fill::NonZero,
+                        Affine::translate((4.0, 4.0 + 2.0 * row as f64)),
+                        &g,
+                        None,
+                        &Rect::new(0.0, 0.0, 5e-7, 2.0),
+                    );
+                }
+                t.finish();
+            },
+            16,
+            16,
+        );
+        assert_eq!(px.len(), 16 * 16 * 4);
     }
 }
