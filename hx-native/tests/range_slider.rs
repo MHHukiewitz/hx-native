@@ -987,17 +987,38 @@ fn without_host_variables_every_engine_drawn_control_uses_the_neutral_greys() {
 #[test]
 fn host_tokens_without_the_hx_prefix_change_no_engine_drawn_pixel() {
     let body = format!(r#"{}{SELECT_HTML}"#, skin_html(""));
-    let mut bare = boot(&page_bare("", &body));
-    bare.test_set_focus("r");
-    let want = frame(&mut bare);
-    let tokens = ":root{--bg:#ff0000;--ink:#00ff00;--edge-hi:#0000ff;--edge-lt:#ff00ff;--edge-sh:#00ffff;--edge-dk:#ffff00;--field:inset 1px 1px #ff0000;--face:#ff0000;--bevel-hi:#00ff00;--track:#0000ff;--thumb-w:40px;--groove-h:12px;--select-hl:#ff0000}";
-    let mut themed = boot(&page_bare(tokens, &body));
-    themed.test_set_focus("r");
-    let got = frame(&mut themed);
-    assert!(
-        want.pixels == got.pixels,
-        "non-`--hx-*` host tokens must not change slider, scrollbar or select pixels"
-    );
+    // Mainnet's own token names (`_tokens.css`) plus the unprefixed forms of
+    // every `--hx-*` variable. Graph review of #37 r4: the open list and the
+    // UA sheet's `var()`s are covered too (`--sel-bg`, `--select-bg`, …).
+    let tokens = ":root{--bg:#ff0000;--ink:#00ff00;--edge-hi:#0000ff;--edge-lt:#ff00ff;--edge-sh:#00ffff;--edge-dk:#ffff00;--field:inset 1px 1px #ff0000;--face:#ff0000;--bevel-hi:#00ff00;--bevel-lt:#00ff00;--bevel-sh:#00ff00;--bevel-dk:#00ff00;--track:#0000ff;--track-alt:#ff00ff;--thumb-w:40px;--groove-h:12px;--select-bg:#ff0000;--select-ink:#00ff00;--select-hl:#ff0000;--sel-bg:#ff00ff;--sel-ink:#00ffff;--hi:#ff0000;--sh:#00ff00;--dk:#0000ff;--navy:#ff00ff;--panel:#ffff00;--menu-bg:#00ffff;--scroll-track:#ff0000;--sunken:inset 1px 1px #ff0000;--raise:inset 1px 1px #00ff00;--press:inset 1px 1px #0000ff}";
+    for open_list in [false, true] {
+        let shoot = |css: &str| {
+            let mut eng = boot(&page_bare(css, &body));
+            if open_list {
+                eng.test_set_focus("sel");
+                let _ = eng.input(key_mods(
+                    "ArrowDown",
+                    Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                ));
+            } else {
+                eng.test_set_focus("r");
+            }
+            frame(&mut eng)
+        };
+        let want = shoot("");
+        if open_list {
+            // The list is open: row 0 shows the neutral highlight.
+            assert_eq!(px(&want, 136.0, 150.0), [0x50, 0x50, 0x50, 0xFF]);
+        }
+        let got = shoot(tokens);
+        assert!(
+            want.pixels == got.pixels,
+            "non-`--hx-*` host tokens must not change slider, scrollbar or select pixels (open list: {open_list})"
+        );
+    }
 }
 
 #[test]
