@@ -226,6 +226,11 @@ fn g2_decimals_and_step_any() {
         let mut ch = vec![];
         type_in(&mut e, id, typed, &mut ch);
         arrow(&mut e, id, up, &mut ch);
+        // Issue #81 (Designer ruling 1): the box keeps the focus after the
+        // click, so leave it (Tab, no second `change`) to see the committed
+        // display this table checks; before #81 the click itself blurred.
+        assert_eq!(e.focus_state().focused_id.as_deref(), Some(id));
+        feed(&mut e, key("Tab", false, false), &mut ch);
         let disp = e.test_editor_display(id);
         eprintln!(
             "{id} typed {typed} {} -> {} shown {disp:?} ch {ch:?}",
@@ -516,7 +521,13 @@ fn g14_press_up_release_down() {
         val(&e, "term"),
         e.focus_state().focused_id
     );
-    assert!(ch.is_empty());
+    // Issue #81 (Designer ruling 2): the press steps 3.7 ▲ to 4 and the
+    // release, on the other arrow or anywhere, sends that one `change`;
+    // the box keeps the focus. Before #81 a release off the pressed arrow
+    // sent nothing.
+    assert_eq!(val(&e, "term"), "4");
+    assert_eq!(ch, vec![c("term", "4")]);
+    assert_eq!(e.focus_state().focused_id.as_deref(), Some("term"));
 }
 
 #[test]

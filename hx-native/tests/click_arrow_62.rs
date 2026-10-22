@@ -217,13 +217,26 @@ fn keyboard_and_click_agree_from_typed_values() {
     }
 }
 
-/// The click commits and blurs: the box shows its unfocused display.
+/// The click commits and (issue #81, Designer ruling 1) keeps the box
+/// focused with its raw editable text; leaving the box then shows the
+/// unfocused display of the committed value, with no second `change`.
+/// Before #81 the click blurred, so the display was checked right away.
 #[test]
 fn click_commit_shows_the_unfocused_display() {
-    let c = clicked(GROUPED, "2", "1234.5", true);
-    assert_eq!(c.shown.as_deref(), Some("1,235"));
-    let c = clicked(FEE, "4.1", "4.105", false);
-    assert_eq!(c.shown.as_deref(), Some("4.10"));
+    for (attrs, start, typed, up, raw, shown, want) in [
+        (GROUPED, "2", "1234.5", true, "1235", "1,235", "1235"),
+        (FEE, "4.1", "4.105", false, "4.10", "4.10", "4.1"),
+    ] {
+        let mut e = boot(attrs, start, PaintMode::Exact);
+        let mut ch = Vec::new();
+        type_into(&mut e, typed, &mut ch);
+        click(&mut e, 140.0, if up { 6.0 } else { 18.0 }, &mut ch);
+        assert_eq!(e.focus_state().focused_id.as_deref(), Some("n"));
+        assert_eq!(e.test_editor_display("n").as_deref(), Some(raw));
+        click(&mut e, 10.0, 46.0, &mut ch);
+        assert_eq!(e.test_editor_display("n").as_deref(), Some(shown));
+        assert_eq!(ch, [want]);
+    }
 }
 
 /// A committed on-grid value steps one step per click, as before, focused
@@ -255,7 +268,8 @@ fn committed_on_grid_value_steps_as_before() {
     assert_eq!(ch, ["10"]);
 }
 
-/// Focus ends where a click on a committed value leaves it (on the arrow).
+/// Focus ends where a click on a committed value leaves it: in the box
+/// (issue #81, Designer ruling 1; before #81 both left it on the arrow).
 #[test]
 fn focus_after_click_matches_a_committed_click() {
     let mut a = boot(WHOLE, "2", PaintMode::Exact);
@@ -264,7 +278,7 @@ fn focus_after_click_matches_a_committed_click() {
     click(&mut a, 140.0, 6.0, &mut ch);
     let mut b = boot(WHOLE, "2", PaintMode::Exact);
     click(&mut b, 140.0, 6.0, &mut ch);
-    assert_eq!(a.focus_state().focused_id.as_deref(), Some("up"));
+    assert_eq!(a.focus_state().focused_id.as_deref(), Some("n"));
     assert_eq!(
         a.focus_state().focused_id,
         b.focus_state().focused_id,
@@ -284,22 +298,28 @@ fn arrow_key_then_click_reports_each_step_once() {
     assert_eq!(ch, ["4", "5"]);
 }
 
-/// Esc after an arrow step still restores the focus-time value.
+/// Esc after an arrow step restores the last committed value, the one the
+/// step's `change` reported (issue #81 item 1, Designer ruling). Before #81
+/// it went back to the focus-time `2`, a value the game never got back.
 #[test]
-fn esc_after_arrow_still_restores_the_focus_value() {
+fn esc_after_arrow_restores_the_last_committed_value() {
     let mut e = boot(WHOLE, "2", PaintMode::Exact);
     let mut ch = Vec::new();
     type_into(&mut e, "3.7", &mut ch);
     feed(&mut e, key_ev("ArrowUp", false), &mut ch);
+    feed(&mut e, InputEvent::Text("9".into()), &mut ch);
     feed(&mut e, key_ev("Escape", false), &mut ch);
-    assert_eq!(e.attr("n", "value").as_deref(), Some("2"));
+    assert_eq!(e.attr("n", "value").as_deref(), Some("4"));
+    assert_eq!(e.test_editor_display("n").as_deref(), Some("4"));
     assert_eq!(ch, ["4"]);
 }
 
-/// Pressing ▲ and releasing elsewhere does nothing: the typed value stays
-/// uncommitted in the focused box, and Enter later commits it once.
+/// Issue #81 (Designer ruling 2): the press on ▲ steps, so releasing
+/// elsewhere still ends the press with its one `change`, and the box keeps
+/// the focus. Before #81 the step waited for a release on the arrow, and a
+/// release elsewhere kept the typed value uncommitted.
 #[test]
-fn release_off_the_arrow_keeps_the_typed_value() {
+fn release_off_the_arrow_sends_the_press_step() {
     let mut e = boot(WHOLE, "2", PaintMode::Exact);
     let mut ch = Vec::new();
     type_into(&mut e, "3.7", &mut ch);
@@ -323,12 +343,11 @@ fn release_off_the_arrow_keeps_the_typed_value() {
         },
         &mut ch,
     );
-    assert!(ch.is_empty(), "no change on a cancelled press: {ch:?}");
-    assert_eq!(e.test_editor_display("n").as_deref(), Some("3.7"));
-    feed(&mut e, InputEvent::Text("5".into()), &mut ch);
-    feed(&mut e, key_ev("Enter", false), &mut ch);
-    assert_eq!(e.attr("n", "value").as_deref(), Some("4"));
     assert_eq!(ch, ["4"]);
+    assert_eq!(e.attr("n", "value").as_deref(), Some("4"));
+    assert_eq!(e.focus_state().focused_id.as_deref(), Some("n"));
+    feed(&mut e, key_ev("Enter", false), &mut ch);
+    assert_eq!(ch, ["4"], "Enter does not report the step again");
 }
 
 /// Partial repaint after the click equals a forced full repaint.

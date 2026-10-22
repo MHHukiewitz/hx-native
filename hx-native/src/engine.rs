@@ -239,6 +239,12 @@ struct LiveSurface {
     released_outcomes: Vec<InputOutcome>,
     hover_id: Option<String>,
     press: Option<PressState>,
+    /// Issue #81 (Designer ruling 2): a ▲/▼ press held on a number box's
+    /// arrow, stepping on press and repeating until the release.
+    spin_hold: Option<SpinHold>,
+    /// Issue #81: the number box whose ArrowUp/ArrowDown key repeat stepped
+    /// it without a `change`; the key release reports the value once.
+    key_hold: Option<String>,
     focus: FocusState,
     /// Physical viewport size used for layout / hit-testing (updated on paint).
     layout_viewport: (u32, u32),
@@ -348,6 +354,35 @@ struct MarkupSnapshot {
     min: Option<String>,
     max: Option<String>,
     step: Option<String>,
+}
+
+/// Issue #81 (Designer ruling 2, HTML_CONTRACT §2): one ▲/▼ press held on
+/// a number box's arrow. The press steps once; after
+/// [`SPIN_REPEAT_DELAY`] the box steps again every [`SPIN_REPEAT_INTERVAL`]
+/// (no speed-up) until the release, which sends the one `change`.
+#[derive(Clone, Debug)]
+struct SpinHold {
+    target_nid: NodeId,
+    target_id: Option<String>,
+    dir: i32,
+    pressed_at: Instant,
+    /// Repeat steps done so far (the press step not counted).
+    repeats: u32,
+}
+
+/// Issue #81: the wait before a held arrow starts repeating.
+const SPIN_REPEAT_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
+/// Issue #81: the time between repeat steps of a held arrow.
+const SPIN_REPEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Repeat steps due `held` after the press (issue #81): none before
+/// [`SPIN_REPEAT_DELAY`], then one at the delay and one per interval after.
+fn spin_repeats_due(held: std::time::Duration) -> u32 {
+    if held < SPIN_REPEAT_DELAY {
+        return 0;
+    }
+    let past = (held - SPIN_REPEAT_DELAY).as_millis() / SPIN_REPEAT_INTERVAL.as_millis();
+    u32::try_from(past).unwrap_or(u32::MAX - 1) + 1
 }
 
 #[derive(Clone, Debug)]
@@ -1445,6 +1480,24 @@ impl Engine {
             .unwrap_or(0)
     }
 
+    /// Test helper (issue #81): make the held ▲/▼ press `held` old and run
+    /// its repeat, as the next `sync` would after that long.
+    #[doc(hidden)]
+    pub fn test_hold_spin_for(&mut self, held: std::time::Duration) {
+        if let Some(live) = self
+            .surfaces
+            .get_mut(&SurfaceId::DEFAULT)
+            .and_then(|s| s.live.as_mut())
+        {
+            if let Some(hold) = live.spin_hold.as_mut() {
+                if let Some(at) = Instant::now().checked_sub(held) {
+                    hold.pressed_at = at;
+                }
+            }
+            live.advance_spin_hold();
+        }
+    }
+
     /// Test helper: force one caret blink phase flip (damage + paint dirty).
     pub fn test_force_caret_blink(&mut self) {
         if let Some(live) = self
@@ -1593,6 +1646,8 @@ impl LiveSurface {
             released_outcomes: Vec::new(),
             hover_id: None,
             press: None,
+            spin_hold: None,
+            key_hold: None,
             focus: FocusState::default(),
             layout_viewport,
             layout_scale,
@@ -1933,6 +1988,8 @@ impl LiveSurface {
     ) -> Result<DirtySet, EngineError> {
         // Caret blink: only while a field is focused; unfocused pages stay idle.
         self.advance_caret_blink();
+        // Issue #81: a held ▲/▼ repeats its step while the host keeps syncing.
+        self.advance_spin_hold();
         // Always subscribe to `actions` for greying.
         let mut subscribed: HashSet<String> = HashSet::new();
         subscribed.insert("actions".into());
@@ -3422,29 +3479,36 @@ impl LiveSurface {
                 return focus_out.unwrap_or(InputOutcome::Press { id });
             }
 
-            // Issue #62: pressing ▲/▼ of the box being edited keeps the typed
-            // value uncommitted and the box focused (as Chrome's spinner does);
-            // the release commits it with the step (`try_spin_step`).
-            let spin_on_edited = self.spin_targets_edited_box(eid);
+            // Issue #81 (Designer rulings 1-2): a press on ▲/▼ steps the box
+            // at once and leaves the focus in the box, never on the arrow.
+            if button == PointerButton::Primary {
+                if let Some(out) = self.try_spin_press(ctx, eid) {
+                    self.range_drag_id = None;
+                    self.press = Some(PressState {
+                        id: eid.clone(),
+                        button,
+                        mods,
+                    });
+                    self.reconcile_open_select_after_focus();
+                    return out;
+                }
+            }
 
             // Click outside a text field (or on another control): commit/blur edit.
-            if !spin_on_edited
-                && self.text_edit.is_some()
+            if self.text_edit.is_some()
                 && self.text_edit.as_ref().map(|s| s.id.as_str()) != Some(eid.as_str())
             {
                 self.blur_text_edit_queued(ctx);
             }
 
-            if !spin_on_edited {
-                if let Some(nid) = self.doc.get_element_by_id(eid) {
-                    if self.doc.set_focus_to(nid) {
-                        // Issue #35: a focus move alone (no value change) still
-                        // repaints (`:focus` styles, the slider focus dots).
-                        self.mark_dom_dirty_raw();
-                        self.mark_paint_dirty();
-                    }
-                    self.focus.focused_id = Some(eid.clone());
+            if let Some(nid) = self.doc.get_element_by_id(eid) {
+                if self.doc.set_focus_to(nid) {
+                    // Issue #35: a focus move alone (no value change) still
+                    // repaints (`:focus` styles, the slider focus dots).
+                    self.mark_dom_dirty_raw();
+                    self.mark_paint_dirty();
                 }
+                self.focus.focused_id = Some(eid.clone());
             }
         } else if let Some(ref c) = ctrl {
             if self.text_edit.is_some() {
@@ -3513,6 +3577,12 @@ impl LiveSurface {
             self.end_scroll_press();
             self.press = None;
             return InputOutcome::None;
+        }
+        // Issue #81: the release of a ▲/▼ press, wherever it lands, ends the
+        // hold and sends its one `change`.
+        if button == PointerButton::Primary && self.press_is_spin_arrow() {
+            let arrow = self.press.take().map(|p| p.id).unwrap_or_default();
+            return self.release_spin_hold(ctx, &arrow);
         }
         // Range drag commit: clear drag, fire change once, suppress click.
         let mut suppress_click = false;
@@ -3603,11 +3673,7 @@ impl LiveSurface {
             return InputOutcome::Press { id: None };
         }
 
-        // Spin-box step arrows (data-hx-step): commit once per click via fire_change.
         if button == PointerButton::Primary {
-            if let Some(out) = self.try_spin_step(ctx, &press.id) {
-                return out;
-            }
             if let Some(out) = self.try_activate_control_at(ctx, x, y) {
                 return out;
             }
@@ -3764,6 +3830,31 @@ impl LiveSurface {
             .get_node(nid)
             .is_some_and(|n| is_editable_input(n) && !is_disabled(n));
         if !ok {
+            // Issue #81 (Designer ruling 3, HTML_CONTRACT §2): the box being
+            // edited was greyed in place. The typed text is dropped and the
+            // box shows the value the game last saw (the last `change`, or
+            // the value at focus), with no `change`; the blur below keeps the
+            // caret out. A replaced box keeps the value of its new markup.
+            if nid == session.node_id
+                && self
+                    .doc
+                    .get_node(nid)
+                    .is_some_and(|n| is_editable_input(n) && is_disabled(n))
+            {
+                let restored = session.value_at_change.clone();
+                let _ = crate::form_args::write_value_attr(&mut self.doc, nid, &restored);
+                crate::text_edit::set_editor_text(&mut self.doc, nid, &restored);
+                apply_unfocused_display(&mut self.doc, nid);
+                let _ = sync_outputs_for(&mut self.doc, &session.id);
+                self.mark_dom_dirty();
+                self.queue_text_field_damage(nid);
+                if self.spin_hold.as_ref().is_some_and(|h| h.target_nid == nid) {
+                    self.spin_hold = None;
+                }
+                if self.key_hold.as_deref() == Some(session.id.as_str()) {
+                    self.key_hold = None;
+                }
+            }
             self.text_edit = None;
             if self.focus.focused_id.as_deref() == Some(session.id.as_str()) {
                 self.focus.focused_id = None;
@@ -3862,54 +3953,148 @@ impl LiveSurface {
         }
     }
 
-    /// True when `hit_id` is a `data-hx-step` arrow whose target number box
-    /// is the one being edited (issue #62).
-    fn spin_targets_edited_box(&self, hit_id: &str) -> bool {
-        let Some(session) = self.text_edit.as_ref() else {
-            return false;
-        };
-        step_direction(&self.doc, hit_id).is_some()
-            && resolve_step_target(&self.doc, hit_id).is_some_and(|(nid, _)| nid == session.node_id)
-    }
-
-    fn try_spin_step(&mut self, ctx: &mut ActionCtx<'_>, hit_id: &str) -> Option<InputOutcome> {
+    /// Issue #81 (Designer rulings 1-2, HTML_CONTRACT §2): a primary press
+    /// on a `data-hx-step` arrow. The target box takes the focus (another box
+    /// being edited commits, as on any focus move) with the caret at the end
+    /// and nothing selected, and steps once now, exactly as ArrowUp/ArrowDown
+    /// would (off-grid snaps to the grid in the arrow's direction, an on-grid
+    /// value moves one step, never past min/max). The step is not reported
+    /// yet: [`Self::advance_spin_hold`] repeats it while the press is held,
+    /// and the release sends one `change` ([`Self::release_spin_hold`]).
+    /// `None` when `hit_id` is not an arrow; an arrow of a disabled box is
+    /// pressed without stepping or moving the focus.
+    fn try_spin_press(&mut self, ctx: &mut ActionCtx<'_>, hit_id: &str) -> Option<InputOutcome> {
         let dir = step_direction(&self.doc, hit_id)?;
         let (target_nid, target_id) = resolve_step_target(&self.doc, hit_id)?;
-        // Disabled target ignores clicks.
+        self.spin_hold = None;
+        let pressed = InputOutcome::Press {
+            id: Some(hit_id.to_string()),
+        };
         if self.doc.get_node(target_nid).is_some_and(is_disabled) {
-            return Some(InputOutcome::None);
+            // A press beside an edited box still ends that edit.
+            self.blur_text_edit_queued(ctx);
+            return Some(pressed);
         }
-        // Issue #62: the box is being edited (its typed value is not
-        // committed yet). Step that typed value exactly as ArrowUp/ArrowDown
-        // would (off-grid snaps to the grid in the arrow's direction, an
-        // on-grid value moves one step, never past min/max), then commit it
-        // and blur: one `change`, never commit-then-step.
-        if let Some(session) = self.text_edit.clone().filter(|s| s.node_id == target_nid) {
-            let _ = step_and_regroup(&mut self.doc, target_nid, dir);
-            // `commit_text_edit` re-reads the box, marks the DOM dirty and
-            // queues the box's damage.
-            let committed = self.commit_text_edit(ctx, true);
-            // Focus ends on the arrow, as after a click on a committed value.
-            if let Some(nid) = self.doc.get_element_by_id(hit_id) {
-                self.doc.set_focus_to(nid);
-                self.focus.focused_id = Some(hit_id.to_string());
+        let out = match target_id.as_deref() {
+            Some(tid) => self.focus_text_input(ctx, tid).unwrap_or(pressed),
+            None => {
+                self.blur_text_edit_queued(ctx);
+                pressed
             }
-            // Every spin click reports one `change`, as before, even when
-            // the value matches what the last `change` already reported.
-            return Some(match committed {
-                Some(InputOutcome::None) | None => self.fire_change(ctx, &session.id),
-                Some(out) => out,
-            });
+        };
+        self.spin_step_target(target_nid, target_id.as_deref(), dir);
+        self.spin_hold = Some(SpinHold {
+            target_nid,
+            target_id,
+            dir,
+            pressed_at: Instant::now(),
+            repeats: 0,
+        });
+        Some(out)
+    }
+
+    /// One ▲/▼ step of `nid` (issue #81): the value moves (clamped), a focused
+    /// box keeps its raw text with the caret at the end and nothing selected,
+    /// and only the box's own damage is queued (partial repaint equals full).
+    fn spin_step_target(&mut self, nid: NodeId, id: Option<&str>, dir: i32) -> bool {
+        let changed = step_and_regroup(&mut self.doc, nid, dir);
+        if self.text_edit.as_ref().is_some_and(|s| s.node_id == nid) {
+            prepare_focus_display(&mut self.doc, nid);
+            self.reset_caret_blink();
         }
-        let _ = step_and_regroup(&mut self.doc, target_nid, dir);
+        if let Some(id) = id {
+            let _ = sync_outputs_for(&mut self.doc, id);
+        }
         self.mark_dom_dirty();
-        self.queue_text_field_damage(target_nid);
-        if let Some(ref tid) = target_id {
-            return Some(self.fire_change(ctx, tid));
-        }
-        Some(InputOutcome::Clicked {
-            id: hit_id.to_string(),
+        self.queue_text_field_damage(nid);
+        changed
+    }
+
+    /// True while the primary press started on a `data-hx-step` arrow.
+    fn press_is_spin_arrow(&self) -> bool {
+        self.press.as_ref().is_some_and(|p| {
+            p.button == PointerButton::Primary && step_direction(&self.doc, &p.id).is_some()
         })
+    }
+
+    /// Issue #81 (Designer ruling 2): the repeat steps a held ▲/▼ owes by now.
+    /// Called from `sync`; stops on its own once the box is gone or greyed.
+    fn advance_spin_hold(&mut self) {
+        let Some(hold) = self.spin_hold.clone() else {
+            return;
+        };
+        let live = self
+            .doc
+            .get_node(hold.target_nid)
+            .is_some_and(|n| is_number_input(n) && !is_disabled(n));
+        if !live {
+            self.spin_hold = None;
+            return;
+        }
+        let due = spin_repeats_due(hold.pressed_at.elapsed());
+        let mut done = hold.repeats;
+        while done < due {
+            done += 1;
+            if !self.spin_step_target(hold.target_nid, hold.target_id.as_deref(), hold.dir) {
+                // Held at min or max: the remaining steps would not move it.
+                done = due;
+            }
+        }
+        if let Some(h) = self.spin_hold.as_mut() {
+            h.repeats = done;
+        }
+    }
+
+    /// Issue #81: the release of a ▲/▼ press. The box keeps the focus and the
+    /// stepped value, which becomes the committed value (Esc and a refused
+    /// comma come back to it), and one `change` reports it: every arrow click
+    /// still sends one, as before #81, even when min or max held it still.
+    /// A box greyed during the hold sends nothing; a box without an `id`
+    /// reports the arrow's click instead, as before.
+    fn release_spin_hold(&mut self, ctx: &mut ActionCtx<'_>, arrow: &str) -> InputOutcome {
+        let Some(hold) = self.spin_hold.take() else {
+            return InputOutcome::None;
+        };
+        if self
+            .doc
+            .get_node(hold.target_nid)
+            .is_none_or(|n| !is_number_input(n) || is_disabled(n))
+        {
+            return InputOutcome::None;
+        }
+        let Some(tid) = hold.target_id else {
+            return InputOutcome::Clicked {
+                id: arrow.to_string(),
+            };
+        };
+        // The box being edited commits as Enter would (canonical text, held
+        // inside min/max: a typed `12` above max 10 stepped ▲ commits `10`,
+        // as ArrowUp then Enter does) and stays focused, caret at the end.
+        if let Some(session) = self
+            .text_edit
+            .clone()
+            .filter(|s| s.node_id == hold.target_nid)
+        {
+            let _ = commit_field(&mut self.doc, hold.target_nid, &session.value_at_focus);
+            prepare_focus_display(&mut self.doc, hold.target_nid);
+            self.reset_caret_blink();
+            let _ = sync_outputs_for(&mut self.doc, &tid);
+            self.mark_dom_dirty();
+            self.queue_text_field_damage(hold.target_nid);
+        }
+        self.mark_committed(hold.target_nid, &tid);
+        self.fire_change(ctx, &tid)
+    }
+
+    /// Record `id`'s value as committed for the box being edited (issue #81):
+    /// a `change` reported it, so Esc, a refused comma and the next commit's
+    /// comparison all start from it.
+    fn mark_committed(&mut self, nid: NodeId, id: &str) {
+        let value = self.attr(id, "value").unwrap_or_default();
+        if let Some(s) = self.text_edit.as_mut().filter(|s| s.node_id == nid) {
+            s.value_at_change = value.clone();
+            s.value_at_focus = value;
+        }
     }
 
     fn focus_text_input(&mut self, ctx: &mut ActionCtx<'_>, id: &str) -> Option<InputOutcome> {
@@ -4020,6 +4205,24 @@ impl LiveSurface {
             self.reset_caret_blink();
         }
         Some(change)
+    }
+
+    /// Issue #81: the key release after ArrowUp/ArrowDown key repeat on a
+    /// number box. One `change` when the repeat moved the value past what the
+    /// last `change` reported (the first press already reported its own
+    /// step); a blur or Enter before the release reports it instead.
+    fn release_key_hold(&mut self, ctx: &mut ActionCtx<'_>) -> Option<InputOutcome> {
+        let fid = self.key_hold.take()?;
+        let session = self.text_edit.clone().filter(|s| s.id == fid)?;
+        if self.element_is_disabled_id(&fid) {
+            return Some(InputOutcome::None);
+        }
+        let now = self.attr(&fid, "value").unwrap_or_default();
+        if now == session.value_at_change {
+            return Some(InputOutcome::None);
+        }
+        self.mark_committed(session.node_id, &fid);
+        Some(self.fire_change(ctx, &fid))
     }
 
     fn hold_focused_number_to_commit(&mut self) {
@@ -4513,6 +4716,7 @@ impl LiveSurface {
         &mut self,
         ctx: &mut ActionCtx<'_>,
         key: &str,
+        repeat: bool,
     ) -> Option<InputOutcome> {
         let fid = self.focus.focused_id.clone()?;
         if self.element_is_disabled_id(&fid) {
@@ -4575,12 +4779,16 @@ impl LiveSurface {
             } else {
                 self.mark_paint_dirty();
             }
-            // Issue #62: this `change` reports the stepped value, so the
-            // Enter / blur that commits it must not report it again.
-            let stepped = self.attr(&fid, "value").unwrap_or_default();
-            if let Some(s) = self.text_edit.as_mut().filter(|s| s.node_id == nid) {
-                s.value_at_change = stepped;
+            // Issue #81 (Designer ruling 2): key repeat steps a number box
+            // without a `change`; the key release reports the value once.
+            if is_number && repeat {
+                self.key_hold = Some(fid);
+                return Some(InputOutcome::None);
             }
+            // Issue #62: this `change` reports the stepped value, so the
+            // Enter / blur that commits it must not report it again, and
+            // (issue #81) Esc and a refused comma come back to it.
+            self.mark_committed(nid, &fid);
             Some(self.fire_change(ctx, &fid))
         } else {
             Some(InputOutcome::None)
@@ -4850,7 +5058,15 @@ impl LiveSurface {
                     | "PageDown"
             )
         {
-            if let Some(out) = self.try_step_focused_numeric(ctx, &key.key) {
+            if let Some(out) = self.try_step_focused_numeric(ctx, &key.key, key.repeat) {
+                return out;
+            }
+        }
+
+        // Issue #81: releasing the ArrowUp/ArrowDown whose key repeat stepped
+        // a number box sends the one `change` for the repeat steps.
+        if !key.pressed && matches!(key.key.as_str(), "ArrowUp" | "ArrowDown") {
+            if let Some(out) = self.release_key_hold(ctx) {
                 return out;
             }
         }
