@@ -30,6 +30,16 @@ pub struct EngineConfig {
     /// [`Engine::try_new`](crate::Engine::try_new) with
     /// [`EngineError::InvalidFont`](crate::EngineError::InvalidFont).
     pub fonts: Vec<FontFace>,
+    /// Issue #81 (Designer, HTML_CONTRACT §2 Ruling 5): the host forwards
+    /// key releases (`KeyEvent { pressed: false, .. }`) for every key press
+    /// it forwards. When `true`, ArrowUp/ArrowDown on a focused number box
+    /// step on keydown (and on key repeat) without a `change`, and the key
+    /// release sends exactly one `change`, only when the value moved past
+    /// what the game last got. When `false` (the default, for hosts without
+    /// key releases), the first keydown sends its `change` at once, key
+    /// repeat steps silently, and a key release, Enter or blur reports the
+    /// repeat steps.
+    pub key_releases: bool,
 }
 
 impl Default for EngineConfig {
@@ -40,6 +50,7 @@ impl Default for EngineConfig {
             paint_mode: PaintMode::Exact,
             hidden_surface_budget_bytes: DEFAULT_HIDDEN_SURFACE_BUDGET_BYTES,
             fonts: Vec::new(),
+            key_releases: false,
         }
     }
 }

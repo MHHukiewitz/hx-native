@@ -240,7 +240,7 @@ fn click_commit_shows_the_unfocused_display() {
 }
 
 /// A committed on-grid value steps one step per click, as before, focused
-/// or not, with one `change` per click.
+/// or not, with one `change` per click that moves it.
 #[test]
 fn committed_on_grid_value_steps_as_before() {
     let mut e = boot(WHOLE, "3", PaintMode::Exact);
@@ -259,13 +259,14 @@ fn committed_on_grid_value_steps_as_before() {
     click(&mut e, 140.0, 6.0, &mut ch);
     assert_eq!(e.attr("n", "value").as_deref(), Some("4"));
     assert_eq!(ch, ["4"]);
-    // At max a click still reports its one `change`, as before.
+    // At max a click that cannot move the value sends no `change`
+    // (Designer, #81 Q4; before #81 Q4 it still reported `10`).
     let mut e = boot(WHOLE, "10", PaintMode::Exact);
     let mut ch = Vec::new();
     e.test_set_focus("n");
     click(&mut e, 140.0, 6.0, &mut ch);
     assert_eq!(e.attr("n", "value").as_deref(), Some("10"));
-    assert_eq!(ch, ["10"]);
+    assert!(ch.is_empty(), "no change at max: {ch:?}");
 }
 
 /// Focus ends where a click on a committed value leaves it: in the box

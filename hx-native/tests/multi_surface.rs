@@ -9,6 +9,7 @@ fn make_eng(budget: u64) -> Engine {
         paint_mode: PaintMode::Exact,
         hidden_surface_budget_bytes: budget,
         fonts: Vec::new(),
+        key_releases: false,
     });
     e.declare_actions(&["act.do", "time.set_speed"]);
     e

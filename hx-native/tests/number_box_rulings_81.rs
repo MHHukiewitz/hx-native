@@ -10,6 +10,11 @@
 //!    Keyboard ArrowUp/ArrowDown key repeat follows the same rule.
 //! 5. A box greyed mid-edit drops the typed text, shows the game's value,
 //!    sends nothing and blurs.
+//! 6. (Designer's answers, Rulings 4-5, Mainnet master 45d9548d) A press,
+//!    hold or key step that min/max holds at the value the game already
+//!    has sends no `change` (Q4). A host that forwards key releases
+//!    (`EngineConfig::key_releases`) gets one `change` on key release and
+//!    none on keydown (Q1); a host without them still gets one.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -40,10 +45,16 @@ fn vp() -> Viewport {
 }
 
 fn boot(attrs: &str, value: &str) -> Engine {
+    boot_with(attrs, value, false)
+}
+
+/// `key_releases`: the host forwards key releases (Ruling 5, #81 Q1).
+fn boot_with(attrs: &str, value: &str, key_releases: bool) -> Engine {
     let mut e = Engine::new(EngineConfig {
         max_paint_ns: 50_000_000,
         pending_timeout_frames: 5,
         paint_mode: PaintMode::Exact,
+        key_releases,
         ..Default::default()
     });
     e.declare_actions(&["deal.n"]);
@@ -488,4 +499,205 @@ fn greyed_mid_edit_partial_equals_full() {
         .filter(|(p, q)| p != q)
         .count();
     assert_eq!(diff, 0, "partial must equal full");
+}
+
+// ---------- 6. Q4: no change when min/max holds the value ----------
+
+fn release(k: &str) -> InputEvent {
+    key_ev(k, false, false, false)
+}
+
+/// Q4: a click on ▲ at max, or ▼ at min, sends nothing, focused or not.
+#[test]
+fn click_at_max_or_min_sends_no_change() {
+    for (start, at, focused) in [
+        ("10", UP, false),
+        ("10", UP, true),
+        ("0", DOWN, false),
+        ("0", DOWN, true),
+    ] {
+        let mut e = boot(WHOLE, start);
+        let mut ch = Vec::new();
+        if focused {
+            e.test_set_focus("n");
+        }
+        click(&mut e, at, &mut ch);
+        assert_eq!(val(&e), start);
+        assert!(ch.is_empty(), "{start} focused={focused}: {ch:?}");
+        assert_eq!(e.focus_state().focused_id.as_deref(), Some("n"));
+    }
+}
+
+/// Q4: a hold that min/max keeps at the reported value sends nothing on
+/// release; a hold that reaches max from below still sends one.
+#[test]
+fn hold_release_at_max_sends_no_change() {
+    let mut e = boot(WHOLE, "10");
+    let mut ch = Vec::new();
+    down(&mut e, UP, &mut ch);
+    e.test_hold_spin_for(Duration::from_millis(1200));
+    up(&mut e, UP, &mut ch);
+    assert_eq!(val(&e), "10");
+    assert!(ch.is_empty(), "{ch:?}");
+    // Moved, then held at max: one change.
+    down(&mut e, DOWN, &mut ch);
+    up(&mut e, DOWN, &mut ch);
+    down(&mut e, UP, &mut ch);
+    e.test_hold_spin_for(Duration::from_millis(1200));
+    up(&mut e, UP, &mut ch);
+    assert_eq!(ch, ["9", "10"]);
+}
+
+/// Q4: a typed value above max that ▲ (or ArrowUp) clamps back to the value
+/// the game already has sends nothing; the box shows that value.
+#[test]
+fn typed_above_max_clamped_to_the_reported_value_sends_no_change() {
+    let mut e = boot(WHOLE, "10");
+    let mut ch = Vec::new();
+    type_into(&mut e, "12", &mut ch);
+    click(&mut e, UP, &mut ch);
+    assert_eq!(val(&e), "10");
+    assert!(ch.is_empty(), "click: {ch:?}");
+
+    let mut e = boot(WHOLE, "10");
+    let mut ch = Vec::new();
+    type_into(&mut e, "12", &mut ch);
+    feed(&mut e, press("ArrowUp"), &mut ch);
+    feed(&mut e, press("Enter"), &mut ch);
+    assert_eq!(val(&e), "10");
+    assert!(ch.is_empty(), "key: {ch:?}");
+}
+
+/// Q4, keyboard: ArrowUp at max, its repeats and its release send nothing;
+/// a step that reaches max sends one, and the held release adds none.
+#[test]
+fn key_step_and_key_release_at_max_send_no_change() {
+    for key_releases in [false, true] {
+        let mut e = boot_with(WHOLE, "10", key_releases);
+        let mut ch = Vec::new();
+        e.test_set_focus("n");
+        feed(&mut e, press("ArrowUp"), &mut ch);
+        feed(&mut e, key_ev("ArrowUp", false, true, true), &mut ch);
+        feed(&mut e, release("ArrowUp"), &mut ch);
+        assert_eq!(val(&e), "10");
+        assert!(ch.is_empty(), "key_releases={key_releases}: {ch:?}");
+
+        let mut e = boot_with(WHOLE, "9", key_releases);
+        let mut ch = Vec::new();
+        e.test_set_focus("n");
+        feed(&mut e, press("ArrowUp"), &mut ch);
+        for _ in 0..3 {
+            feed(&mut e, key_ev("ArrowUp", false, true, true), &mut ch);
+        }
+        feed(&mut e, release("ArrowUp"), &mut ch);
+        assert_eq!(ch, ["10"], "key_releases={key_releases}");
+
+        // A typed `10.0` is the reported `10` written differently: ArrowUp
+        // rewrites it to `10` but max holds the value, so nothing is sent.
+        let mut e = boot_with(WHOLE, "10", key_releases);
+        let mut ch = Vec::new();
+        type_into(&mut e, "10.0", &mut ch);
+        feed(&mut e, press("ArrowUp"), &mut ch);
+        feed(&mut e, release("ArrowUp"), &mut ch);
+        feed(&mut e, press("Enter"), &mut ch);
+        assert_eq!(val(&e), "10");
+        assert!(ch.is_empty(), "10.0 key_releases={key_releases}: {ch:?}");
+    }
+}
+
+/// Q4 at the limit the game already has: committed `0` (min 0), typed `1`,
+/// ▼ / ArrowDown bring it back to `0`, which min holds, so no path sends a
+/// `change` (click, keydown, key release).
+#[test]
+fn step_back_onto_the_reported_limit_sends_no_change() {
+    let mut e = boot(WHOLE, "0");
+    let mut ch = Vec::new();
+    type_into(&mut e, "1", &mut ch);
+    click(&mut e, DOWN, &mut ch);
+    assert_eq!(val(&e), "0");
+    assert!(ch.is_empty(), "click: {ch:?}");
+    for key_releases in [false, true] {
+        let mut e = boot_with(WHOLE, "0", key_releases);
+        let mut ch = Vec::new();
+        type_into(&mut e, "1", &mut ch);
+        feed(&mut e, press("ArrowDown"), &mut ch);
+        feed(&mut e, release("ArrowDown"), &mut ch);
+        feed(&mut e, press("Enter"), &mut ch);
+        assert_eq!(val(&e), "0");
+        assert!(ch.is_empty(), "key_releases={key_releases}: {ch:?}");
+    }
+}
+
+// ---------- 7. Q1: one change on key release ----------
+
+/// Q1, host forwards key releases: a tap sends nothing on keydown and one
+/// `change` on key release; a hold sends one for the whole hold.
+#[test]
+fn key_release_host_gets_one_change_on_release() {
+    let mut e = boot_with(WIDE, "10", true);
+    let mut ch = Vec::new();
+    e.test_set_focus("n");
+    feed(&mut e, press("ArrowUp"), &mut ch);
+    assert_eq!(val(&e), "11", "keydown steps");
+    assert!(ch.is_empty(), "no change on keydown: {ch:?}");
+    feed(&mut e, release("ArrowUp"), &mut ch);
+    assert_eq!(ch, ["11"]);
+    // Hold: keydown, repeats, release.
+    feed(&mut e, press("ArrowDown"), &mut ch);
+    for _ in 0..4 {
+        feed(&mut e, key_ev("ArrowDown", false, true, true), &mut ch);
+    }
+    assert_eq!(val(&e), "6");
+    assert_eq!(ch, ["11"], "nothing while held");
+    feed(&mut e, release("ArrowDown"), &mut ch);
+    assert_eq!(ch, ["11", "6"]);
+    // A stray release afterwards sends nothing.
+    feed(&mut e, release("ArrowDown"), &mut ch);
+    assert_eq!(ch, ["11", "6"]);
+    // Esc before the release reverts to `6` and sends nothing.
+    feed(&mut e, press("ArrowUp"), &mut ch);
+    feed(&mut e, press("Escape"), &mut ch);
+    feed(&mut e, release("ArrowUp"), &mut ch);
+    assert_eq!(val(&e), "6");
+    assert_eq!(ch, ["11", "6"]);
+}
+
+/// Q1: with key releases, a blur or Enter before the release reports the
+/// step once, and the release then sends nothing more.
+#[test]
+fn key_release_host_blur_or_enter_first_reports_once() {
+    let mut e = boot_with(WIDE, "10", true);
+    let mut ch = Vec::new();
+    e.test_set_focus("n");
+    feed(&mut e, press("ArrowUp"), &mut ch);
+    click(&mut e, OTHER, &mut ch);
+    feed(&mut e, release("ArrowUp"), &mut ch);
+    assert_eq!(ch, ["11"]);
+
+    let mut e = boot_with(WIDE, "10", true);
+    let mut ch = Vec::new();
+    e.test_set_focus("n");
+    feed(&mut e, press("ArrowUp"), &mut ch);
+    feed(&mut e, press("Enter"), &mut ch);
+    feed(&mut e, release("ArrowUp"), &mut ch);
+    assert_eq!(ch, ["11"]);
+}
+
+/// Q1 stopgap kept for hosts that never forward key releases (the
+/// default): every keydown tap still sends its own `change` at once, and
+/// a hold's repeats reach the game on blur.
+#[test]
+fn host_without_key_releases_still_gets_changes() {
+    assert!(!EngineConfig::default().key_releases);
+    let mut e = boot(WIDE, "10");
+    let mut ch = Vec::new();
+    e.test_set_focus("n");
+    feed(&mut e, press("ArrowUp"), &mut ch);
+    assert_eq!(ch, ["11"], "change on keydown");
+    feed(&mut e, press("ArrowUp"), &mut ch);
+    assert_eq!(ch, ["11", "12"]);
+    feed(&mut e, key_ev("ArrowUp", false, true, true), &mut ch);
+    feed(&mut e, key_ev("ArrowUp", false, true, true), &mut ch);
+    click(&mut e, OTHER, &mut ch);
+    assert_eq!(ch, ["11", "12", "14"]);
 }
