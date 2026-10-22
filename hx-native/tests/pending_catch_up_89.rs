@@ -552,6 +552,9 @@ fn a_select_and_a_range_catch_up() {
 #[test]
 fn greyed_while_held_drops_the_held_change() {
     let mut d = deal();
+    // #96: take the redraw `deal()` leaves due, so this half greys by the
+    // `actions` slice alone (a redraw first is the drawn-value case).
+    d.sync_only();
     let o1 = d.click("up"); // 4.7 sent
     d.click("up"); // 4.71 held
     d.set_actions(vec![(
@@ -681,4 +684,32 @@ fn a_checkbox_catches_up() {
             );
         }
     }
+}
+
+/// #96 (Gap B of Designer's #94 review): 4.7 sent, 4.71 held, a redraw
+/// that does not grey draws 4.65 (4.71 is put back), then the `actions`
+/// slice greys the focused box in place. The held change is dropped and the
+/// box shows the game's last drawn value, 4.65, not the last value sent
+/// (4.7); nothing is sent on complete or on a later blur.
+#[test]
+fn greyed_in_place_after_a_redraw_shows_the_games_drawn_value() {
+    let mut d = deal();
+    let o1 = d.click("up"); // 4.7 sent
+    d.click("up"); // 4.71 held
+    d.answer_redraw("4.65");
+    assert_eq!(d.fee(), "4.71", "the held 4.71 is put back");
+    assert_eq!(d.e.focus_state().focused_id.as_deref(), Some("fee"));
+    d.set_actions(vec![(
+        "deal.fee".into(),
+        ActionState::Disabled {
+            reason: "Locked".into(),
+        },
+    )]);
+    assert_eq!(d.fee(), "4.65", "the game's drawn value, not the 4.7 sent");
+    assert_eq!(d.shown().as_deref(), Some("4.65"));
+    let after = d.complete(&o1, true);
+    assert!(after.is_empty(), "{after:?}");
+    let blur = d.click("b");
+    assert!(changes(&blur).is_empty(), "{blur:?}");
+    assert_eq!(d.fee(), "4.65");
 }

@@ -4556,6 +4556,14 @@ impl LiveSurface {
                 continue;
             }
             let game = e.game.clone().unwrap_or_else(|| e.sent.clone());
+            // Issue #96: the box being edited greys in place next, and
+            // Ruling 6 (`reconcile_text_edit`) writes the session's
+            // `value_at_change` back. After a redraw that is the game's drawn
+            // value, not the last value sent, so the session takes it too.
+            if let Some(s) = self.text_edit.as_mut().filter(|s| s.node_id == nid) {
+                s.value_at_change = game.clone();
+                s.value_at_focus = game.clone();
+            }
             let shown = self
                 .doc
                 .get_node(nid)
