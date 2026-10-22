@@ -253,6 +253,15 @@ pub(crate) fn bundled_font_context(host: &HostFonts) -> FontContext {
 mod tests {
     use super::*;
 
+    /// Graph review of #61 (kills G4): both bundled faces are one Blob each,
+    /// process-wide, so the shared SourceCache sees one id per face.
+    #[test]
+    fn bundled_blobs_are_shared_process_wide() {
+        assert_eq!(shared_font_blob().id(), shared_font_blob().id());
+        assert_eq!(shared_bold_blob().id(), shared_bold_blob().id());
+        assert_ne!(shared_font_blob().id(), shared_bold_blob().id());
+    }
+
     /// The bundled-face constants used by the duplicate check must match
     /// what fontique reads from the bundled files: one family, regular then
     /// bold, both normal style.

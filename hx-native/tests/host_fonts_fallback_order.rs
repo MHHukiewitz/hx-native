@@ -167,3 +167,44 @@ fn bundled_family_bold_is_the_real_bold_face() {
     );
     let _ = REGULAR;
 }
+
+/// Graph review of #61: the part of A29 that survives the #56 reversal. A
+/// host "DejaVu Sans" face at a weight the crate does not bundle (600) is the
+/// face `font-weight:600` paints in the bundled family. Without it, 600
+/// resolves to the bundled bold and 500 to the bundled regular (CSS weight
+/// matching).
+#[test]
+fn host_face_extends_the_bundled_family_at_600() {
+    let at = |fonts: Vec<FontFace>, w: u16| {
+        paint(
+            fonts,
+            &format!("<p style=\"font-family:sans-serif;font-weight:{w}\">{TEXT}</p>"),
+        )
+    };
+    let regular = at(Vec::new(), 400);
+    let bold = at(Vec::new(), 700);
+    assert!(diff(&regular, &bold) > 0, "bundled 400 and 700 must differ");
+    assert_eq!(
+        diff(&at(Vec::new(), 600), &bold),
+        0,
+        "600 resolves to the bundled bold"
+    );
+    assert_eq!(
+        diff(&at(Vec::new(), 500), &regular),
+        0,
+        "500 resolves to the bundled regular"
+    );
+    // The regular bytes registered as "DejaVu Sans" 600: weight 600 now
+    // paints regular glyphs, and 700 keeps the bundled bold.
+    let ext = || vec![face("DejaVu Sans", 600, REGULAR)];
+    assert_eq!(
+        diff(&at(ext(), 600), &regular),
+        0,
+        "a host DejaVu Sans 600 paints for weight 600"
+    );
+    assert_eq!(
+        diff(&at(ext(), 700), &bold),
+        0,
+        "700 stays the bundled bold"
+    );
+}
