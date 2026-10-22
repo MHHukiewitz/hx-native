@@ -19,8 +19,10 @@ pub struct EngineConfig {
     /// [`DEFAULT_HIDDEN_SURFACE_BUDGET_BYTES`].
     pub hidden_surface_budget_bytes: u64,
     /// Host-supplied font faces (issue #28). Empty by default, which keeps
-    /// the bundled-DejaVu-only behaviour. Faces are registered in this
-    /// order, after bundled DejaVu Sans, under the family / weight / style
+    /// the bundled-DejaVu-only behaviour. Pass both the regular and the bold
+    /// face of a family: Blitz paints no synthetic bold (issue #56). Faces
+    /// are registered in this order, after bundled DejaVu Sans 400 and 700,
+    /// under the family / weight / style
     /// given here (not the names inside the font file). DejaVu stays the
     /// generic (`sans-serif`, `serif`, `monospace`, `system-ui`) and
     /// unknown-family fallback. CSS `@font-face` rules stay ignored: the
@@ -414,7 +416,7 @@ pub enum WheelUnit {
 pub const SCROLL_ROW_PX: f32 = 20.0;
 /// Rows per wheel line (browsers scroll about three lines per notch).
 pub const SCROLL_LINE_ROWS: f32 = 3.0;
-/// Width of the engine-drawn Win95 scrollbar in CSS px (HTML_CONTRACT §4).
+/// Width of the engine-drawn scrollbar in CSS px (HTML_CONTRACT §4).
 pub const SCROLLBAR_WIDTH_PX: f32 = 16.0;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

@@ -184,10 +184,17 @@ fn range_slider_values_are_clean_on_a_large_fractional_range() {
             &[],
         );
         let xf = x as f32 * 6.5;
+        // #37: a press off the thumb pages (Win95 trackbar), so grab the
+        // thumb (at min, x 0..11) and drag it to `xf`.
         let _ = eng.input(InputEvent::PointerDown {
-            x: xf,
+            x: 5.0,
             y: 12.0,
             button: PointerButton::Primary,
+            mods: Modifiers::default(),
+        });
+        let _ = eng.input(InputEvent::PointerMove {
+            x: xf,
+            y: 12.0,
             mods: Modifiers::default(),
         });
         let _ = eng.input(InputEvent::PointerUp {
@@ -199,13 +206,13 @@ fn range_slider_values_are_clean_on_a_large_fractional_range() {
         let v = eng.attr("r", "value").unwrap();
         assert!(clean(&v, 2), "slider at x={xf}: {v}");
     }
-    // Dragged past the far end it lands exactly on max.
+    // The thumb dragged past the far end lands exactly on max.
     let mut eng = boot(
         r#"<input id="r" type="range" name="r" min="1000000" max="1234567.89" step="0.01" value="1000000" />"#,
         &[],
     );
     let _ = eng.input(InputEvent::PointerDown {
-        x: 390.0,
+        x: 5.0,
         y: 12.0,
         button: PointerButton::Primary,
         mods: Modifiers::default(),
@@ -224,23 +231,31 @@ fn fee_range_slider_steps_clean_at_every_pixel() {
         r#"<input id="r" type="range" name="r" min="0" max="100.00" step="0.01" value="0" />"#,
         &[],
     );
+    // #37: a press off the thumb pages, so grab the thumb (at min, x 0..11)
+    // once and drag it across every pixel.
+    let _ = eng.input(InputEvent::PointerDown {
+        x: 5.0,
+        y: 12.0,
+        button: PointerButton::Primary,
+        mods: Modifiers::default(),
+    });
     for x in 0..400 {
         let xf = x as f32 + 0.5;
-        let _ = eng.input(InputEvent::PointerDown {
+        let _ = eng.input(InputEvent::PointerMove {
             x: xf,
             y: 12.0,
-            button: PointerButton::Primary,
-            mods: Modifiers::default(),
-        });
-        let _ = eng.input(InputEvent::PointerUp {
-            x: xf,
-            y: 12.0,
-            button: PointerButton::Primary,
             mods: Modifiers::default(),
         });
         let v = eng.attr("r", "value").unwrap();
         assert!(clean(&v, 2), "fee slider at x={xf}: {v}");
     }
+    let _ = eng.input(InputEvent::PointerUp {
+        x: 399.5,
+        y: 12.0,
+        button: PointerButton::Primary,
+        mods: Modifiers::default(),
+    });
+    assert_eq!(eng.attr("r", "value").as_deref(), Some("100"));
 }
 
 struct Src {

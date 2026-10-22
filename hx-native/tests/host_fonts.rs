@@ -11,7 +11,7 @@ use std::time::Duration;
 use hx_native::*;
 
 const REGULAR: &[u8] = include_bytes!("../../assets/fonts/DejaVuSans.ttf");
-const BOLD: &[u8] = include_bytes!("fonts/DejaVuSans-Bold.ttf");
+const BOLD: &[u8] = include_bytes!("../../assets/fonts/DejaVuSans-Bold.ttf");
 
 fn vp() -> Viewport {
     Viewport {
@@ -228,10 +228,14 @@ fn partial_repaint_equals_full_with_host_fonts() {
     };
     let (partial, full) = run(host_pair());
     assert_eq!(diff(&partial, &full), 0, "partial must equal full");
-    let (dejavu_only, _) = run(Vec::new());
+    // The test faces are DejaVu, and since #56 the bundled fallback paints
+    // DejaVu Sans Bold too, so a DejaVu-only engine paints the same pixels.
+    // Prove the host 700 face is in the frames against the host family with
+    // only its 400 face (`<b>` then paints regular).
+    let (regular_only, _) = run(vec![face("Host", 400, REGULAR)]);
     assert!(
-        diff(&partial, &dejavu_only) > 0,
-        "host fonts must actually be in the compared frames"
+        diff(&partial, &regular_only) > 0,
+        "the host 700 face must actually be in the compared frames"
     );
 }
 
@@ -241,8 +245,12 @@ fn partial_repaint_equals_full_with_host_fonts() {
 fn paint_worker_matches_direct_engine_with_host_fonts() {
     let body = "<p style=\"font-family:Host\">Plain <b>Bold</b></p>";
     let direct = paint_with(host_pair(), body);
-    let dejavu_only = paint_with(Vec::new(), body);
-    assert!(diff(&direct, &dejavu_only) > 0);
+    // Since #56 a DejaVu-only engine paints the same DejaVu faces (the guard
+    // only held while mixed weights in an unknown family painted one face;
+    // Graph review of #61). Prove the host 700 face reaches the frame against
+    // the host family with only its 400 face.
+    let regular_only = paint_with(vec![face("Host", 400, REGULAR)], body);
+    assert!(diff(&direct, &regular_only) > 0);
 
     let worker = PaintWorker::try_spawn(cfg(host_pair())).expect("valid fonts");
     worker.load_html(&page(body)).unwrap();
@@ -315,22 +323,24 @@ fn ellipsis_truncation_uses_the_host_face() {
     );
 }
 
-/// Crate-owner decision (Graph review of #30): a host face that ties with
-/// the bundled "DejaVu Sans" 400 normal is rejected (the bundled face counts
-/// as an earlier entry in the duplicate check); the same family at another
-/// weight or style is allowed and becomes, e.g., the real bold.
+/// Crate-owner decision (Graph review of #30, bold added by #56): a host face
+/// that ties with a bundled "DejaVu Sans" face, 400 or 700 normal, is
+/// rejected (the bundled faces count as earlier entries in the duplicate
+/// check); the same family at another weight or style is allowed.
 #[test]
 fn host_face_tying_with_bundled_dejavu_is_rejected() {
     for family in ["DejaVu Sans", "dejavu sans", "  DEJAVU SANS "] {
-        match invalid(vec![face(family, 400, BOLD)]) {
-            EngineError::InvalidFont { index, reason, .. } => {
-                assert_eq!(index, 0);
-                assert!(reason.contains("bundled"), "{family:?}: {reason}");
+        for weight in [400, 700] {
+            match invalid(vec![face(family, weight, BOLD)]) {
+                EngineError::InvalidFont { index, reason, .. } => {
+                    assert_eq!(index, 0);
+                    assert!(reason.contains("bundled"), "{family:?} {weight}: {reason}");
+                }
+                other => panic!("{family:?} {weight}: expected InvalidFont, got {other:?}"),
             }
-            other => panic!("{family:?}: expected InvalidFont, got {other:?}"),
         }
     }
-    assert!(Engine::try_new(cfg(vec![face("DejaVu Sans", 700, BOLD)])).is_ok());
+    assert!(Engine::try_new(cfg(vec![face("DejaVu Sans", 600, BOLD)])).is_ok());
     assert!(Engine::try_new(cfg(vec![FontFace::new(
         "DejaVu Sans",
         400,
@@ -431,5 +441,59 @@ fn woff2_collection_is_rejected() {
             assert!(reason.contains("collection"), "{reason}");
         }
         other => panic!("expected InvalidFont, got {other:?}"),
+    }
+}
+
+/// Issue #56: with no host fonts, `font-weight:700` paints the bundled
+/// DejaVu Sans Bold, not the regular face: in an unknown family (Mainnet's
+/// "MS Sans Serif" stack today), in `sans-serif`, and in "DejaVu Sans".
+#[test]
+fn bold_without_host_fonts_paints_bundled_bold() {
+    for fam in [
+        "\"MS Sans Serif\",Arial,sans-serif",
+        "sans-serif",
+        "\"DejaVu Sans\"",
+    ] {
+        let regular = paint_with(vec![], &format!("<p style='font-family:{fam}'>x</p>"));
+        let bold = paint_with(
+            vec![],
+            &format!("<p style='font-family:{fam};font-weight:700'>x</p>"),
+        );
+        let (r, b) = (ink(&regular), ink(&bold));
+        println!("{fam}: ink 400 {r}, 700 {b}");
+        assert!(r > 0, "{fam}: regular must paint");
+        assert!(b > r, "{fam}: 700 must paint heavier than 400 ({b} vs {r})");
+    }
+    // The bundled bold is the same face a host registering DejaVu Sans Bold
+    // under its own family gets: identical pixels.
+    let bundled = paint_with(vec![], "<p style='font-weight:700'>x</p>");
+    let host = paint_with(
+        vec![face("Host", 700, BOLD)],
+        "<p style='font-family:Host;font-weight:700'>x</p>",
+    );
+    assert_eq!(diff(&bundled, &host), 0, "bundled bold is DejaVu Sans Bold");
+}
+
+/// Graph review of #61: a paragraph that mixes 400 and 700 in a family list
+/// with no generic and no registered family paints each run in its own
+/// bundled face: the same pixels as DejaVu regular + bold registered as a
+/// host family. Before the script fallback, parley's last-resort face (one
+/// per paragraph, picked without regard to weight) painted every run.
+#[test]
+fn mixed_weights_in_an_unknown_family_paint_their_own_faces() {
+    let real = || vec![face("Ref", 400, REGULAR), face("Ref", 700, BOLD)];
+    for inner in [
+        "Plain <b>Bold</b>",
+        "<b>Bold</b> Plain",
+        "<b>Exit</b> this <b>lease?</b>",
+    ] {
+        let want = paint_with(real(), &format!("<p style=\"font-family:Ref\">{inner}</p>"));
+        for fam in ["Host", "'MS Sans Serif'", "'MS Sans Serif',Arial"] {
+            let got = paint_with(
+                Vec::new(),
+                &format!("<p style=\"font-family:{fam}\">{inner}</p>"),
+            );
+            assert_eq!(diff(&want, &got), 0, "{fam}: {inner}");
+        }
     }
 }
