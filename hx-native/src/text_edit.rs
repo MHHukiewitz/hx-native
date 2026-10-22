@@ -144,6 +144,72 @@ pub fn format_grouped(canonical: &str) -> String {
     out
 }
 
+/// Issue #87 (Designer, HTML_CONTRACT §2 Ruling 5, Mainnet master
+/// 04c95f50): a number box's value `now` already is the last value `sent`
+/// when the two parse to the same number (`4.1` is a sent `4.10`), or when
+/// `now` does not parse as a number at all (not a value, nothing to send).
+/// Plain decimals compare exactly, digit by digit; anything else falls back
+/// to the parsed `f64`.
+pub fn number_is_sent(now: &str, sent: &str) -> bool {
+    match (SentNumber::parse(now), SentNumber::parse(sent)) {
+        (None, _) => true,
+        (Some(a), Some(b)) => a.same(&b),
+        (Some(_), None) => false,
+    }
+}
+
+/// A parsed number for [`number_is_sent`].
+#[derive(PartialEq, Debug)]
+enum SentNumber {
+    /// Plain decimal: sign, whole digits without leading zeros, fraction
+    /// digits without trailing zeros (zero is unsigned and empty).
+    Decimal(bool, String, String),
+    Float(f64),
+}
+
+impl SentNumber {
+    fn parse(text: &str) -> Option<Self> {
+        let t = text.trim();
+        let (neg, body) = match t.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, t.strip_prefix('+').unwrap_or(t)),
+        };
+        let (whole, frac) = body.split_once('.').unwrap_or((body, ""));
+        let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+        if digits(whole) && digits(frac) && !(whole.is_empty() && frac.is_empty()) {
+            let whole = whole.trim_start_matches('0').to_string();
+            let frac = frac.trim_end_matches('0').to_string();
+            let zero = whole.is_empty() && frac.is_empty();
+            return Some(SentNumber::Decimal(neg && !zero, whole, frac));
+        }
+        t.parse::<f64>()
+            .ok()
+            .filter(|f| f.is_finite())
+            .map(SentNumber::Float)
+    }
+
+    fn as_f64(&self) -> f64 {
+        match self {
+            SentNumber::Float(f) => *f,
+            SentNumber::Decimal(neg, whole, frac) => {
+                let v: f64 = format!("0{whole}.{frac}0").parse().unwrap_or(0.0);
+                if *neg {
+                    -v
+                } else {
+                    v
+                }
+            }
+        }
+    }
+
+    fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (SentNumber::Decimal(..), SentNumber::Decimal(..)) => self == other,
+            _ => self.as_f64() == other.as_f64(),
+        }
+    }
+}
+
 /// Strip grouping commas (and accept them) then parse. Returns `None` if empty/invalid.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn parse_number_display(text: &str) -> Option<f64> {
@@ -945,6 +1011,49 @@ mod tests {
         };
         assert!(number_char_allowed("4", '.', &lim));
         assert!(number_char_allowed("4.", '3', &lim));
+    }
+}
+
+#[cfg(test)]
+mod number_is_sent_tests {
+    use super::number_is_sent;
+
+    /// Issue #87 (Ruling 5, Mainnet 04c95f50): by number, not text.
+    #[test]
+    fn equal_numbers_are_the_sent_value() {
+        for (now, sent) in [
+            ("4.1", "4.10"),
+            ("4.10", "4.1"),
+            ("04.100", "4.1"),
+            ("7", "7.0"),
+            ("0", "-0"),
+            ("-0.0", "0"),
+            (".5", "0.5"),
+            ("+3", "3"),
+            ("100", "1e2"),
+            ("", "4.1"),
+            ("abc", "4.1"),
+            ("-", "4.1"),
+            ("", ""),
+        ] {
+            assert!(number_is_sent(now, sent), "{now:?} vs {sent:?}");
+        }
+    }
+
+    #[test]
+    fn different_numbers_send() {
+        for (now, sent) in [
+            ("4.11", "4.1"),
+            ("-4.1", "4.1"),
+            ("41", "4.1"),
+            ("0.1", "1"),
+            ("10", "1"),
+            ("5", ""),
+            ("5", "abc"),
+            ("100.000000000000001", "100"),
+        ] {
+            assert!(!number_is_sent(now, sent), "{now:?} vs {sent:?}");
+        }
     }
 }
 

@@ -7,7 +7,9 @@
 //! contribute a `(name, value)` pair in document order — the same shape as
 //! HTML form serialization and htmx. Use [`args_get`] for the first value and
 //! [`args_get_all`] for every value. The args type stays `Vec<(String, String)>`
-//! so Mainnet's existing consumers keep working.
+//! so Mainnet's existing consumers keep working. An unchecked checkbox or
+//! radio contributes nothing, even when it is the element that fired (issue
+//! #82: an untick posts the form without the box, as htmx does).
 //!
 //! When the triggering element has `name=` / `value=` and the form also has a
 //! field with that name, both appear: the trigger's value first, then the
@@ -63,8 +65,13 @@ pub fn collect_action_args(
     // Any element (button, tr, input, select, …) with name= contributes a
     // pair, matching htmx. Form controls use their control value (selected
     // option, checkbox value, …); other elements use the `value` attribute.
+    // Issue #82 (Mainnet #791): a checkbox or radio is posted only while it is
+    // checked, the trigger included (htmx `shouldInclude`), so an untick sends
+    // the form without the box.
     if let Some(name) = named_attr(source, "name") {
-        args.push((name, trigger_element_value(doc, source)));
+        if !is_unchecked_checkable(source) {
+            args.push((name, trigger_element_value(doc, source)));
+        }
     }
 
     // Then named controls in the closest ancestor form (document order).
@@ -200,7 +207,8 @@ fn trigger_element_value(doc: &HtmlDocument, node: &Node) -> String {
             let ty = input_type(node);
             match ty.as_str() {
                 "checkbox" | "radio" => {
-                    // Trigger always contributes its value attr (htmx); default "on".
+                    // A checked trigger contributes its value attr (htmx);
+                    // default "on". Unchecked ones never get here (#82).
                     match attr(node, "value") {
                         None => "on".to_string(),
                         Some(v) => v,
@@ -695,6 +703,13 @@ fn option_value(node: &Node) -> String {
     }
     // HTML: missing value attribute → option's text.
     node.text_content()
+}
+
+/// An `<input type="checkbox|radio">` that is not checked (issue #82).
+fn is_unchecked_checkable(node: &Node) -> bool {
+    tag_name(node) == "input"
+        && matches!(input_type(node).as_str(), "checkbox" | "radio")
+        && !is_checked(node)
 }
 
 fn is_checked(node: &Node) -> bool {

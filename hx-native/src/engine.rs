@@ -53,7 +53,8 @@ use crate::text_edit::{
     apply_group_display_all, apply_unfocused_display, backspace, caret_device_rect, commit_field,
     delete_forward, delete_selection, editor_text, filter_number_insert, has_selection,
     insert_text, is_disabled, is_editable_input, move_end, move_home, move_left, move_right,
-    place_caret_at, prepare_focus_display, resolve_step_target, select_all, select_word_at,
+    number_is_sent, place_caret_at, prepare_focus_display, resolve_step_target, select_all,
+    select_word_at,
     selected_text, step_and_regroup, step_direction, sync_value_from_editor,
     text_outside_selection, TextEditSession, CARET_BLINK_HALF_PERIOD,
 };
@@ -403,6 +404,9 @@ struct SpinHold {
     /// last `change`, or the value at focus): the release reports only a
     /// value that differs from it (issue #81, Ruling 5).
     reported: String,
+    /// A repeat step found the box held at min or max: later repeats would
+    /// move nothing, so the hold stops dirtying the box (Graph review).
+    pinned: bool,
 }
 
 /// Issue #81: the wait before a held arrow starts repeating.
@@ -1544,12 +1548,10 @@ impl Engine {
             .get_mut(&SurfaceId::DEFAULT)
             .and_then(|s| s.live.as_mut())
         {
-            if let Some(hold) = live.spin_hold.as_mut() {
-                if let Some(at) = Instant::now().checked_sub(held) {
-                    hold.pressed_at = at;
-                }
-            }
-            live.advance_spin_hold();
+            // Graph review of #84: the repeat count comes from `held` itself,
+            // not from a wall-clock read, so the 400/500 ms boundaries in the
+            // tests cannot drift under load.
+            live.advance_spin_hold_by(Some(held));
         }
     }
 
@@ -3186,7 +3188,21 @@ impl LiveSurface {
             InputEvent::Paste(s) => self.on_paste(s),
             InputEvent::Copy => self.on_copy(false),
             InputEvent::Cut => self.on_copy(true),
-            InputEvent::PointerLeave => self.on_pointer_leave(),
+            InputEvent::PointerLeave => {
+                // Graph review of #84: a host that loses the pointer (Mainnet
+                // drops a release outside the panel and sends PointerLeave)
+                // ends a held arrow like a release elsewhere (Q3): the repeat
+                // stops and the one `change` is queued, never a repeat that
+                // runs on with no release to stop it.
+                if self.press_is_spin_arrow() {
+                    let arrow = self.press.take().map(|p| p.id).unwrap_or_default();
+                    let out = self.release_spin_hold(ctx, &arrow);
+                    if !matches!(out, InputOutcome::None) {
+                        self.released_outcomes.push(out);
+                    }
+                }
+                self.on_pointer_leave()
+            }
             InputEvent::PointerMove { x, y, .. } => self.on_pointer_move(x, y),
             InputEvent::PointerDown { x, y, button, mods } => {
                 self.on_pointer_down(ctx, x, y, button, mods)
@@ -4080,6 +4096,7 @@ impl LiveSurface {
             pressed_at: Instant::now(),
             repeats: 0,
             reported,
+            pinned: false,
         });
         Some(out)
     }
@@ -4111,6 +4128,14 @@ impl LiveSurface {
     /// Issue #81 (Designer ruling 2): the repeat steps a held ▲/▼ owes by now.
     /// Called from `sync`; stops on its own once the box is gone or greyed.
     fn advance_spin_hold(&mut self) {
+        self.advance_spin_hold_by(None);
+    }
+
+    /// [`Self::advance_spin_hold`] with the time held given (tests) or read
+    /// from the press time (`None`). A box that lost the focus since the
+    /// press (Tab, a host focus move, a click that blurred it) stops
+    /// repeating: its blur already reported the value (Graph review of #84).
+    fn advance_spin_hold_by(&mut self, held: Option<std::time::Duration>) {
         let Some(hold) = self.spin_hold.clone() else {
             return;
         };
@@ -4118,21 +4143,33 @@ impl LiveSurface {
             .doc
             .get_node(hold.target_nid)
             .is_some_and(|n| is_number_input(n) && !is_disabled(n));
-        if !live {
+        let lost_focus = hold.target_id.is_some()
+            && self.focus.focused_id.as_deref() != hold.target_id.as_deref();
+        // No arrow press any more (a path that cleared `press` without the
+        // release): nothing can end this hold, so end it now.
+        if !live || lost_focus || !self.press_is_spin_arrow() {
             self.spin_hold = None;
             return;
         }
-        let due = spin_repeats_due(hold.pressed_at.elapsed());
+        // Pinned at min or max: further steps move nothing, so do not mark
+        // the box dirty (and reset its caret blink) every 100 ms for nothing.
+        if hold.pinned {
+            return;
+        }
+        let due = spin_repeats_due(held.unwrap_or_else(|| hold.pressed_at.elapsed()));
         let mut done = hold.repeats;
+        let mut pinned = false;
         while done < due {
             done += 1;
             if !self.spin_step_target(hold.target_nid, hold.target_id.as_deref(), hold.dir) {
                 // Held at min or max: the remaining steps would not move it.
                 done = due;
+                pinned = true;
             }
         }
         if let Some(h) = self.spin_hold.as_mut() {
             h.repeats = done;
+            h.pinned = pinned;
         }
     }
 
@@ -4175,7 +4212,8 @@ impl LiveSurface {
             self.queue_text_field_damage(hold.target_nid);
         }
         // Ruling 5 (b6f2c892): the box's value against the last value sent.
-        let already_sent = self.attr(&tid, "value").unwrap_or_default() == hold.reported;
+        let now = self.attr(&tid, "value").unwrap_or_default();
+        let already_sent = self.is_sent_value(hold.target_nid, &now, &hold.reported);
         self.mark_committed(hold.target_nid, &tid);
         if already_sent {
             return InputOutcome::None;
@@ -4191,8 +4229,25 @@ impl LiveSurface {
     /// does ▲ at max or ▼ at min.
     fn at_sent_value(&self, nid: NodeId, id: &str) -> bool {
         self.text_edit.as_ref().is_some_and(|s| {
-            s.node_id == nid && self.attr(id, "value").unwrap_or_default() == s.value_at_change
+            s.node_id == nid
+                && self.is_sent_value(
+                    nid,
+                    &self.attr(id, "value").unwrap_or_default(),
+                    &s.value_at_change,
+                )
         })
+    }
+
+    /// Issue #87 (Designer, HTML_CONTRACT §2 Ruling 5, Mainnet master
+    /// 04c95f50): whether `now` is the last value `sent` for `nid`. A number
+    /// box compares by number ([`number_is_sent`]): `4.1` is a sent `4.10`,
+    /// and text that does not parse sends nothing. Other boxes compare text.
+    fn is_sent_value(&self, nid: NodeId, now: &str, sent: &str) -> bool {
+        if self.doc.get_node(nid).is_some_and(is_number_input) {
+            number_is_sent(now, sent)
+        } else {
+            now == sent
+        }
     }
 
     /// Record `id`'s value as committed for the box being edited (issue #81):
@@ -4291,7 +4346,7 @@ impl LiveSurface {
         self.mark_dom_dirty();
         self.queue_text_field_damage(session.node_id);
         let value_now = self.attr(&session.id, "value").unwrap_or_default();
-        let change = if value_now != session.value_at_change {
+        let change = if !self.is_sent_value(session.node_id, &value_now, &session.value_at_change) {
             self.fire_change(ctx, &session.id)
         } else {
             InputOutcome::None
