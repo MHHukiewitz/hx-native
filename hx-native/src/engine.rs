@@ -2258,6 +2258,11 @@ impl LiveSurface {
         // re-authored host `disabled` on the swapped-in markup is never
         // mistaken for a stale engine-owned grey.
         self.invalidate_rule_disabled_in(target_id);
+        // Graph review of #102: the markup `min`/`max`/`step` snapshot of an
+        // input this swap re-renders is retaken from its new markup, so a
+        // range under `InputLimits::at_least` follows a new markup `max` and
+        // removing the limits later restores the markup the game drew last.
+        self.invalidate_limits_markup_in(target_id);
 
         // Record old subtree ink from the last paint snapshot (no resolve here —
         // sync must not run style/layout). compute_plan merges these so old
@@ -3104,6 +3109,35 @@ impl LiveSurface {
             .collect();
         for id in stale {
             self.rule_disabled.remove(&id);
+        }
+    }
+
+    /// Drop the `limits_markup` snapshot of every `(action, input)` whose
+    /// inputs all sit inside `target_id` (the swap replaces their markup).
+    /// A key with an input outside the swap keeps its snapshot: that input
+    /// still carries the engine's attributes, not markup.
+    fn invalidate_limits_markup_in(&mut self, target_id: NodeId) {
+        if self.limits_markup.is_empty() {
+            return;
+        }
+        let stale: Vec<(String, String)> = self
+            .limits_markup
+            .keys()
+            .filter(|(action, input)| {
+                let inputs: Vec<NodeId> = self
+                    .forms_for_action(action)
+                    .into_iter()
+                    .flat_map(|f| self.range_or_number_inputs_named(f, input))
+                    .collect();
+                !inputs.is_empty()
+                    && inputs
+                        .iter()
+                        .all(|&n| n == target_id || self.is_descendant(target_id, n))
+            })
+            .cloned()
+            .collect();
+        for key in stale {
+            self.limits_markup.remove(&key);
         }
     }
 
