@@ -23,18 +23,19 @@ use crate::focus::{focusable_ids, ids_in_document_order, step_focus};
 use crate::fonts::{bundled_font_context, HostFonts};
 use crate::form_args::{
     capture_applied_controls, capture_form_controls, clamp_snap_value, clamp_value, closest_form,
-    collect_action_args, collect_applied_control_nids, format_numeric, is_number_input,
-    is_numeric_input, parse_f64, range_page, range_page_toward_x, range_to_end,
-    set_range_value_from_x, step_numeric_value, write_value_attr, NumericLimits, MAX_SAFE_NUMBER,
+    collect_action_args, collect_applied_control_nids, control_current_value,
+    control_value_in_args, format_numeric, is_number_input, is_numeric_input, parse_f64,
+    patch_control_arg, range_page, range_page_toward_x, range_to_end, set_range_value_from_x,
+    step_numeric_value, value_control_kind, write_value_attr, NumericLimits, MAX_SAFE_NUMBER,
 };
 use crate::form_controls::{
     activate_checkable, checkbox_checked_by_name, control_is_disabled, form_control_at_point,
-    named_controls_in_form, select_options, select_radio, select_set_index, select_step,
-    sync_outputs_for, toggle_checkbox, FormControlKind, FormControlRef,
+    named_controls_in_form, radios_in_group, select_options, select_radio, select_set_index,
+    select_step, sync_outputs_for, toggle_checkbox, FormControlKind, FormControlRef,
 };
 use crate::memory::estimate_surface_engine_bytes;
 use crate::paint::{paint_damage_into, paint_rgba};
-use crate::pending::{PendingEntry, PendingState, PendingTimeout, QueuedRelease};
+use crate::pending::{CatchUp, PendingEntry, PendingState, PendingTimeout, QueuedRelease};
 use crate::scroll::{
     all_bars, author_padding_right_css, bar_geometry, bar_hit, bar_unoccluded, can_scroll,
     container_damage_rect, containers_at, gutter_css, is_scroll_container, max_offset_y,
@@ -54,8 +55,8 @@ use crate::text_edit::{
     delete_forward, delete_selection, editor_text, filter_number_insert, has_selection,
     insert_text, is_disabled, is_editable_input, move_end, move_home, move_left, move_right,
     number_is_sent, place_caret_at, prepare_focus_display, resolve_step_target, select_all,
-    select_word_at, selected_text, step_and_regroup, step_direction, sync_value_from_editor,
-    text_outside_selection, TextEditSession, CARET_BLINK_HALF_PERIOD,
+    select_word_at, selected_text, set_editor_text, step_and_regroup, step_direction,
+    sync_value_from_editor, text_outside_selection, TextEditSession, CARET_BLINK_HALF_PERIOD,
 };
 use crate::trigger::{
     filter_ctx_from_key, keydown_repeat_allowed, FilterCtx, FromTarget, TriggerEvent,
@@ -290,6 +291,22 @@ struct LiveSurface {
     /// Issue #35: the range's value when the press began; the release fires
     /// `change` only when the value differs (HTML: no change, no event).
     range_press_value: Option<String>,
+    /// Issue #89 (Designer, HTML_CONTRACT `hx-sync`, Mainnet master
+    /// 188feffd): value controls whose newest committed value the game has
+    /// not answered yet, at most one per control, in commit order.
+    catch_up: Vec<CatchUp>,
+    /// Issue #89: the value control a `change` being fired came from (the
+    /// trigger may bubble to its form), so a held `change` knows its box.
+    change_origin: Option<String>,
+    /// Issue #89: text the player was typing, not committed, in the box a
+    /// redraw replaced: the rebound editor gets it back (box id, text).
+    kept_typing: Option<(String, String)>,
+    /// Issue #94 (Graph review): per radio group `name`, the value the last
+    /// request a radio of that group sent carried. A radio's catch-up
+    /// compares with it, since another radio of the group may have sent
+    /// after the held one's request (b, then c, then b while b is pending).
+    /// At most one entry per radio group in the document.
+    radio_sent: HashMap<String, String>,
     /// Issue #35: engine-drawn slider geometry painted last frame; a change
     /// damages that slider's old and new rects only.
     last_sliders: Vec<SliderGeom>,
@@ -698,10 +715,11 @@ impl Engine {
     /// upload is still reported on the first paint after it becomes visible.
     pub fn paint_surface(&mut self, id: SurfaceId) -> Result<PaintOutput, EngineError> {
         let t0 = Instant::now();
+        // Issue #89: a timeout runs the catch-up before this frame renders.
+        self.tick_surface_pending(id);
         let last_used = self.touch_lru();
         self.frame_count = self.frame_count.saturating_add(1);
         let paint_mode = self.config.paint_mode;
-        let timeout_frames = self.config.pending_timeout_frames;
 
         let surface = self
             .surfaces
@@ -715,7 +733,6 @@ impl Engine {
             .as_mut()
             .ok_or(EngineError::SurfaceEvicted(id))?;
 
-        live.pending.tick_frames(timeout_frames);
         let result = live.render(size, paint_mode)?;
         self.style_layout_passes = self
             .style_layout_passes
@@ -1279,10 +1296,32 @@ impl Engine {
     /// (for timeout tests).
     pub fn test_tick_frame(&mut self) {
         self.frame_count = self.frame_count.saturating_add(1);
-        let timeout_frames = self.config.pending_timeout_frames;
-        for live in self.surfaces.values_mut().filter_map(|s| s.live.as_mut()) {
-            live.pending.tick_frames(timeout_frames);
+        let ids: Vec<SurfaceId> = self.surfaces.keys().copied().collect();
+        for id in ids {
+            self.tick_surface_pending(id);
         }
+    }
+
+    /// Age surface `id`'s pending requests one frame (A3c timeouts); a timed-
+    /// out request still runs its catch-up (issue #89).
+    fn tick_surface_pending(&mut self, id: SurfaceId) {
+        let Self {
+            surfaces,
+            declared_actions,
+            requests,
+            config,
+            ..
+        } = self;
+        let Some(live) = surfaces.get_mut(&id).and_then(|s| s.live.as_mut()) else {
+            return;
+        };
+        let mut ctx = ActionCtx {
+            surface: id,
+            key_releases: config.key_releases,
+            declared_actions,
+            requests,
+        };
+        live.tick_pending(&mut ctx, config.pending_timeout_frames);
     }
 
     /// Test helper: current focus.
@@ -1724,6 +1763,10 @@ impl LiveSurface {
             range_grab: 0.0,
             range_paging: false,
             range_press_value: None,
+            catch_up: Vec::new(),
+            change_origin: None,
+            kept_typing: None,
+            radio_sent: HashMap::new(),
             last_sliders: Vec::new(),
             open_select: None,
             select_hover_row: None,
@@ -2237,6 +2280,7 @@ impl LiveSurface {
             false
         });
         if replaces_focused {
+            self.kept_typing = self.uncommitted_typing();
             if let Some(s) = self.text_edit.as_mut() {
                 s.needs_prepare = true;
             }
@@ -2268,6 +2312,8 @@ impl LiveSurface {
                 mutr.remove_and_drop_node(wrapper_id);
             }
         }
+        // Issue #89: a redraw never overwrites a newer committed value.
+        self.restore_catch_up_values();
 
         self.mark_dom_dirty();
         self.mark_paint_dirty();
@@ -2383,8 +2429,27 @@ impl LiveSurface {
             );
             return;
         }
-        self.form_baselines
-            .insert(form_id.to_string(), self.capture_form_current(form_id));
+        let mut baseline = self.capture_form_current(form_id);
+        // Issue #94 (Mainnet 5983ff17): a control with an unanswered commit
+        // keeps the game's last value as its baseline, never the put-back,
+        // so the form reads as changed until the game answers.
+        if !self.catch_up.is_empty() {
+            for (i, (nid, ..)) in capture_form_controls(&self.doc, form_id)
+                .into_iter()
+                .enumerate()
+            {
+                if let Some(e) = self
+                    .catch_up
+                    .iter()
+                    .find(|e| self.doc.get_element_by_id(&e.control_id) == Some(nid))
+                {
+                    if let Some(slot) = baseline.get_mut(i) {
+                        slot.1 = e.game.clone().unwrap_or_else(|| e.sent.clone());
+                    }
+                }
+            }
+        }
+        self.form_baselines.insert(form_id.to_string(), baseline);
     }
 
     /// `true` (clean, so the action greys) when `form_id`'s live values equal
@@ -3905,11 +3970,15 @@ impl LiveSurface {
     }
 
     fn reconcile_text_edit(&mut self) {
+        // Issue #94: greying (markup, actions slice or a rule) drops a held
+        // change before the box being edited is reconciled.
+        self.drop_greyed_catch_up();
         let Some(session) = self.text_edit.clone() else {
             return;
         };
         let Some(nid) = self.doc.get_element_by_id(&session.id) else {
             self.text_edit = None;
+            self.kept_typing = None;
             if self.focus.focused_id.as_deref() == Some(session.id.as_str()) {
                 self.focus.focused_id = None;
             }
@@ -3946,7 +4015,9 @@ impl LiveSurface {
                     self.key_hold = None;
                 }
             }
+            // Ruling 6: a greyed box drops the text being typed too.
             self.text_edit = None;
+            self.kept_typing = None;
             if self.focus.focused_id.as_deref() == Some(session.id.as_str()) {
                 self.focus.focused_id = None;
             }
@@ -3973,6 +4044,9 @@ impl LiveSurface {
             s.last_caret_rect = None;
             s.needs_prepare = true;
         }
+        // Issue #89: a box with a held or unanswered commit keeps the last
+        // value actually sent as its step base and restore value.
+        self.sync_session_sent();
         self.queue_text_field_damage(nid);
         self.mark_paint_dirty();
     }
@@ -3993,6 +4067,23 @@ impl LiveSurface {
             return;
         }
         prepare_focus_display(&mut self.doc, nid);
+        // Issue #89 (Mainnet 188feffd): text the player was typing survives
+        // the redraw; it stays uncommitted, as before the swap.
+        if let Some((kid, text)) = self.kept_typing.take() {
+            if kid == session.id {
+                let is_number = self.doc.get_node(nid).is_some_and(is_number_input);
+                let fallback = self
+                    .text_edit
+                    .as_ref()
+                    .map(|s| s.value_at_focus.clone())
+                    .unwrap_or_default();
+                set_editor_text(&mut self.doc, nid, &text);
+                let _ = sync_value_from_editor(&mut self.doc, nid, is_number, false, &fallback);
+                self.doc.with_text_input(nid, |mut driver| {
+                    driver.move_to_text_end();
+                });
+            }
+        }
         // Issue #35: the rebound node gains FOCUS here, after this frame's
         // resolve; restyle now so its `:focus` look (outline) is in this
         // frame instead of one frame late (partial == full on the swap frame).
@@ -4134,6 +4225,376 @@ impl LiveSurface {
             .as_ref()
             .filter(|s| s.node_id == nid)
             .map(|s| s.value_at_change.clone())
+    }
+
+    /// Issue #89 (Designer, HTML_CONTRACT `hx-sync`, Mainnet master
+    /// 188feffd): hold back the `change` value control `ctrl_id` committed
+    /// while `source_id`'s request is pending. It is not marked as sent: the
+    /// box keeps the last value actually sent as its step base and restore
+    /// value, and [`Self::run_catch_up`] sends the newest committed value once
+    /// the request finishes. `false` for a control a request cannot carry
+    /// (no name, or no pair in the pending request), which keeps `hx-sync`.
+    fn hold_change(&mut self, source_id: &str, ctrl_id: &str) -> bool {
+        let Some(nid) = self.doc.get_element_by_id(ctrl_id) else {
+            return false;
+        };
+        let Some(node) = self.doc.get_node(nid) else {
+            return false;
+        };
+        let Some(committed) = control_current_value(&self.doc, node) else {
+            return false;
+        };
+        if let Some(e) = self.catch_up.iter_mut().find(|e| e.control_id == ctrl_id) {
+            e.source_id = source_id.to_string();
+            e.committed = committed;
+            e.held = true;
+        } else {
+            let Some(sent) = self
+                .pending
+                .by_source
+                .get(source_id)
+                .and_then(|p| control_value_in_args(node, &p.args))
+            else {
+                return false;
+            };
+            self.catch_up.push(CatchUp {
+                control_id: ctrl_id.to_string(),
+                source_id: source_id.to_string(),
+                sent,
+                committed,
+                game: None,
+                held: true,
+            });
+        }
+        // A radio's commit unticks its group; re-read the other controls
+        // (not the box being typed in, nor a slider being dragged).
+        let skip: Vec<String> = [
+            Some(ctrl_id.to_string()),
+            self.text_edit.as_ref().map(|s| s.id.clone()),
+            self.range_drag_id.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        for i in 0..self.catch_up.len() {
+            if skip.contains(&self.catch_up[i].control_id) {
+                continue;
+            }
+            let now = self
+                .doc
+                .get_element_by_id(&self.catch_up[i].control_id)
+                .and_then(|n| self.doc.get_node(n))
+                .and_then(|n| control_current_value(&self.doc, n));
+            if let Some(now) = now {
+                self.catch_up[i].committed = now;
+            }
+        }
+        self.sync_session_sent();
+        true
+    }
+
+    /// Issue #89: the player committed `value` in box `id` (an arrow step,
+    /// Enter, blur, a key release), sent or not.
+    fn note_committed(&mut self, id: &str, value: &str) {
+        if let Some(e) = self.catch_up.iter_mut().find(|e| e.control_id == id) {
+            e.committed = value.to_string();
+        }
+        self.sync_session_sent();
+    }
+
+    /// Issue #89 (point 3 of Graph's review): the box being edited steps from
+    /// and restores the last value actually sent, never a held one.
+    fn sync_session_sent(&mut self) {
+        let Some(s) = self.text_edit.as_mut() else {
+            return;
+        };
+        if let Some(e) = self.catch_up.iter().find(|e| e.control_id == s.id) {
+            s.value_at_change = e.sent.clone();
+        }
+    }
+
+    /// Issue #89: `a` and `b` are the same value of control `id` (by number
+    /// in a number box, #87).
+    fn same_control_value(&self, id: &str, a: &str, b: &str) -> bool {
+        if a == b {
+            return true;
+        }
+        let is_number = self
+            .doc
+            .get_element_by_id(id)
+            .and_then(|n| self.doc.get_node(n))
+            .is_some_and(is_number_input);
+        is_number && parse_f64(a).is_some() && parse_f64(b).is_some() && number_is_sent(a, b)
+    }
+
+    /// Issue #89 (Mainnet 188feffd): `source_id`'s request finished (done,
+    /// failed or timed out). An entry with nothing new committed is answered
+    /// and dropped. A held commit equal to the value sent needs nothing; any
+    /// other sends one `change` with the newest committed values, so fast
+    /// presses fold into it and the game ends on the box's value. Only a
+    /// player's commit holds a change, so the game's own redraw (a clamp or
+    /// a refusal) never starts another send.
+    fn run_catch_up(&mut self, ctx: &mut ActionCtx<'_>, source_id: &str) {
+        if self.pending.is_pending(source_id) {
+            return;
+        }
+        let entries = std::mem::take(&mut self.catch_up);
+        let mut kept = Vec::with_capacity(entries.len());
+        for e in entries {
+            if e.source_id == source_id
+                && (!e.held || {
+                    let sent = self.effective_sent(&e.control_id, &e.sent);
+                    self.same_control_value(&e.control_id, &e.committed, &sent)
+                })
+            {
+                continue;
+            }
+            kept.push(e);
+        }
+        self.catch_up = kept;
+        if !self.catch_up.iter().any(|e| e.source_id == source_id) {
+            self.sync_session_sent();
+            return;
+        }
+        let action = self
+            .bindings
+            .get(source_id)
+            .and_then(|b| b.hx_post.clone().map(|name| (name, b.hx_indicator.clone())));
+        let Some((action_name, indicator)) = action else {
+            self.catch_up.retain(|e| e.source_id != source_id);
+            return;
+        };
+        if self.disabled_actions.contains_key(&action_name) {
+            // Issue #94: a greyed control drops its held change.
+            self.drop_greyed_catch_up();
+            return;
+        }
+        let mut args = self.action_args_for(source_id);
+        for e in self.catch_up.iter().filter(|e| e.source_id == source_id) {
+            // The box being typed in posts its committed value, not the
+            // text in progress.
+            if let Some(node) = self
+                .doc
+                .get_element_by_id(&e.control_id)
+                .and_then(|n| self.doc.get_node(n))
+                .filter(|n| is_editable_input(n) || is_numeric_input(n))
+            {
+                patch_control_arg(node, &mut args, &e.committed);
+            }
+        }
+        let out = self.emit_action(
+            ctx,
+            source_id,
+            &action_name,
+            args,
+            TriggerInfo::Change,
+            indicator,
+        );
+        for e in self
+            .catch_up
+            .iter_mut()
+            .filter(|e| e.source_id == source_id)
+        {
+            e.held = false;
+            e.sent = e.committed.clone();
+        }
+        self.sync_session_sent();
+        self.released_outcomes.push(out);
+    }
+
+    /// Issue #89 (Mainnet 188feffd): a redraw (the answer to an older
+    /// request) never overwrites a value the player committed after it: each
+    /// control with a held or unanswered commit gets that value back. A
+    /// control the redraw removed is dropped from the catch-up. Runs inside
+    /// the swap, whose subtree is already damaged.
+    fn restore_catch_up_values(&mut self) {
+        let entries = std::mem::take(&mut self.catch_up);
+        let mut kept = Vec::with_capacity(entries.len());
+        for e in entries {
+            let Some(nid) = self.doc.get_element_by_id(&e.control_id) else {
+                continue;
+            };
+            let Some(node) = self.doc.get_node(nid) else {
+                continue;
+            };
+            let Some(now) = control_current_value(&self.doc, node) else {
+                continue;
+            };
+            let mut e = e;
+            e.game = Some(now.clone());
+            if now != e.committed {
+                self.put_control_value(nid, &e.control_id, &e.committed);
+            }
+            kept.push(e);
+        }
+        self.catch_up = kept;
+    }
+
+    /// Issue #89: write `value` (in `control_current_value`'s encoding) into
+    /// control `nid` (`id`): the selected option, the tick, the checked
+    /// radio, or the `value` attribute.
+    fn put_control_value(&mut self, nid: NodeId, id: &str, value: &str) {
+        let Some(node) = self.doc.get_node(nid) else {
+            return;
+        };
+        match value_control_kind(node) {
+            "select" => {
+                if let Some(i) = select_options(&self.doc, nid)
+                    .iter()
+                    .position(|o| o.value == value)
+                {
+                    select_set_index(&mut self.doc, nid, i);
+                }
+            }
+            "checkbox" => {
+                // Write the state and the `checked` attribute: a box a swap
+                // just inserted has no checked state yet (Blitz creates it
+                // from the attribute at layout), so a toggle alone is lost.
+                // A greyed box is written too (drop to the game's value).
+                self.put_checked(nid, value == "true");
+            }
+            "radio" => {
+                if value == "true" {
+                    let name = attr_of(node, "name").unwrap_or_default();
+                    for other in radios_in_group(&self.doc, &name) {
+                        if other != nid {
+                            self.put_checked(other, false);
+                        }
+                    }
+                    self.put_checked(nid, true);
+                }
+            }
+            _ => {
+                let _ = write_value_attr(&mut self.doc, nid, value);
+            }
+        }
+        let _ = sync_outputs_for(&mut self.doc, id);
+        self.mark_dom_dirty();
+    }
+
+    /// Issue #94 (Graph review): set checkbox or radio `nid` checked or not,
+    /// in its live state when it has one and in its `checked` attribute, so
+    /// a node a swap just inserted (no live state until layout) keeps it.
+    fn put_checked(&mut self, nid: NodeId, checked: bool) {
+        let has_attr = self
+            .doc
+            .get_node(nid)
+            .is_some_and(|n| attr_of(n, "checked").is_some());
+        let live = self
+            .doc
+            .get_node(nid)
+            .and_then(|n| n.element_data())
+            .and_then(|el| el.checkbox_input_checked());
+        if has_attr == checked && live.is_none_or(|l| l == checked) {
+            return;
+        }
+        self.doc.snapshot_node_state_only(nid);
+        if has_attr != checked {
+            let mut mutr = self.doc.mutate();
+            if checked {
+                mutr.set_attribute(nid, qual_name!("checked"), "");
+            } else {
+                mutr.clear_attribute(nid, qual_name!("checked"));
+            }
+        }
+        if let Some(node) = self.doc.get_node_mut(nid) {
+            if let Some(el) = node.element_data_mut() {
+                if el.checkbox_input_checked().is_some() {
+                    el.set_checkbox_input_checked(checked);
+                }
+            }
+            node.mark_ancestors_dirty();
+        }
+    }
+
+    /// Issue #94 (Graph review): what radio `id` carried in the last request
+    /// any radio of its group sent, in `control_current_value`'s encoding;
+    /// `fallback` for any other control or a group nothing has sent for.
+    fn effective_sent(&self, id: &str, fallback: &str) -> String {
+        let Some(node) = self
+            .doc
+            .get_element_by_id(id)
+            .and_then(|n| self.doc.get_node(n))
+        else {
+            return fallback.to_string();
+        };
+        if value_control_kind(node) != "radio" {
+            return fallback.to_string();
+        }
+        let name = attr_of(node, "name").unwrap_or_default();
+        match self.radio_sent.get(&name) {
+            Some(v) => {
+                let mine = attr_of(node, "value").unwrap_or_else(|| "on".to_string());
+                (*v == mine).to_string()
+            }
+            None => fallback.to_string(),
+        }
+    }
+
+    /// Issue #94 (Designer, HTML_CONTRACT `hx-sync`, Mainnet master
+    /// 5983ff17): when the game greys a control (its markup, an `actions`
+    /// state or an input rule) while it holds a change, the held change is
+    /// dropped, as Ruling 6 drops typed text, and the control shows the
+    /// game's value: the value a redraw drew, else the last value sent.
+    fn drop_greyed_catch_up(&mut self) {
+        if self.catch_up.is_empty() {
+            return;
+        }
+        let entries = std::mem::take(&mut self.catch_up);
+        let mut kept = Vec::with_capacity(entries.len());
+        for e in entries {
+            let Some(nid) = self.doc.get_element_by_id(&e.control_id) else {
+                continue;
+            };
+            let action_greyed = self
+                .bindings
+                .get(&e.source_id)
+                .and_then(|b| b.hx_post.as_ref())
+                .is_some_and(|a| self.disabled_actions.contains_key(a));
+            if !(action_greyed || control_is_disabled(&self.doc, nid)) {
+                kept.push(e);
+                continue;
+            }
+            let game = e.game.clone().unwrap_or_else(|| e.sent.clone());
+            let shown = self
+                .doc
+                .get_node(nid)
+                .and_then(|n| control_current_value(&self.doc, n));
+            if shown.as_deref() != Some(game.as_str()) {
+                self.put_control_value(nid, &e.control_id, &game);
+                if self.text_edit.as_ref().is_some_and(|s| s.node_id == nid) {
+                    set_editor_text(&mut self.doc, nid, &game);
+                }
+                apply_unfocused_display(&mut self.doc, nid);
+                self.queue_text_field_damage(nid);
+                self.mark_paint_dirty();
+            }
+        }
+        self.catch_up = kept;
+    }
+
+    /// Issue #89: the text being typed in the box being edited, when it is
+    /// not the committed value (Ruling 6 still drops it if the box greys).
+    /// A held arrow or key's steps are not typing: the replacement clears
+    /// the repeat and shows the game's value (#84).
+    fn uncommitted_typing(&mut self) -> Option<(String, String)> {
+        let s = self.text_edit.clone()?;
+        if self
+            .spin_hold
+            .as_ref()
+            .is_some_and(|h| h.target_nid == s.node_id)
+            || self.key_hold.as_deref() == Some(s.id.as_str())
+        {
+            return None;
+        }
+        let text = editor_text(&mut self.doc, s.node_id)?;
+        let is_number = self.doc.get_node(s.node_id).is_some_and(is_number_input);
+        let same = text == s.value_at_focus
+            || (is_number
+                && parse_f64(&text).is_some()
+                && parse_f64(&s.value_at_focus).is_some()
+                && number_is_sent(&text, &s.value_at_focus));
+        (!same).then_some((s.id, text))
     }
 
     /// True while the primary press started on a `data-hx-step` arrow.
@@ -4278,8 +4739,9 @@ impl LiveSurface {
         let value = self.attr(id, "value").unwrap_or_default();
         if let Some(s) = self.text_edit.as_mut().filter(|s| s.node_id == nid) {
             s.value_at_change = value.clone();
-            s.value_at_focus = value;
+            s.value_at_focus = value.clone();
         }
+        self.note_committed(id, &value);
     }
 
     fn focus_text_input(&mut self, ctx: &mut ActionCtx<'_>, id: &str) -> Option<InputOutcome> {
@@ -4369,6 +4831,7 @@ impl LiveSurface {
         self.mark_dom_dirty();
         self.queue_text_field_damage(session.node_id);
         let value_now = self.attr(&session.id, "value").unwrap_or_default();
+        self.note_committed(&session.id, &value_now);
         let change = if !self.is_sent_value(session.node_id, &value_now, &session.value_at_change) {
             self.fire_change(ctx, &session.id)
         } else {
@@ -4395,6 +4858,8 @@ impl LiveSurface {
                 needs_prepare: false,
             });
             self.reset_caret_blink();
+            // Issue #89: a held commit is not the value sent.
+            self.sync_session_sent();
         }
         Some(change)
     }
@@ -4412,6 +4877,8 @@ impl LiveSurface {
         }
         // Ruling 5: the box ends on the last value sent.
         if self.at_sent_value(session.node_id, &fid) {
+            let value = self.attr(&fid, "value").unwrap_or_default();
+            self.note_committed(&fid, &value);
             return Some(InputOutcome::None);
         }
         self.mark_committed(session.node_id, &fid);
@@ -4712,7 +5179,8 @@ impl LiveSurface {
     /// Single commit path for `hx-trigger="change"` (range release, toggle,
     /// select pick, arrow/spin step, typed Enter/blur).
     fn fire_change(&mut self, ctx: &mut ActionCtx<'_>, node_id: &str) -> InputOutcome {
-        self.fire_on(
+        let outer = self.change_origin.replace(node_id.to_string());
+        let out = self.fire_on(
             ctx,
             node_id,
             TriggerEvent::Change,
@@ -4724,7 +5192,9 @@ impl LiveSurface {
             TriggerInfo::Change,
             None,
             false,
-        )
+        );
+        self.change_origin = outer;
+        out
     }
 
     fn element_is_disabled_id(&self, id: &str) -> bool {
@@ -4838,6 +5308,16 @@ impl LiveSurface {
 
         // Pending / hx-sync.
         if self.pending.is_pending(source_id) {
+            // Issue #89 (Mainnet 188feffd): `drop` and `queue` are for
+            // clicks and actions; a value control's `change` is held and
+            // caught up when the pending request finishes.
+            if event == TriggerEvent::Change {
+                if let Some(ctrl) = self.change_origin.clone() {
+                    if self.hold_change(source_id, &ctrl) {
+                        return InputOutcome::None;
+                    }
+                }
+            }
             match binding.hx_sync {
                 SyncMode::Drop => {
                     return InputOutcome::None;
@@ -5137,6 +5617,7 @@ impl LiveSurface {
         indicator_id: Option<String>,
     ) -> InputOutcome {
         let request = ctx.requests.issue(ctx.surface);
+        self.note_radio_sent(source_id, &args);
 
         self.pending.insert(PendingEntry {
             request,
@@ -5156,6 +5637,35 @@ impl LiveSurface {
             args,
             source_id: source_id.to_string(),
             trigger,
+        }
+    }
+
+    /// Issue #94 (Graph review): a radio's request records what its group
+    /// sent (see `radio_sent`); groups no longer in the document are pruned.
+    fn note_radio_sent(&mut self, source_id: &str, args: &[(String, String)]) {
+        let Some(node) = self
+            .doc
+            .get_element_by_id(source_id)
+            .and_then(|n| self.doc.get_node(n))
+        else {
+            return;
+        };
+        if value_control_kind(node) != "radio" {
+            return;
+        }
+        let Some(name) = attr_of(node, "name").filter(|n| !n.is_empty()) else {
+            return;
+        };
+        let doc = &self.doc;
+        self.radio_sent
+            .retain(|g, _| !radios_in_group(doc, g).is_empty());
+        match args.iter().find(|(k, _)| *k == name) {
+            Some((_, v)) => {
+                self.radio_sent.insert(name, v.clone());
+            }
+            None => {
+                self.radio_sent.remove(&name);
+            }
         }
     }
 
@@ -5629,6 +6139,16 @@ impl LiveSurface {
                 q.indicator_id,
             );
             self.released_outcomes.push(outcome);
+        }
+        // Issue #89: a finished request, failed or not, runs the catch-up.
+        self.run_catch_up(ctx, &source_id);
+    }
+
+    /// Age pending requests by one frame; a timed-out request still runs
+    /// its source's catch-up (issue #89).
+    fn tick_pending(&mut self, ctx: &mut ActionCtx<'_>, timeout_frames: u32) {
+        for source_id in self.pending.tick_frames(timeout_frames) {
+            self.run_catch_up(ctx, &source_id);
         }
     }
 
@@ -6317,3 +6837,13 @@ fn remove_class_token(class: &str, token: &str) -> String {
 // Silence unused import when local_name is only needed in some paths.
 #[allow(unused_imports)]
 use local_name as _;
+
+/// Issue #94 (Graph review): attribute `name` of element `node`.
+fn attr_of(node: &blitz_dom::node::Node, name: &str) -> Option<String> {
+    node.attrs().and_then(|attrs| {
+        attrs
+            .iter()
+            .find(|a| &*a.name.local == name)
+            .map(|a| a.value.to_string())
+    })
+}
