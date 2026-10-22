@@ -3464,6 +3464,10 @@ impl LiveSurface {
         self.ensure_resolved();
         self.range_drag_released = None;
         // Issue #85: any press ends a click run unless it continues it below.
+        // Arrow presses are not text clicks (Designer, HTML_CONTRACT §2
+        // Ruling 7, Mainnet 04c95f50): `try_spin_press` steps on every press
+        // and never records one, so a fast double-click on ▲ steps twice,
+        // and an arrow press never counts toward a double- or triple-click.
         let prev_text_click = self.last_text_click.take();
 
         // Open select: press inside the list must not hit-test the element under
