@@ -504,7 +504,9 @@ pub(crate) fn range_snap(raw: f64, limits: &NumericLimits) -> f64 {
     }
     let min = limits.min.unwrap_or(-MAX_SAFE_NUMBER);
     let max = limits.max.unwrap_or(MAX_SAFE_NUMBER).max(min);
-    let places = step_decimal_places(limits.step);
+    // The grid's decimals are those of `step` and of its origin `min`
+    // (`min=0.5 step=1` has values 0.5, 1.5, …), as in `step_precise`.
+    let places = result_decimals(limits, 0.0);
     let v = round_decimal(snapped, places).clamp(min, max);
     // A clamp to a max that is off the step grid (0..10 step 3) leaves the
     // grid; like HTML, take the last on-grid value at or below max (9).
@@ -905,6 +907,38 @@ mod tests {
             format_numeric(range_snap(5.0, &lim(0.0, 4.99999999, 1.0))),
             "4"
         );
+    }
+
+    /// Graph review of #37 r4: the grid starts at `min`, so a `min` with more
+    /// decimals than `step` keeps them (0.5, 1.5, …, 9.5), like the arrows.
+    #[test]
+    fn range_snap_keeps_the_decimals_of_min() {
+        let lim = |min: f64, max: f64, step: f64| NumericLimits {
+            min: Some(min),
+            max: Some(max),
+            step,
+            unconstrained: false,
+        };
+        for (l, raw, want) in [
+            (lim(0.5, 10.0, 1.0), 1.4, "1.5"),
+            (lim(0.5, 10.0, 1.0), 10.0, "9.5"),
+            (lim(0.25, 5.0, 0.5), 0.6, "0.75"),
+            (lim(0.25, 5.0, 0.5), 5.0, "4.75"),
+            (lim(0.05, 1.0, 0.1), 0.05, "0.05"),
+            (lim(1.5, 9.0, 2.0), 9.0, "7.5"),
+        ] {
+            assert_eq!(format_numeric(range_snap(raw, &l)), want, "{raw}");
+        }
+        let l = lim(0.5, 10.0, 1.0);
+        let mut v = 0.5;
+        loop {
+            let n = super::step_precise(v, 1, &l);
+            if n == v {
+                break;
+            }
+            v = n;
+        }
+        assert_eq!(range_snap(10.0, &l), v, "End agrees with the arrows' top");
     }
 
     #[test]

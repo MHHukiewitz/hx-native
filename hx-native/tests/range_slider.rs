@@ -1104,6 +1104,46 @@ fn a_page_past_an_off_grid_max_stays_on_the_step_grid() {
     );
 }
 
+/// Graph review of #37 r4: a `min` with more decimals than `step`
+/// (`0.5..10 step 1`): drag, groove page, PageUp and End stay on the grid
+/// from `min`, as the arrow keys do.
+#[test]
+fn a_fractional_min_keeps_drag_page_and_end_on_its_grid() {
+    let mut eng = boot(&graph_range(r#"min="0.5" max="10" step="1" value="0.5""#));
+    eng.test_set_focus("d");
+    let mut seen = Vec::new();
+    let k = |eng: &mut Engine, k: &str| {
+        let out = eng.input(key(k));
+        settle(eng, &out);
+        value(eng, "d")
+    };
+    seen.push(k(&mut eng, "PageUp"));
+    seen.push(k(&mut eng, "End"));
+    seen.push(k(&mut eng, "PageDown"));
+    assert_eq!(seen, ["1.5", "9.5", "8.5"]);
+    let c = slider(&eng, "d").0;
+    let y = c.1 + c.3 / 2.0;
+    let _ = eng.input(down(c.0 + 1.0, y));
+    let out = eng.input(up(c.0 + 1.0, y));
+    settle(&mut eng, &out);
+    assert_eq!(value(&eng, "d"), "7.5", "groove page");
+    let (cx, cy) = thumb_centre(&eng, "d");
+    let _ = eng.input(down(cx, cy));
+    let mut x = c.0 - 10.0;
+    while x <= c.0 + c.2 + 10.0 {
+        let _ = eng.input(mv(x, cy));
+        let v: f64 = value(&eng, "d").parse().unwrap();
+        assert!(
+            (0.5..=9.5).contains(&v) && (v - 0.5).fract() == 0.0,
+            "drag at x {x} gave {v}"
+        );
+        x += 1.0;
+    }
+    let out = eng.input(up(c.0 + c.2 + 10.0, cy));
+    settle(&mut eng, &out);
+    assert_eq!(value(&eng, "d"), "9.5");
+}
+
 /// A #16 limits change moves the thumb without touching `value`; the old
 /// thumb is repainted (partial == full).
 #[test]
