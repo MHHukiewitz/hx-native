@@ -23,6 +23,7 @@ mod scroll;
 mod select_ui;
 mod stylo_text_style;
 mod text_edit;
+mod tile_coalesce;
 mod trigger;
 mod types;
 pub mod worker;
@@ -40,6 +41,11 @@ pub use memory::{
     DOCUMENT_ESTIMATE_BASE_BYTES, DOCUMENT_ESTIMATE_PER_HTML_BYTE, RGBA_BYTES_PER_PIXEL,
 };
 pub use pending::PendingTimeout;
+#[doc(hidden)]
+pub use tile_coalesce::{
+    clear_tile_cache_for_test, set_tile_coalesce_for_test, take_tile_coalesce_counters_for_test,
+    TileCoalesceCounters,
+};
 pub use trigger::{FilterExpr, FromTarget, ParsedTrigger, TriggerEvent};
 pub use types::*;
 pub use worker::{
