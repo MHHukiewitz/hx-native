@@ -125,6 +125,9 @@ pub struct CatchUp {
     /// replaced). `None`: the game's value is `sent`. Issue #94: the
     /// unapplied-change baseline and a greyed control use it.
     pub game: Option<String>,
+    /// A radio's group as that redraw drew it: the `value` of the radio it
+    /// drew ticked, "" for none. Set with `game`, for radios only.
+    pub game_radio: Option<String>,
     /// A commit is held back: the catch-up has not been sent. `false` once
     /// the catch-up is in flight; the entry then only guards redraws until
     /// its answer.
