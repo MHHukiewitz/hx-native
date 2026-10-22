@@ -75,7 +75,9 @@ impl PendingState {
         self.by_source.insert(source, entry);
     }
 
-    pub fn tick_frames(&mut self, timeout_frames: u32) {
+    /// Age every pending entry by one frame; returns the sources whose
+    /// request timed out (issue #89: their value controls still catch up).
+    pub fn tick_frames(&mut self, timeout_frames: u32) -> Vec<String> {
         let mut timed = Vec::new();
         for entry in self.by_source.values_mut() {
             entry.frames_alive = entry.frames_alive.saturating_add(1);
@@ -83,7 +85,9 @@ impl PendingState {
                 timed.push((entry.request, entry.source_id.clone(), entry.frames_alive));
             }
         }
+        let mut sources = Vec::new();
         for (request, source_id, frames) in timed {
+            sources.push(source_id.clone());
             self.by_source.remove(&source_id);
             self.by_request.remove(&request);
             self.queued.remove(&source_id);
@@ -98,5 +102,26 @@ impl PendingState {
                 frames,
             });
         }
+        sources.sort();
+        sources
     }
+}
+
+/// Issue #89 (Designer, HTML_CONTRACT `hx-sync`, Mainnet master 188feffd):
+/// a value control whose newest committed value the game has not answered.
+#[derive(Clone, Debug)]
+pub struct CatchUp {
+    /// The control (`id`) the player committed.
+    pub control_id: String,
+    /// The element whose request is pending (the control or its form).
+    pub source_id: String,
+    /// What the control carried in the last request actually sent, in
+    /// `control_current_value`'s encoding.
+    pub sent: String,
+    /// The player's newest committed value, same encoding.
+    pub committed: String,
+    /// A commit is held back: the catch-up has not been sent. `false` once
+    /// the catch-up is in flight; the entry then only guards redraws until
+    /// its answer.
+    pub held: bool,
 }

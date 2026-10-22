@@ -144,7 +144,7 @@ fn control_baseline_pair(doc: &HtmlDocument, node: &Node) -> Option<(String, Str
 /// value). Unlike [`control_baseline_pair`], does not require a `name` —
 /// standalone `data-hx-applied` controls (Designer lock 2026-10-20) opt into
 /// `hx-changed` by the attribute alone, with or without a form or a name.
-fn control_current_value(doc: &HtmlDocument, node: &Node) -> Option<String> {
+pub(crate) fn control_current_value(doc: &HtmlDocument, node: &Node) -> Option<String> {
     match tag_name(node).as_str() {
         "input" => match input_type(node).as_str() {
             "checkbox" | "radio" => Some(is_checked(node).to_string()),
@@ -195,6 +195,60 @@ pub(crate) fn capture_applied_controls(
             Some((nid, current, applied))
         })
         .collect()
+}
+
+/// Issue #89 (Designer, HTML_CONTRACT `hx-sync`, Mainnet master 188feffd):
+/// what value control `node` contributed to a request that carried `args`,
+/// in [`control_current_value`]'s encoding (checkbox/radio `"true"` when its
+/// pair was posted, `"false"` otherwise). `None` for a control the request
+/// could not carry: no name, a hidden input, or a named value control with
+/// no pair in `args`.
+pub(crate) fn control_value_in_args(node: &Node, args: &[(String, String)]) -> Option<String> {
+    let name = named_attr(node, "name")?;
+    match tag_name(node).as_str() {
+        "input" => match input_type(node).as_str() {
+            "checkbox" | "radio" => {
+                let v = attr(node, "value").unwrap_or_else(|| "on".to_string());
+                Some(args.iter().any(|(k, a)| *k == name && *a == v).to_string())
+            }
+            "number" | "range" | "text" | "" => args
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.clone()),
+            _ => None,
+        },
+        "select" => args
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.clone()),
+        _ => None,
+    }
+}
+
+/// Issue #89: how a redraw puts a committed value back into `node`:
+/// `"select"`, `"checkbox"`, `"radio"`, or `"value"` (the `value` attribute).
+pub(crate) fn value_control_kind(node: &Node) -> &'static str {
+    match tag_name(node).as_str() {
+        "select" => "select",
+        "input" => match input_type(node).as_str() {
+            "checkbox" => "checkbox",
+            "radio" => "radio",
+            _ => "value",
+        },
+        _ => "value",
+    }
+}
+
+/// Issue #89: replace the value `node` posts in `args` (the first pair with
+/// its name) with `value`, for a text, number or range box whose live
+/// `value` holds text the player has not committed yet.
+pub(crate) fn patch_control_arg(node: &Node, args: &mut [(String, String)], value: &str) {
+    let Some(name) = named_attr(node, "name") else {
+        return;
+    };
+    if let Some(pair) = args.iter_mut().find(|(k, _)| *k == name) {
+        pair.1 = value.to_string();
+    }
 }
 
 /// Value for a triggering element: real control value for form controls,
