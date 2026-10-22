@@ -1,11 +1,12 @@
 //! Issue #110: the `text-overflow: ellipsis` redraw keeps each inline run's own
 //! style (weight, italic, colour, size, family from `<b>`, `<i>`, `<span>`),
-//! measures the cut with those styles, and draws the "…" in the style of the
-//! last visible run (Chrome's behaviour).
+//! measures the cut with those styles, and draws the "…" in the block's own
+//! style (CSS UI 3 §5.2.1; Chrome), not the last visible run's.
 //!
 //! Oracle: Blitz itself. An ellipsis paint must be byte-identical to Blitz
 //! painting the same markup with the cut already applied and `text-overflow:
-//! clip`, so every run is shaped and painted by Blitz's own per-span path.
+//! clip`, so every run is shaped and painted by Blitz's own per-span path. The
+//! reference puts "…" outside the child elements, i.e. in the block's style.
 
 use std::collections::HashMap;
 
@@ -59,6 +60,11 @@ fn boot(html: &str) -> Engine {
 fn paint(e: &mut Engine, scale: f32) -> RgbaImage {
     let out = e.paint(view(scale)).expect("paint");
     out.rgba.unwrap_or_else(|| e.last_frame().unwrap().clone())
+}
+
+/// `"kept…"` -> `"kept"`.
+fn kept(t: &str) -> &str {
+    t.strip_suffix(ELLIPSIS).expect("ends with the ellipsis")
 }
 
 fn dark(p: &[u8]) -> bool {
@@ -139,7 +145,7 @@ fn clipped_bold_ellipsis_has_same_first_40px_ink_as_clip() {
     }
 }
 
-/// Widths in CSS px of `<b>prefix…</b>` (or regular) for every cluster prefix,
+/// Widths in CSS px of `<b>prefix</b>…` (or regular) for every cluster prefix,
 /// laid out by Blitz as shrink-to-fit inline-blocks.
 fn measured_cut(scale: f32, bold: bool) -> String {
     let prefixes: Vec<&str> = LONG
@@ -150,7 +156,7 @@ fn measured_cut(scale: f32, bold: bool) -> String {
     let mut spans = String::new();
     for (i, p) in prefixes.iter().enumerate() {
         let inner = if bold {
-            format!("<b>{p}{ELLIPSIS}</b>")
+            format!("<b>{p}</b>{ELLIPSIS}")
         } else {
             format!("{p}{ELLIPSIS}")
         };
@@ -183,8 +189,9 @@ body {{ background:#fff; color:#000; font-family:"DejaVu Sans",sans-serif; font-
 #[test]
 fn bold_cut_point_matches_measuring_in_bold() {
     for scale in SCALES {
-        let (truncated, img, ref_img) =
-            ellipsis_vs_blitz(scale, &format!("<b>{LONG}</b>"), |t| format!("<b>{t}</b>"));
+        let (truncated, img, ref_img) = ellipsis_vs_blitz(scale, &format!("<b>{LONG}</b>"), |t| {
+            format!("<b>{}</b>{ELLIPSIS}", kept(t))
+        });
         let bold_cut = measured_cut(scale, true);
         let regular_cut = measured_cut(scale, false);
         eprintln!("s{scale}: truncated={truncated:?} bold={bold_cut:?} regular={regular_cut:?}");
@@ -196,7 +203,7 @@ fn bold_cut_point_matches_measuring_in_bold() {
         assert_eq!(
             d, 0,
             "s{scale}: ellipsis <b> must be byte-identical to Blitz painting \
-             <b>{truncated}</b> (diff={d})"
+             <b>prefix</b>… for {truncated:?} (diff={d})"
         );
     }
 }
@@ -206,8 +213,10 @@ fn mixed_regular_then_bold_runs_keep_each_weight() {
     for scale in SCALES {
         let inner = format!("Deal: <b>{LONG}</b>");
         let (truncated, img, ref_img) = ellipsis_vs_blitz(scale, &inner, |t| {
-            let rest = t.strip_prefix("Deal: ").expect("cut lands in the bold run");
-            format!("Deal: <b>{rest}</b>")
+            let rest = kept(t)
+                .strip_prefix("Deal: ")
+                .expect("cut lands in the bold run");
+            format!("Deal: <b>{rest}</b>{ELLIPSIS}")
         });
         let d = diff(&img, &ref_img);
         assert_eq!(
@@ -259,26 +268,26 @@ fn last_dot_pixels(e: &Engine, img: &RgbaImage, id: &str, scale: f32) -> Vec<[u8
 }
 
 #[test]
-fn ellipsis_takes_the_last_visible_runs_style() {
+fn ellipsis_is_styled_by_the_block_not_the_last_run() {
     for scale in SCALES {
-        // Cut lands in a red bold run: the "…" is red and bold.
+        // Cut lands in a red bold run: the "…" is still the block's regular black.
         let inner = format!("Deal <b style=\"color:#c00\">{LONG}</b>");
         let (truncated, img, ref_img) = ellipsis_vs_blitz(scale, &inner, |t| {
-            let rest = t.strip_prefix("Deal ").unwrap();
-            format!("Deal <b style=\"color:#c00\">{rest}</b>")
+            let rest = kept(t).strip_prefix("Deal ").unwrap();
+            format!("Deal <b style=\"color:#c00\">{rest}</b>{ELLIPSIS}")
         });
         let d = diff(&img, &ref_img);
         assert_eq!(
             d, 0,
-            "s{scale}: red bold ellipsis (truncated={truncated:?} diff={d})"
+            "s{scale}: block-styled ellipsis after red bold run (truncated={truncated:?} diff={d})"
         );
         let e = boot(&table_page("", &[("c", "", &inner)]));
         let mut e = e;
         let img2 = paint(&mut e, scale);
         let dot = last_dot_pixels(&e, &img2, "c", scale);
         assert!(
-            !dot.is_empty() && dot.iter().any(|p| reddish(p)),
-            "s{scale}: last dot must be red: {dot:?}"
+            !dot.is_empty() && !dot.iter().any(|p| reddish(p)),
+            "s{scale}: last dot must be the block's black, not red: {dot:?}"
         );
 
         // Cut lands in a regular run after a red bold one: the "…" is regular black.
@@ -306,7 +315,8 @@ fn ellipsis_takes_the_last_visible_runs_style() {
         );
         let (truncated, img, ref_img) = ellipsis_vs_blitz(scale, &inner, |t| {
             format!(
-                "<span style=\"font-style:italic;font-size:13px;font-family:'DejaVu Serif',serif\">{t}</span>"
+                "<span style=\"font-style:italic;font-size:13px;font-family:'DejaVu Serif',serif\">{}</span>{ELLIPSIS}",
+                kept(t)
             )
         });
         let d = diff(&img, &ref_img);

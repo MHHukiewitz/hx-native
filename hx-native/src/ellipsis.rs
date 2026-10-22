@@ -26,9 +26,11 @@
 //! size, family and spacing therefore survive truncation, and colour /
 //! decorations follow because paint resolves them from the same brush node.
 //!
-//! The ellipsis glyph takes the style of the **last visible cluster's run**
-//! (Chrome's behaviour), and its width is measured in that style, so the cut
-//! depends on which run it lands in.
+//! The ellipsis glyph is styled by the **block** (the ellipsis element's own
+//! style), not by the last visible run: CSS UI 3 §5.2.1 ("the ellipsis is
+//! styled and baseline-aligned according to the block") and Chrome. A `<b>`,
+//! `<u>` or coloured last run does not make the "…" bold, underlined or
+//! coloured, and its width is a single measurement in the block's style.
 //!
 //! # Paint without dirtying layout for hit-testing
 //!
@@ -370,33 +372,28 @@ fn width_key_bits(w_css: f32) -> u32 {
     rounded.to_bits()
 }
 
-/// Cluster end byte offsets, cumulative advances (layout / scaled px) and the
-/// brush node of the cluster that ends there. Advances come from Blitz's own
-/// per-run shaping, so a bold run is measured in bold. Entry 0 is "nothing
-/// visible" and carries the first cluster's brush (or `fallback`).
-fn cluster_cum_advances(layout: &Layout<TextBrush>, fallback: NodeId) -> Vec<(usize, f32, NodeId)> {
+/// Cluster end byte offsets and cumulative advances (layout / scaled px).
+/// Advances come from Blitz's own per-run shaping, so a bold run is measured
+/// in bold. Entry 0 is "nothing visible".
+fn cluster_cum_advances(layout: &Layout<TextBrush>) -> Vec<(usize, f32)> {
     let mut out = Vec::new();
     let mut cum = 0.0f32;
-    out.push((0, 0.0, fallback));
+    out.push((0, 0.0));
     for line in layout.lines() {
         for run in line.runs() {
             for cluster in run.clusters() {
                 cum += cluster.advance();
                 let end = cluster.text_range().end;
-                let brush = cluster.style().brush.id;
-                if out.len() > 1 && out.last().is_some_and(|(e, _, _)| *e == end) {
+                if out.len() > 1 && out.last().is_some_and(|(e, _)| *e == end) {
                     // Ligature continuation with zero extra bytes — keep max advance.
                     if let Some(last) = out.last_mut() {
                         last.1 = cum;
                     }
                 } else {
-                    out.push((end, cum, brush));
+                    out.push((end, cum));
                 }
             }
         }
-    }
-    if let Some(first) = out.get(1).map(|c| c.2) {
-        out[0].2 = first;
     }
     out
 }
@@ -527,14 +524,14 @@ fn align_params_for_element(doc: &HtmlDocument, element_id: NodeId) -> Option<Al
     })
 }
 
-/// Shape `text[..cut.end]` + `"…"` with each run's own style (one parley span
-/// per inline run, like Blitz) and the ellipsis in the last visible run's
-/// style; returns a paint `TextLayout`.
+/// Shape `text[..end]` + `"…"` with each run's own style (one parley span per
+/// inline run, like Blitz) and the ellipsis in the block's (root) style;
+/// returns a paint `TextLayout`.
 #[allow(clippy::too_many_arguments)]
 fn shape_text_layout(
     shaper: &mut EllipsisShaper,
     text: &str,
-    cut: &Cut,
+    end: usize,
     runs: &RunStyles,
     scale: f32,
     max_advance: Option<f32>,
@@ -546,13 +543,14 @@ fn shape_text_layout(
         .tree_builder(&mut shaper.font_ctx, scale, true, &runs.root);
     builder.set_base_direction(align.base_direction);
     for (range, id) in &runs.segments {
-        if range.start >= cut.end {
+        if range.start >= end {
             break;
         }
-        let slice = text.get(range.start..range.end.min(cut.end)).unwrap_or("");
+        let slice = text.get(range.start..range.end.min(end)).unwrap_or("");
         runs.push(&mut builder, *id, slice);
     }
-    runs.push(&mut builder, cut.ellipsis_brush, ELLIPSIS);
+    // CSS UI 3 §5.2.1 / Chrome: the ellipsis is styled by the block.
+    runs.push(&mut builder, runs.root_id, ELLIPSIS);
     let mut layout = Layout::new();
     let shaped_text = builder.build_into(&mut layout);
     layout.break_all_lines(max_advance);
@@ -589,48 +587,26 @@ fn measure_ellipsis_advance(
     layout.full_width()
 }
 
-/// Where to cut: keep `text[..end]`, then draw `"…"` in `ellipsis_brush`'s style.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Cut {
-    end: usize,
-    ellipsis_brush: NodeId,
-}
-
-/// Pick the longest cluster prefix whose advance plus the ellipsis advance fits
-/// `budget` (scaled px). The ellipsis advance depends on the cut, because the
-/// ellipsis takes the style of the last visible cluster; `ellipsis_adv` gives
-/// it per brush. Returns `None` when the whole text fits.
+/// Pick the longest cluster prefix whose advance plus the ellipsis advance
+/// (block style, so one value for every cut) fits `budget` (scaled px).
+/// Returns the byte end of the kept prefix, or `None` when the whole text fits.
 fn truncate_by_clusters(
     layout: &Layout<TextBrush>,
     budget: f32,
-    fallback_brush: NodeId,
-    mut ellipsis_adv: impl FnMut(NodeId) -> f32,
-) -> Option<Cut> {
-    let clusters = cluster_cum_advances(layout, fallback_brush);
+    ellipsis_adv: f32,
+) -> Option<usize> {
+    let clusters = cluster_cum_advances(layout);
     if clusters.len() <= 1 {
-        return Some(Cut {
-            end: 0,
-            ellipsis_brush: fallback_brush,
-        });
+        return Some(0);
     }
     let full = clusters.last().map(|c| c.1).unwrap_or(0.0);
     if full + 0.5 <= budget {
         return None;
     }
-    // Cumulative advances are non-decreasing, so with a single style this is the
-    // same "largest prefix that fits" answer the earlier binary search gave.
-    let mut best = 0usize;
-    for (i, &(_, cum, brush)) in clusters.iter().enumerate().rev() {
-        let target = (budget - ellipsis_adv(brush)).max(0.0);
-        if cum <= target + 0.5 {
-            best = i;
-            break;
-        }
-    }
-    Some(Cut {
-        end: clusters[best].0,
-        ellipsis_brush: clusters[best].2,
-    })
+    let target = (budget - ellipsis_adv).max(0.0);
+    // Cumulative advances are non-decreasing: largest prefix that fits.
+    let best = clusters.partition_point(|&(_, cum)| cum <= target + 0.5);
+    Some(clusters[best.saturating_sub(1)].0)
 }
 
 fn take_inline_layout(doc: &mut HtmlDocument, nid: NodeId) -> Option<Box<TextLayout>> {
@@ -683,14 +659,9 @@ fn prepare_one(
     // Cache miss: cut from Blitz's per-run shaped cluster advances, reshape the
     // kept prefix with the same per-run styles (no DOM mutation, no resolve).
     let budget = cand.content_w_css * scale;
-    let mut ellipsis_advs: HashMap<NodeId, f32> = HashMap::new();
-    let first_brush = runs.segments.first().map_or(runs.root_id, |s| s.1);
-    let cut = truncate_by_clusters(&original_layout.layout, budget, first_brush, |brush| {
-        *ellipsis_advs.entry(brush).or_insert_with(|| {
-            measure_ellipsis_advance(shaper, runs.style_of(brush), scale, &align)
-        })
-    })?;
-    let prefix = original_text.get(..cut.end).unwrap_or("");
+    let ellipsis_adv = measure_ellipsis_advance(shaper, &runs.root, scale, &align);
+    let end = truncate_by_clusters(&original_layout.layout, budget, ellipsis_adv)?;
+    let prefix = original_text.get(..end).unwrap_or("");
     let truncated = format!("{prefix}{ELLIPSIS}");
     if truncated == original_text {
         return None;
@@ -699,7 +670,7 @@ fn prepare_one(
     let truncated_layout = shape_text_layout(
         shaper,
         &original_text,
-        &cut,
+        end,
         &runs,
         scale,
         Some(budget),
