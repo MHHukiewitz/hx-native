@@ -4097,7 +4097,8 @@ impl LiveSurface {
     /// box keeps its raw text with the caret at the end and nothing selected,
     /// and only the box's own damage is queued (partial repaint equals full).
     fn spin_step_target(&mut self, nid: NodeId, id: Option<&str>, dir: i32) -> bool {
-        let changed = step_and_regroup(&mut self.doc, nid, dir);
+        let fallback = self.sent_value_of(nid);
+        let changed = step_and_regroup(&mut self.doc, nid, dir, fallback.as_deref());
         if self.text_edit.as_ref().is_some_and(|s| s.node_id == nid) {
             prepare_focus_display(&mut self.doc, nid);
             self.reset_caret_blink();
@@ -4123,6 +4124,16 @@ impl LiveSurface {
             button,
             mods,
         });
+    }
+
+    /// The last value sent for `nid` while it is the box being edited (the
+    /// last `change`, or the value at focus): what an arrow on an empty or
+    /// unparsable box steps from (issue #92, Ruling 5, Mainnet cea8a42a).
+    fn sent_value_of(&self, nid: NodeId) -> Option<String> {
+        self.text_edit
+            .as_ref()
+            .filter(|s| s.node_id == nid)
+            .map(|s| s.value_at_change.clone())
     }
 
     /// True while the primary press started on a `data-hx-step` arrow.
@@ -4943,7 +4954,8 @@ impl LiveSurface {
             }
         };
         let changed = if is_number {
-            let changed = step_and_regroup(&mut self.doc, nid, dir);
+            let fallback = self.sent_value_of(nid);
+            let changed = step_and_regroup(&mut self.doc, nid, dir, fallback.as_deref());
             // Focused: keep the raw editable text with the caret at the end,
             // not the grouped display (issue #40, Graph #42 review).
             if self.text_edit.as_ref().is_some_and(|s| s.node_id == nid) {

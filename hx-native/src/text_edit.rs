@@ -926,7 +926,18 @@ fn number_inputs_under(doc: &HtmlDocument, root: NodeId) -> Vec<(NodeId, Option<
 }
 
 /// Step a number input by `dir`, write canonical value, regroup display if enabled.
-pub fn step_and_regroup(doc: &mut HtmlDocument, nid: NodeId, dir: i32) -> bool {
+///
+/// `fallback` is the last value sent for a box being edited (issue #92,
+/// Designer, HTML_CONTRACT §2 Ruling 5, Mainnet master cea8a42a): when the
+/// box is empty or doesn't parse (a lone `-`, a cleared fee), the step
+/// starts from it, the value blur or Enter would put back, not from `min`
+/// or 0. Before anything is sent it is the box's starting value.
+pub fn step_and_regroup(
+    doc: &mut HtmlDocument,
+    nid: NodeId,
+    dir: i32,
+    fallback: Option<&str>,
+) -> bool {
     use crate::form_args::step_precise;
 
     let Some(node) = doc.get_node(nid) else {
@@ -939,6 +950,7 @@ pub fn step_and_regroup(doc: &mut HtmlDocument, nid: NodeId, dir: i32) -> bool {
     let group = grouping_enabled(node);
     let current = attr(node, "value")
         .and_then(|s| parse_f64(&s))
+        .or_else(|| fallback.and_then(parse_f64))
         .unwrap_or(limits.min.unwrap_or(0.0));
     let next = step_precise(current, dir, &limits);
     let canonical = format_numeric(next);
