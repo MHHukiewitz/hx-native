@@ -97,5 +97,8 @@ fn release_after_a_swap_that_adds_a_gutter_does_not_panic() {
     .unwrap();
     full.paint(vp()).unwrap();
     let fresh = full.last_frame().unwrap().pixels.clone();
-    assert!(partial == fresh, "partial repaint differs from a fresh full paint");
+    assert!(
+        partial == fresh,
+        "partial repaint differs from a fresh full paint"
+    );
 }
