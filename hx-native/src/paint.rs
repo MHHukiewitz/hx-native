@@ -14,6 +14,7 @@ use peniko::{BlendMode, Color, Fill, FontData, StyleRef};
 
 use crate::damage::IntRect;
 use crate::error::EngineError;
+use crate::tile_coalesce::TileScene;
 use crate::types::{PaintMode, RgbaImage};
 
 pub fn paint_rgba(
@@ -27,7 +28,9 @@ pub fn paint_rgba(
     }
     let pixels = render_to_buffer::<VelloCpuImageRenderer, _>(
         |scene| {
-            paint_scene(scene, doc, scale, width, height, 0, 0);
+            let mut tiles = TileScene::new(scene);
+            paint_scene(&mut tiles, doc, scale, width, height, 0, 0);
+            tiles.finish();
         },
         width,
         height,
@@ -89,7 +92,11 @@ fn paint_exact_rect(
             };
             // Full-size clip so fragments outside the rect cannot leak.
             PaintScene::push_clip_layer(&mut cull, Fill::NonZero, Affine::IDENTITY, &clip);
-            paint_scene(&mut cull, doc, scale, width, height, 0, 0);
+            // Tile runs are merged before culling, so full and partial paints
+            // see the same merged fill (issue #67).
+            let mut tiles = TileScene::new(&mut cull);
+            paint_scene(&mut tiles, doc, scale, width, height, 0, 0);
+            tiles.finish();
             PaintScene::pop_layer(&mut cull);
         },
         width,
@@ -128,7 +135,9 @@ fn paint_shifted_rect(
                 shift: Some(shift),
                 skip_depth: 0,
             };
-            paint_scene(&mut cull, doc, scale, width, height, 0, 0);
+            let mut tiles = TileScene::new(&mut cull);
+            paint_scene(&mut tiles, doc, scale, width, height, 0, 0);
+            tiles.finish();
         },
         rw,
         rh,
