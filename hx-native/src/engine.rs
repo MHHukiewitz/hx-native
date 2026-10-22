@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use blitz_dom::{
     local_name, ns, qual_name, DocumentConfig, LocalName, NodeId, QualName, StyleThreading,
+    UserAgentStylesheet,
 };
 use blitz_html::{HtmlDocument, HtmlProvider};
 use blitz_traits::shell::{ColorScheme, Viewport as BlitzViewport};
@@ -357,9 +358,10 @@ struct LiveSurface {
     /// for every container with an engine-reserved 16 px gutter. Sticky per
     /// id: kept across same-id swaps, dropped once no element has the id.
     gutters: BTreeMap<String, String>,
-    /// Detached engine-owned element carrying the gutter stylesheet (never
-    /// in the tree, so never serialized and never hit-tested).
-    gutter_sheet_node: Option<NodeId>,
+    /// The engine-owned gutter stylesheet, installed in the user-agent
+    /// origin through Blitz's user-agent sheet API. Issue #100: not tied to
+    /// a node, so Blitz's node-id ordering of `<style>` sheets never sees it.
+    gutter_sheet: Option<UserAgentStylesheet>,
     /// A gutter made another container overflow: resolve again next time.
     gutter_followup: bool,
 }
@@ -1787,7 +1789,7 @@ impl LiveSurface {
             scroll_press_active: false,
             last_bars: Vec::new(),
             gutters: BTreeMap::new(),
-            gutter_sheet_node: None,
+            gutter_sheet: None,
             gutter_followup: false,
         };
         // `doc.resolve` above built the editors: show opt-in grouping on load.
@@ -1881,24 +1883,26 @@ impl LiveSurface {
         }
     }
 
-    /// (Re)install the engine-owned gutter stylesheet on a detached element.
+    /// (Re)install the engine-owned gutter stylesheet as the last
+    /// user-agent sheet (after the default, select and slider sheets).
+    ///
+    /// Issue #100: it used to sit on a detached `<style>` node through
+    /// `add_stylesheet_for_node`, which orders node sheets by `NodeId` and
+    /// inserts before the next higher id whatever its origin. After a swap
+    /// freed node slots, the gutter node could reuse a slot below a later
+    /// author `<style>`, and stylo panicked looking for that author sheet
+    /// among the user-agent sheets. User-agent sheets are kept in their own
+    /// ordered list, so this one is removed and appended instead.
     fn install_gutter_sheet(&mut self) {
-        let node = match self.gutter_sheet_node {
-            Some(n) => n,
-            None => {
-                let n = self
-                    .doc
-                    .mutate()
-                    .create_element(qual_name!("style"), vec![]);
-                self.gutter_sheet_node = Some(n);
-                n
-            }
-        };
-        let css = gutter_css(self.gutters.iter());
-        let sheet = self
-            .doc
-            .make_stylesheet(css, style::stylesheets::Origin::UserAgent);
-        self.doc.add_stylesheet_for_node(sheet, node);
+        if let Some(old) = self.gutter_sheet.take() {
+            self.doc.remove_user_agent_stylesheet(&old);
+        }
+        if self.gutters.is_empty() {
+            return;
+        }
+        let sheet = UserAgentStylesheet::parse(&gutter_css(self.gutters.iter()));
+        self.doc.add_user_agent_stylesheet(sheet.clone());
+        self.gutter_sheet = Some(sheet);
     }
 
     /// Issue #26, after every layout: restore offsets recorded across a swap
