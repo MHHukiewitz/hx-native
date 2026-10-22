@@ -14,6 +14,8 @@ use peniko::{BlendMode, Color, Fill, FontData, StyleRef};
 
 use crate::damage::IntRect;
 use crate::error::EngineError;
+use crate::text_shadow::{ShadowScene, ShadowTable};
+use crate::tile_coalesce::TileScene;
 use crate::types::{PaintMode, RgbaImage};
 
 pub fn paint_rgba(
@@ -25,9 +27,18 @@ pub fn paint_rgba(
     if width == 0 || height == 0 {
         return Err(EngineError::Paint("viewport size must be non-zero".into()));
     }
+    let table = ShadowTable::build(doc, scale);
     let pixels = render_to_buffer::<VelloCpuImageRenderer, _>(
         |scene| {
-            paint_scene(scene, doc, scale, width, height, 0, 0);
+            let mut tiles = TileScene::new(scene);
+            {
+                let mut shadow = ShadowScene {
+                    inner: &mut tiles,
+                    table: &table,
+                };
+                paint_scene(&mut shadow, doc, scale, width, height, 0, 0);
+            }
+            tiles.finish();
         },
         width,
         height,
@@ -52,13 +63,15 @@ pub fn paint_damage_into(
     if width == 0 || height == 0 {
         return Err(EngineError::Paint("viewport size must be non-zero".into()));
     }
+    // Issue #57: one shadow table for every rect of this paint.
+    let table = ShadowTable::build(doc, scale);
     for rect in damage {
         if rect.is_empty() {
             continue;
         }
         match mode {
-            PaintMode::Exact => paint_exact_rect(doc, frame, scale, *rect)?,
-            PaintMode::Shifted => paint_shifted_rect(doc, frame, scale, *rect)?,
+            PaintMode::Exact => paint_exact_rect(doc, frame, scale, *rect, &table)?,
+            PaintMode::Shifted => paint_shifted_rect(doc, frame, scale, *rect, &table)?,
         }
     }
     Ok(())
@@ -70,6 +83,7 @@ fn paint_exact_rect(
     frame: &mut RgbaImage,
     scale: f64,
     rect: IntRect,
+    table: &ShadowTable,
 ) -> Result<(), EngineError> {
     let width = frame.width;
     let height = frame.height;
@@ -89,7 +103,18 @@ fn paint_exact_rect(
             };
             // Full-size clip so fragments outside the rect cannot leak.
             PaintScene::push_clip_layer(&mut cull, Fill::NonZero, Affine::IDENTITY, &clip);
-            paint_scene(&mut cull, doc, scale, width, height, 0, 0);
+            // Shadows are emitted above the tile merge, and tile runs are merged
+            // before culling, so full and partial paints see the same commands
+            // (issues #57, #67).
+            let mut tiles = TileScene::new(&mut cull);
+            {
+                let mut shadow = ShadowScene {
+                    inner: &mut tiles,
+                    table,
+                };
+                paint_scene(&mut shadow, doc, scale, width, height, 0, 0);
+            }
+            tiles.finish();
             PaintScene::pop_layer(&mut cull);
         },
         width,
@@ -105,6 +130,7 @@ fn paint_shifted_rect(
     frame: &mut RgbaImage,
     scale: f64,
     rect: IntRect,
+    table: &ShadowTable,
 ) -> Result<(), EngineError> {
     let width = frame.width;
     let height = frame.height;
@@ -128,7 +154,15 @@ fn paint_shifted_rect(
                 shift: Some(shift),
                 skip_depth: 0,
             };
-            paint_scene(&mut cull, doc, scale, width, height, 0, 0);
+            let mut tiles = TileScene::new(&mut cull);
+            {
+                let mut shadow = ShadowScene {
+                    inner: &mut tiles,
+                    table,
+                };
+                paint_scene(&mut shadow, doc, scale, width, height, 0, 0);
+            }
+            tiles.finish();
         },
         rw,
         rh,
