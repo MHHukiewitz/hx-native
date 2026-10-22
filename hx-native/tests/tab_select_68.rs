@@ -176,6 +176,9 @@ fn click_on_focused_box_does_not_reselect() {
         None,
         "click clears, no re-select"
     );
+    // Issue #85 (Ruling 7): an immediate second click at the same spot is a
+    // double-click and selects the word, so this second click comes later.
+    e.test_advance_clock(std::time::Duration::from_secs(1));
     click_at(&mut e, x + 3.0, y + h / 2.0);
     assert_eq!(
         e.test_selected_text("fee"),
