@@ -305,3 +305,46 @@ fn sub_pixel_background_size_paints_without_panicking() {
         assert_eq!(first_diff(&merged, &per_tile, w), None, "{bg} at {scale}");
     }
 }
+
+/// Scale 1.5 does merge when the box sits on even CSS px (whole device px).
+/// Linear and radial tiles match the per-tile path exactly. Conic tiles of an
+/// odd device size differ only at tile centres, where the per-tile path is
+/// position noise and the merged path is uniform.
+#[test]
+fn scale_1_5_on_even_offsets_merges_and_matches_except_conic_centres() {
+    clear_tile_cache_for_test();
+    let lr = page("").replace(
+        "</body>",
+        r#"<div class="b" style="left:4px;top:6px;width:34px;height:18px;background:linear-gradient(90deg,#c00 50%,#00c 50%) 0 0/4px 2px"></div><div class="b rad" style="left:60px;top:2px;width:36px;height:24px"></div></body>"#,
+    );
+    let w = 450;
+    let _ = take_tile_coalesce_counters_for_test();
+    let merged = full_paint(&lr, 1.5, true);
+    let c = take_tile_coalesce_counters_for_test();
+    let per_tile = full_paint(&lr, 1.5, false);
+    assert!(c.runs_merged >= 2, "{c:?}");
+    assert_eq!(first_diff(&merged, &per_tile, w), None);
+
+    // 60x20 CSS box at (4, 6): 90x30 device px of 3x3 px tiles, 300 tiles.
+    let dither = r#"<!DOCTYPE html><html><head><style>html,body{margin:0}#b{position:absolute;left:4px;top:6px;width:60px;height:20px;background:#c0c0c0 repeating-conic-gradient(#fff 0deg 90deg,#c0c0c0 90deg 180deg) 0 0/2px 2px}</style></head><body><div id="b"></div></body></html>"#;
+    let _ = take_tile_coalesce_counters_for_test();
+    let merged = full_paint(dither, 1.5, true);
+    let c = take_tile_coalesce_counters_for_test();
+    let per_tile = full_paint(dither, 1.5, false);
+    assert_eq!((c.runs_merged, c.tiles_merged), (1, 300), "{c:?}");
+    let px = |b: &[u8], x: usize, y: usize| b[(y * w + x) * 4..(y * w + x) * 4 + 4].to_vec();
+    let mut centres = std::collections::HashSet::new();
+    for (i, (a, b)) in merged.chunks(4).zip(per_tile.chunks(4)).enumerate() {
+        let (x, y) = (i % w, i / w);
+        if a != b {
+            assert!(
+                x >= 6 && y >= 9 && (x - 6) % 3 == 1 && (y - 9) % 3 == 1,
+                "({x}, {y}) is not a tile centre: merged {a:?} per-tile {b:?}"
+            );
+        }
+        if (6..96).contains(&x) && (9..39).contains(&y) && (x - 6) % 3 == 1 && (y - 9) % 3 == 1 {
+            centres.insert(px(&merged, x, y));
+        }
+    }
+    assert_eq!(centres.len(), 1, "merged centres are uniform: {centres:?}");
+}

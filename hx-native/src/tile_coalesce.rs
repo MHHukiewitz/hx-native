@@ -23,6 +23,13 @@
 //! - every pixel of the rendered tile has alpha 0 or 255, so the image draw
 //!   composites exactly like the gradient draw.
 //!
+//! One known difference: a conic tile whose centre lands exactly on a pixel
+//! centre (odd tile size in device px, e.g. the 2 px dither at scale 1.5).
+//! vello_cpu's angle at that pixel is float noise that depends on where the
+//! tile sits, so Blitz's per-tile path paints an occasional centre pixel in
+//! the other colour (1 of 450 tiles in Graph's probe). The merged fill gives
+//! every tile the origin tile's centre pixel.
+//!
 //! Pin-sensitive: depends on how Blitz emits tile fills (see BLITZ_PIN.md).
 
 use std::cell::{Cell, RefCell};
