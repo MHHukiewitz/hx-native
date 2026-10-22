@@ -45,6 +45,7 @@ module once Blitz paints `text-shadow` itself:
 | `draw_glyphs` gets the run's `FontData`, `font_size` and parley's positioned glyph `x`/`y` unchanged (the run key) | `blitz-paint/src/text.rs` `stroke_text` |
 | Inline-root transform = `parent * translate(location) * node.transform()`, then the node's own scroll offset applied **twice** (`cx.transform.then_translate(-scroll)` and `content_position - scroll`), then `translate(padding + border + block_offset)` | `blitz-paint/src/render.rs` `render_element`, `draw_inline_layout` |
 | Each run's brush is `TextBrush { id }` of the run's own node (its computed `text-shadow` and `color`) | `blitz-dom/src/node/text.rs` |
+| Anonymous blocks (mixed inline and block children) and `::before` / `::after` boxes are not in the DOM `children` list; they are found through `Node::anonymous_blocks`, `before()` and `after()` | `blitz-dom/src/layout/construct.rs` `create_anonymous_block`, `node.rs` |
 | Text inside `<input>` / `<textarea>` editors is not an inline layout, so it gets no shadow | `render.rs` `draw_text_input_text` |
 
 A run whose origin does not match within 0.5 device px paints without a

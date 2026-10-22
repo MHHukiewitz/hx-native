@@ -387,6 +387,78 @@ fn anonymous_block_text_swap_partial_equals_full() {
     );
     assert_eq!(diffs(&partial, &full, 0), 0);
     assert_eq!(count(&partial, (0, 0, 140, 80), reddish), 0);
+    // The removal only proves something if the shadow was there before.
+    let before = SWAP_PAGE.replace(
+        "<b>Hi</b></section>",
+        "<b class=far>Hi</b><div>x</div></section>",
+    );
+    let red = count(&paint(&before, 140, 80), (0, 0, 140, 80), reddish);
+    assert!(red > 20, "the anonymous block's shadow paints: {red}");
+    // Every mode and scale, both directions, with the shadow far outside
+    // the swapped section (its own box and its old <b>'s box).
+    let cases = [
+        ("<b class=far>Hi</b><div>x</div>", "<b>Hi</b><div>x</div>"),
+        (
+            "<div>x</div>Hi <b class=far>Hi</b>",
+            "<div>x</div>Hi <b>Hi</b>",
+        ),
+        (
+            "<div>x</div>Hi <b>Hi</b>",
+            "<div>x</div>Hi <b class=far>Hi</b>",
+        ),
+    ];
+    for mode in [PaintMode::Exact, PaintMode::Shifted] {
+        for scale in [1.0, 2.0] {
+            for (before, after) in cases {
+                let (partial, full) = swap(mode, scale, before, after);
+                let tol = if mode == PaintMode::Exact { 0 } else { 1 };
+                let d = diffs(&partial, &full, tol);
+                assert_eq!(
+                    d, 0,
+                    "{mode:?} scale {scale}: {before} -> {after}: {d} px differ"
+                );
+            }
+        }
+    }
+}
+
+/// Blitz keeps anonymous blocks (the inline runs of a block with mixed
+/// inline and block children) and `::before` / `::after` boxes out of the
+/// DOM `children` list. Their text gets its shadow like any other text
+/// (Graph review of #60).
+#[test]
+fn anonymous_block_and_pseudo_element_text_paint_shadow() {
+    let red = |css: &str, body: &str| {
+        let img = paint(&page(css, body), 160, 90);
+        count(&img, (0, 0, 160, 90), reddish)
+    };
+    let css = ".s{text-shadow:3px 3px #f00}";
+    let inline_root = red(
+        css,
+        "<div style='margin:10px'><span class=s>Hi</span></div>",
+    );
+    assert!(inline_root > 20, "{inline_root}");
+    let anon_inline = red(
+        css,
+        "<div style='margin:10px'><span class=s>Hi</span><div>x</div></div>",
+    );
+    assert_eq!(
+        anon_inline, inline_root,
+        "inline child in an anonymous block"
+    );
+    let anon_inherited = red(
+        css,
+        "<div class=s style='margin:10px'>Hi<div style='text-shadow:none'>x</div></div>",
+    );
+    assert_eq!(
+        anon_inherited, inline_root,
+        "block's own shadow on anonymous text"
+    );
+    let pseudo_block = red(
+        "p{margin:10px}p::before{content:'Hi';display:block;text-shadow:3px 3px #f00}",
+        "<p><span style='color:transparent'>x</span></p>",
+    );
+    assert_eq!(pseudo_block, inline_root, "block ::before");
 }
 
 /// `align-content:center` moves the line boxes (Blitz `block_offset`); the

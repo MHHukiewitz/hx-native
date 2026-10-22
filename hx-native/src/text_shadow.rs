@@ -116,7 +116,12 @@ impl ShadowTable {
             let Some(node) = doc.get_node(nid) else {
                 continue;
             };
-            stack.extend(node.children.iter().copied());
+            // An anonymous block's DOM children are its container's
+            // children too: walking them again would record runs twice.
+            if !node.is_anonymous() {
+                stack.extend(node.children.iter().copied());
+            }
+            stack.extend(layout_only_boxes(node));
             let Some(layout) = node
                 .element_data()
                 .and_then(|e| e.inline_layout_data.as_ref())
@@ -167,6 +172,18 @@ impl ShadowTable {
                 .then_some(&*c.shadows)
         })
     }
+}
+
+/// Boxes Blitz lays out and paints for `node` that are not in its DOM
+/// `children`: anonymous blocks (the inline runs of a block with mixed inline
+/// and block children) and `::before` / `::after`. Blitz 0.3.0-beta.4 keeps
+/// these only in the node slab and `layout_children`.
+fn layout_only_boxes(node: &blitz_dom::Node) -> impl Iterator<Item = NodeId> + '_ {
+    node.anonymous_blocks
+        .iter()
+        .copied()
+        .chain(node.before())
+        .chain(node.after())
 }
 
 /// Device-space origin of the transform Blitz 0.3.0-beta.4 uses for an inline
@@ -331,8 +348,9 @@ impl<S: PaintScene> PaintScene for ShadowScene<'_, S> {
 /// Extra ink (left, top, right, bottom, device px, all >= 0) that shadows of
 /// the text an element paints add around its box, for damage (issue #57).
 ///
-/// Covers the element's own inline layout and those of its anonymous-block
-/// children (the text of a block with mixed content), reading each run's own
+/// Covers the element's own inline layout and those of its anonymous blocks
+/// and `::before` / `::after` boxes (the text of a block with mixed content;
+/// none of them is in the snapshot of their own), reading each run's own
 /// node: an inline `<b>` with a shadow inside a block without one still grows
 /// the block's damage. Blurred shadows count too (offset + 1.5×blur), even
 /// though they are not painted yet.
@@ -357,12 +375,8 @@ pub(crate) fn text_shadow_ink_pad(
     if let Some(styles) = node.primary_styles() {
         grow(&styles);
     }
-    let layouts = std::iter::once(node).chain(
-        node.children
-            .iter()
-            .filter_map(|&c| doc.get_node(c))
-            .filter(|c| c.is_anonymous()),
-    );
+    let layouts =
+        std::iter::once(node).chain(layout_only_boxes(node).filter_map(|c| doc.get_node(c)));
     for n in layouts {
         let Some(layout) = n.element_data().and_then(|e| e.inline_layout_data.as_ref()) else {
             continue;
