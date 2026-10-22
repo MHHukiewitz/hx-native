@@ -637,8 +637,10 @@ pub fn caret_device_rect(
 /// Restores the focused display text in the editor afterwards.
 ///
 /// A number whose commas are not thousands grouping ("3,5", "7,3480") is no
-/// number: the value becomes `fallback` (the value at focus, held in the
-/// limits), the same as a refused paste leaves it (issue #51).
+/// number: the value becomes `fallback` (the last value sent, held in the
+/// limits), the same as a refused paste leaves it (issue #51). With `clamp`
+/// (the read a `from:body` shortcut posts) an empty box or a lone sign or
+/// point also becomes `fallback`, as its commit does (issue #90).
 pub fn sync_value_from_editor(
     doc: &mut HtmlDocument,
     nid: NodeId,
@@ -662,7 +664,17 @@ pub fn sync_value_from_editor(
                 unconstrained: false,
             });
         if commas_are_grouping(display.trim()) {
-            canonical_from_display(&display, &limits, clamp)
+            let parsed = canonical_from_display(&display, &limits, clamp);
+            // `clamp` is the commit-like read (a `from:body` shortcut posting
+            // what Enter would commit, Graph review of #91): an empty box or
+            // a lone sign or point posts the last value sent, as Enter now
+            // commits it (issue #90). While typing (`clamp == false`) the
+            // live value follows the text, empty included.
+            if clamp && parsed.is_empty() {
+                fallback_value(fallback, &limits, clamp)
+            } else {
+                parsed
+            }
         } else {
             fallback_value(fallback, &limits, clamp)
         }

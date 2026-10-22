@@ -4214,7 +4214,7 @@ impl LiveSurface {
             .clone()
             .filter(|s| s.node_id == hold.target_nid)
         {
-            let _ = commit_field(&mut self.doc, hold.target_nid, &session.value_at_focus);
+            let _ = commit_field(&mut self.doc, hold.target_nid, &session.value_at_change);
             prepare_focus_display(&mut self.doc, hold.target_nid);
             self.reset_caret_blink();
             let _ = sync_outputs_for(&mut self.doc, &tid);
@@ -4411,7 +4411,7 @@ impl LiveSurface {
         let Some((nid, fallback)) = self
             .text_edit
             .as_ref()
-            .map(|s| (s.node_id, s.value_at_focus.clone()))
+            .map(|s| (s.node_id, s.value_at_change.clone()))
         else {
             return;
         };
