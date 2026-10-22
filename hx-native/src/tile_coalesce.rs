@@ -40,6 +40,10 @@ use peniko::{
 
 /// Bounded number of cached tiles (cleared wholesale when full).
 const CACHE_CAP: usize = 64;
+/// Bounded cached pixel bytes per thread (cleared wholesale when a new tile
+/// would go over). Without it 64 tiles of 256x256 px hold 16 MiB per painting
+/// thread, outside the surface memory budget.
+const CACHE_MAX_BYTES: usize = 1 << 20;
 /// Largest tile (device px per side) worth rasterizing separately.
 const MAX_TILE_SIDE: f64 = 256.0;
 const EPS: f64 = 1e-6;
@@ -47,6 +51,7 @@ const EPS: f64 = 1e-6;
 thread_local! {
     static ENABLED: Cell<bool> = const { Cell::new(true) };
     static CACHE: RefCell<HashMap<String, Option<Arc<ImageData>>>> = RefCell::new(HashMap::new());
+    static CACHE_BYTES: Cell<usize> = const { Cell::new(0) };
     static COUNTERS: Cell<TileCoalesceCounters> = const { Cell::new(TileCoalesceCounters::ZERO) };
 }
 
@@ -96,6 +101,7 @@ pub fn take_tile_coalesce_counters_for_test() -> TileCoalesceCounters {
 #[doc(hidden)]
 pub fn clear_tile_cache_for_test() {
     CACHE.with(|c| c.borrow_mut().clear());
+    CACHE_BYTES.with(|b| b.set(0));
 }
 
 struct Run {
@@ -219,12 +225,16 @@ fn cached_tile(run: &Run) -> Option<Arc<ImageData>> {
         return hit;
     }
     let made = rasterize_tile(run.style, &run.gradient, run.brush_xf, run.tile);
+    let size = made.as_ref().map_or(0, |i| i.data.len());
     CACHE.with(|c| {
         let mut c = c.borrow_mut();
-        if c.len() >= CACHE_CAP {
+        let used = CACHE_BYTES.with(|b| b.get());
+        if c.len() >= CACHE_CAP || used + size > CACHE_MAX_BYTES {
             c.clear();
+            CACHE_BYTES.with(|b| b.set(0));
         }
         c.insert(key, made.clone());
+        CACHE_BYTES.with(|b| b.set(b.get() + size));
     });
     made
 }
@@ -520,6 +530,35 @@ mod tests {
         assert_eq!(feed(&ragged), (8, 0));
         // A gap in a row ends the run there.
         assert_eq!(feed(&[(0.0, 0.0), (2.0, 0.0), (6.0, 0.0)]), (1, 1));
+    }
+
+    #[test]
+    fn tile_cache_stays_within_its_byte_bound() {
+        clear_tile_cache_for_test();
+        // 40 distinct 256x256 tiles (256 KiB each): 10 MiB unbounded.
+        for i in 0..40u8 {
+            let g = Gradient::new_linear((0.0, 0.0), (256.0, 0.0)).with_stops([
+                (0.0, Color::from_rgb8(i, 0, 0)),
+                (1.0, Color::from_rgb8(0, 0, 255 - i)),
+            ]);
+            let mut scene = Scene::new();
+            let mut t = TileScene::new(&mut scene);
+            t.enabled = true;
+            for c in 0..2 {
+                t.fill(
+                    Fill::NonZero,
+                    Affine::translate((256.0 * c as f64, 0.0)),
+                    &g,
+                    None,
+                    &Rect::new(0.0, 0.0, 256.0, 256.0),
+                );
+            }
+            t.finish();
+            let held: usize =
+                CACHE.with(|c| c.borrow().values().flatten().map(|i| i.data.len()).sum());
+            assert!(held <= CACHE_MAX_BYTES, "tile {i}: {held} bytes cached");
+            assert_eq!(held, CACHE_BYTES.with(|b| b.get()));
+        }
     }
 
     #[test]
