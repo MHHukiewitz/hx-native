@@ -1492,6 +1492,18 @@ impl Engine {
         editor_text(&mut live.doc, nid)
     }
 
+    /// Test harness (issue #68): the focused editor's selected text for
+    /// `#id` (`None` when nothing is selected).
+    #[doc(hidden)]
+    pub fn test_selected_text(&mut self, elem_id: &str) -> Option<String> {
+        let live = self
+            .surfaces
+            .get_mut(&SurfaceId::DEFAULT)
+            .and_then(|s| s.live.as_mut())?;
+        let nid = live.doc.get_element_by_id(elem_id)?;
+        selected_text(&mut live.doc, nid).filter(|t| !t.is_empty())
+    }
+
     /// Test helper: subscribed slice names the engine will ask `version` for.
     pub fn subscribed_slices(&self) -> HashSet<String> {
         let mut s = HashSet::new();
@@ -2092,6 +2104,25 @@ impl LiveSurface {
         // Issue #26: an offset survives the swap when an element with the
         // same id does (restored + clamped at the next layout).
         self.record_scroll_offsets_in(target_id);
+        // Issue #68 (Graph review of #69): only a swap that replaces the
+        // focused field (or an ancestor) re-seeds its editor. Mark it before
+        // mutating, while the old node is still in the tree: NodeIds recycle,
+        // so `reconcile_text_edit` cannot tell a replacement from the id alone.
+        let replaces_focused = self.text_edit.as_ref().is_some_and(|s| {
+            let mut cur = Some(s.node_id);
+            while let Some(nid) = cur {
+                if nid == target_id {
+                    return swap == SwapMode::OuterHtml || nid != s.node_id;
+                }
+                cur = self.doc.get_node(nid).and_then(|n| n.parent);
+            }
+            false
+        });
+        if replaces_focused {
+            if let Some(s) = self.text_edit.as_mut() {
+                s.needs_prepare = true;
+            }
+        }
 
         match swap {
             SwapMode::InnerHtml => {
@@ -3740,6 +3771,13 @@ impl LiveSurface {
             self.doc.clear_focus();
             return;
         }
+        // Issue #68 (Graph review of #69): the same, unreplaced node (an
+        // unrelated swap, or greying attributes written on other controls)
+        // keeps its editor as it is: the Tab selection, the caret and the
+        // value at focus (Esc and the commit's `change` compare against it).
+        if nid == session.node_id && !session.needs_prepare {
+            return;
+        }
         // Same-id replacement: rebind node_id; defer prepare_focus_display until
         // style/layout (sync must not resolve). Typing before paint must not wipe value.
         let value = self.attr(&session.id, "value").unwrap_or_default();
@@ -4946,6 +4984,15 @@ impl LiveSurface {
                     .is_some_and(|n| is_editable_input(n) && !is_disabled(n));
                 if editable {
                     let _ = self.focus_text_input(ctx, nid_str);
+                    // Issue #68 (Designer lock, HTML_CONTRACT §2): focus that
+                    // arrives by Tab / Shift+Tab selects the whole text, so
+                    // typing replaces the value (Win95 edit boxes, Chrome).
+                    // Click focus places the caret; host / swap focus keeps
+                    // the caret at the end with no selection. The field's
+                    // damage is already queued by `focus_text_input`.
+                    if let Some(nid) = self.doc.get_element_by_id(nid_str) {
+                        select_all(&mut self.doc, nid);
+                    }
                 } else if let Some(nid) = self.doc.get_element_by_id(nid_str) {
                     self.doc.set_focus_to(nid);
                     self.focus.focused_id = Some(nid_str.clone());
