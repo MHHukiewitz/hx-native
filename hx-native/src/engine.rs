@@ -2298,6 +2298,19 @@ impl LiveSurface {
                 vec![target_id]
             }
             SwapMode::OuterHtml => {
+                // Like the `outerHTML` setter: the fragment's context is the
+                // target's parent, so a `<tr>` root parses under its
+                // `<tbody>` and a root inside `<svg>` stays foreign. Without
+                // an element parent, an HTML `<div>`.
+                let context = self
+                    .doc
+                    .get_node(target_id)
+                    .and_then(|n| n.parent)
+                    .and_then(|p| self.doc.get_node(p))
+                    .and_then(|p| p.element_data())
+                    .map(|e| e.name.clone())
+                    .filter(|q| !(q.ns == ns!(html) && q.local == local_name!("html")))
+                    .unwrap_or_else(|| qual_name!("div", html));
                 let wrapper_id = {
                     let mut mutr = self.doc.mutate();
                     // The wrapper is the fragment parser's context element,
@@ -2309,7 +2322,7 @@ impl LiveSurface {
                     // `<input>` is not void (it swallows its siblings) and no
                     // HTML user-agent style applies (#svc-tabs laid out 0 px
                     // tall with 0x0 buttons, #104).
-                    let wrapper_id = mutr.create_element(qual_name!("div", html), vec![]);
+                    let wrapper_id = mutr.create_element(context, vec![]);
                     mutr.set_inner_html(wrapper_id, html);
                     wrapper_id
                 };
