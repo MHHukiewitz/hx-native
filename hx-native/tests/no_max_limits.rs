@@ -2,9 +2,10 @@
 //! Mainnet Services' Marketing budget has no max by game rule. With
 //! `max: None` the engine writes no `max` attribute (and clears one from
 //! markup: the slice wins), ▲ / ArrowUp step up with no clamp, and typed or
-//! pasted values clamp only at `min`. A range slider still needs a max: it
-//! keeps the markup `max`, or HTML's default of 100. `InputLimits::new`
-//! behaves exactly as before.
+//! pasted values clamp only at `min`. A range must have a real max
+//! (Designer ruling, 2026-10-22): `at_least` on a range is refused and the
+//! range keeps its markup limits. `InputLimits::new` behaves exactly as
+//! before.
 
 use std::collections::HashMap;
 
@@ -283,34 +284,42 @@ fn range(value: &str, extra: &str) -> String {
     )
 }
 
+/// Designer ruling (2026-10-22 12:45 America/Asuncion): a range must have a
+/// real max. `at_least` on a range is refused (logged with the element's
+/// id); the input keeps its markup `min`/`max`/`step` and value.
 #[test]
-fn at_least_range_keeps_the_markup_max() {
-    let mut eng = boot(&range("70", " max=\"50\""));
+fn at_least_on_a_range_is_refused_and_keeps_its_markup() {
+    let mut eng = boot(&range("30", " min=\"10\" max=\"50\" step=\"5\""));
     set(&mut eng, 1, "vol", InputLimits::at_least(0.0, Some(1.0))).unwrap();
+    assert_eq!(eng.attr("vol", "min").as_deref(), Some("10"));
     assert_eq!(eng.attr("vol", "max").as_deref(), Some("50"));
-    assert_eq!(
-        val(&eng, "vol").as_deref(),
-        Some("50"),
-        "clamps at the markup max"
-    );
+    assert_eq!(eng.attr("vol", "step").as_deref(), Some("5"));
+    assert_eq!(val(&eng, "vol").as_deref(), Some("30"));
     eng.test_set_focus("vol");
     key(&mut eng, "ArrowUp");
-    assert_eq!(val(&eng, "vol").as_deref(), Some("50"));
-}
+    assert_eq!(
+        val(&eng, "vol").as_deref(),
+        Some("35"),
+        "steps by the markup step"
+    );
 
-#[test]
-fn at_least_range_without_markup_max_uses_100() {
     let mut eng = boot(&range("150", ""));
-    set(&mut eng, 1, "vol", InputLimits::at_least(0.0, Some(1.0))).unwrap();
-    assert_eq!(eng.attr("vol", "max"), None, "HTML's default max");
-    assert_eq!(val(&eng, "vol").as_deref(), Some("100"));
+    set(&mut eng, 1, "vol", InputLimits::at_least(120.0, Some(1.0))).unwrap();
+    assert_eq!(eng.attr("vol", "min"), None, "nothing applied");
+    assert_eq!(eng.attr("vol", "max"), None);
+    assert_eq!(eng.attr("vol", "step"), None);
 }
 
+/// A range that had `new` limits and then gets `at_least` goes back to its
+/// markup `min`/`max`/`step`.
 #[test]
-fn at_least_range_after_new_goes_back_to_the_markup_max() {
-    let mut eng = boot(&range("30", " max=\"50\""));
-    set(&mut eng, 1, "vol", InputLimits::new(0.0, 10.0, Some(1.0))).unwrap();
-    assert_eq!(eng.attr("vol", "max").as_deref(), Some("10"));
+fn at_least_on_a_range_after_new_restores_its_markup() {
+    let mut eng = boot(&range("30", " min=\"10\" max=\"50\" step=\"5\""));
+    set(&mut eng, 1, "vol", InputLimits::new(0.0, 40.0, Some(1.0))).unwrap();
+    assert_eq!(eng.attr("vol", "max").as_deref(), Some("40"));
+    assert_eq!(eng.attr("vol", "step").as_deref(), Some("1"));
     set(&mut eng, 2, "vol", InputLimits::at_least(0.0, Some(1.0))).unwrap();
+    assert_eq!(eng.attr("vol", "min").as_deref(), Some("10"));
     assert_eq!(eng.attr("vol", "max").as_deref(), Some("50"));
+    assert_eq!(eng.attr("vol", "step").as_deref(), Some("5"));
 }

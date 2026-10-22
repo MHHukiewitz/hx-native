@@ -2732,6 +2732,26 @@ impl LiveSurface {
 
         let mut any_changed = false;
         for (key, input_nid, limits) in resolved {
+            // Designer ruling (2026-10-22 12:45 America/Asuncion, #101): a
+            // range must have a real max. `at_least` (no max) on a range is
+            // refused: nothing is applied, the input keeps (or gets back) its
+            // markup `min`/`max`/`step`, and the refusal is logged with the
+            // element's id on each `input_limits()` refresh.
+            if limits.max.is_none() && self.doc.get_node(input_nid).is_some_and(is_range_input) {
+                if validate {
+                    let id = node_id_attr(&self.doc, input_nid).unwrap_or_default();
+                    eprintln!(
+                        "hx_native: refused InputLimits::at_least (no max) for range input                          id=`{id}` (action `{}`, input `{}`): a range must have a real max;                          it keeps its markup min/max/step",
+                        key.0, key.1
+                    );
+                }
+                if let Some(snap) = self.limits_markup.get(&key).cloned() {
+                    if self.restore_markup_onto(input_nid, Some(&snap)) {
+                        any_changed = true;
+                    }
+                }
+                continue;
+            }
             if !self.limits_markup.contains_key(&key) {
                 let snap = MarkupSnapshot {
                     min: node_attr(&self.doc, input_nid, "min"),
@@ -2740,8 +2760,7 @@ impl LiveSurface {
                 };
                 self.limits_markup.insert(key.clone(), snap);
             }
-            let markup_max = self.limits_markup.get(&key).and_then(|m| m.max.clone());
-            if self.write_limits_onto(input_nid, &limits, markup_max) {
+            if self.write_limits_onto(input_nid, &limits) {
                 any_changed = true;
             }
         }
@@ -2884,27 +2903,12 @@ impl LiveSurface {
     ///
     /// Issue #101: `limits.max: None` (`InputLimits::at_least`) writes no
     /// `max` on a number box and clears one from markup (the slice wins),
-    /// so it clamps at `min` only. A range slider needs a max: it keeps
-    /// `markup_max` (the input's markup `max`, from the first snapshot), or
-    /// none, which HTML reads as 100.
-    fn write_limits_onto(
-        &mut self,
-        nid: NodeId,
-        limits: &InputLimits,
-        markup_max: Option<String>,
-    ) -> bool {
-        let is_range = self.doc.get_node(nid).is_some_and(is_range_input);
+    /// so it clamps at `min` only. A range never gets here with no max
+    /// (`apply_limits_to_doc` refuses it, Designer ruling).
+    fn write_limits_onto(&mut self, nid: NodeId, limits: &InputLimits) -> bool {
         let min_s = format_numeric(limits.min);
-        let want_max: Option<String> = match limits.max {
-            Some(max) => Some(format_numeric(max)),
-            None if is_range => markup_max.filter(|m| parse_f64(m).is_some_and(|v| v.is_finite())),
-            None => None,
-        };
-        let clamp_max = match limits.max {
-            Some(max) => Some(max),
-            None if is_range => Some(want_max.as_deref().and_then(parse_f64).unwrap_or(100.0)),
-            None => None,
-        };
+        let want_max: Option<String> = limits.max.map(format_numeric);
+        let clamp_max = limits.max;
         let step_s = limits
             .step
             .map(format_numeric)

@@ -305,8 +305,10 @@ pub enum InputRule {
 /// build it with [`InputLimits::at_least`]. A number box then gets no `max`
 /// attribute (one from markup is cleared, the slice wins), arrows and spin
 /// step up with no clamp, and typed or pasted values clamp at `min` only
-/// (the ±2^53 safe-number ceiling still holds). A range slider needs a max:
-/// with `max: None` it keeps its markup `max`, or HTML's default of 100.
+/// (the ±2^53 safe-number ceiling still holds). A range must have a real
+/// max (Designer ruling, 2026-10-22): `at_least` on a range is refused and
+/// logged with the element's id, and the range keeps its markup
+/// `min`/`max`/`step`.
 /// [`InputLimits::new`] always sets `Some(max)`. Reading `.max` directly is
 /// a breaking change from `f64` to `Option<f64>` (#101).
 ///
