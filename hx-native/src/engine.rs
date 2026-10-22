@@ -2775,8 +2775,9 @@ impl LiveSurface {
     /// key that `self.limits_cache` carried but `raw` no longer does (PR27
     /// round 2, non-blocking item): the slice stopped declaring limits for
     /// that input, so the engine's override must stop too. Restores the
-    /// markup snapshot taken the first time the engine wrote over it, or
-    /// clears the three attributes when there was nothing to restore.
+    /// markup snapshot taken the first time the engine wrote over it. With
+    /// no snapshot the engine never wrote over the current markup, so the
+    /// input is left as it is.
     fn remove_stale_limits(&mut self, raw: &[(String, String, InputLimits)]) {
         let new_keys: HashSet<(String, String)> =
             raw.iter().map(|(a, i, _)| (a.clone(), i.clone())).collect();
@@ -2791,11 +2792,17 @@ impl LiveSurface {
         }
         let mut any_changed = false;
         for key in removed {
-            let snap = self.limits_markup.remove(&key);
+            // Graph review of #102: no snapshot means the engine has not
+            // written over this input's current markup (a refused range, or
+            // a swap re-rendered it since), so there is nothing to undo, and
+            // clearing would wipe the markup `min`/`max`/`step`.
+            let Some(snap) = self.limits_markup.remove(&key) else {
+                continue;
+            };
             let (action, input_name) = key;
             for form_nid in self.forms_for_action(&action) {
                 for input_nid in self.range_or_number_inputs_named(form_nid, &input_name) {
-                    if self.restore_markup_onto(input_nid, snap.as_ref()) {
+                    if self.restore_markup_onto(input_nid, Some(&snap)) {
                         any_changed = true;
                     }
                 }
