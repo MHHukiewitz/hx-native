@@ -3805,6 +3805,19 @@ impl LiveSurface {
         if !is_editable_input(node) || is_disabled(node) {
             return None;
         }
+        // Graph review of #72: a click into the box already being edited
+        // only moves the caret. Re-seeding here put the typed text through
+        // the focus display (`7` became `7.00`) and reset `value_at_focus`
+        // and `value_at_change` to the typed value, so the Enter or blur
+        // that followed fired no `change` and Esc no longer reverted.
+        if self
+            .text_edit
+            .as_ref()
+            .is_some_and(|s| s.id == id && s.node_id == nid)
+        {
+            self.ensure_text_edit_prepared();
+            return None;
+        }
         // Commit previous field if switching.
         if self.text_edit.as_ref().map(|s| s.id.as_str()) != Some(id) {
             self.blur_text_edit_queued(ctx);
