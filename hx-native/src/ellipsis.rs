@@ -12,9 +12,23 @@
 //! - inline content wider than the content box
 //!
 //! Truncation cuts at a **parley cluster** boundary (grapheme / ZWJ-safe) so
-//! `prefix + "…"` fits the content box. Fit is decided with a binary search
-//! over shaped cluster advances — no per-character re-layout. The ellipsis
-//! glyph width is measured by shaping `"…"` with the same style.
+//! `prefix + "…"` fits the content box. Fit is decided from Blitz's own shaped
+//! cluster advances — no per-character re-layout. Those advances already carry
+//! each inline run's style, so a `<b>` run is measured in bold.
+//!
+//! # Per-run styles (issue #110)
+//!
+//! The truncated prefix is reshaped with one parley style span per inline run,
+//! exactly as Blitz built the original: each cluster's `TextBrush` id names the
+//! DOM node (the ellipsis element or a child like `<b>`, `<i>`, `<span>`, or a
+//! `::before`/`::after` pseudo) whose computed style shaped it, and that node's
+//! [`TextStyle`] is rebuilt with [`crate::stylo_text_style`]. Weight, italic,
+//! size, family and spacing therefore survive truncation, and colour /
+//! decorations follow because paint resolves them from the same brush node.
+//!
+//! The ellipsis glyph takes the style of the **last visible cluster's run**
+//! (Chrome's behaviour), and its width is measured in that style, so the cut
+//! depends on which run it lands in.
 //!
 //! # Paint without dirtying layout for hit-testing
 //!
@@ -31,7 +45,8 @@
 //!
 //! Truncated layouts are cached under a key of
 //! `(Blitz layout text, content-box width @ 1/64 px, scale bits,
-//! TextStyle+AlignParams fingerprint)`. The layout text is Blitz's
+//! fingerprint of the root TextStyle + AlignParams + every run's range and
+//! TextStyle)`. The layout text is Blitz's
 //! whitespace-collapsed, `text-transform`ed string in document order — not the
 //! raw DOM concatenation. A cache miss reshapes once via parley (not counted as
 //! a document style/layout pass). Clear the cache when the DOM mutates
@@ -76,12 +91,14 @@
 //!
 //! - RTL / bidirectional ellipsis sides
 //! - Multi-line clamp (`-webkit-line-clamp` / `line-clamp`)
-//! - Child-element styling inside the ellipsis element (e.g. `<b>` / `<em>`):
-//!   truncated paint flattens to the ellipsis element's own style. Document
-//!   order of text is preserved via Blitz's `TextLayout.text`; per-span style
-//!   is not.
+//! - Atomic inline boxes (inline-block, `<img>`, …) inside the ellipsis element
+//!   are not re-inserted into the truncated paint layout (unchanged from #12).
+//! - A `list-style-position: inside` marker is reshaped in the element's own
+//!   font rather than Blitz's bullet font (it shares the root brush id).
+//! - `text-overflow` string values (`text-overflow: "…"`) and two-value syntax.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use blitz_dom::node::{TextBrush, TextLayout};
 use blitz_dom::{FontContext, NodeId};
@@ -324,11 +341,21 @@ fn inline_text_width_css(node: &blitz_dom::Node, scale: f32) -> Option<f32> {
     Some(inline.layout.full_width() / scale)
 }
 
-/// Fingerprint the full parley [`TextStyle`] plus [`AlignParams`] used for reshape.
-/// Must include every field that affects cut point or paint (scale is keyed separately).
+/// Fingerprint everything used for the cut and the reshape: the element's root
+/// parley [`TextStyle`], [`AlignParams`], and every inline run's byte range and
+/// [`TextStyle`] (so a style change on a child `<b>` / `<span>` misses the cache).
+/// Scale is keyed separately.
 /// Pin sensitivity: depends on parley `Debug` formatting — see module rustdoc.
-fn shaping_fingerprint(style: &TextStyle<'static, 'static, TextBrush>, align: &AlignParams) -> u64 {
-    let raw = format!("{style:?}|{align:?}");
+fn shaping_fingerprint(runs: &RunStyles, align: &AlignParams) -> u64 {
+    let mut raw = format!("{:?}|{align:?}", runs.root);
+    for (range, id) in &runs.segments {
+        raw.push_str(&format!(
+            "|{}..{}:{:?}",
+            range.start,
+            range.end,
+            runs.style_of(*id)
+        ));
+    }
     let mut h: u64 = 0xcbf29ce484222325;
     for b in raw.as_bytes() {
         h ^= u64::from(*b);
@@ -343,54 +370,143 @@ fn width_key_bits(w_css: f32) -> u32 {
     rounded.to_bits()
 }
 
-/// Cluster end byte offsets and cumulative advances (layout / scaled px).
-fn cluster_cum_advances(layout: &Layout<TextBrush>) -> Vec<(usize, f32)> {
+/// Cluster end byte offsets, cumulative advances (layout / scaled px) and the
+/// brush node of the cluster that ends there. Advances come from Blitz's own
+/// per-run shaping, so a bold run is measured in bold. Entry 0 is "nothing
+/// visible" and carries the first cluster's brush (or `fallback`).
+fn cluster_cum_advances(layout: &Layout<TextBrush>, fallback: NodeId) -> Vec<(usize, f32, NodeId)> {
     let mut out = Vec::new();
     let mut cum = 0.0f32;
-    out.push((0, 0.0));
+    out.push((0, 0.0, fallback));
     for line in layout.lines() {
         for run in line.runs() {
             for cluster in run.clusters() {
                 cum += cluster.advance();
                 let end = cluster.text_range().end;
-                if out.last().is_some_and(|(e, _)| *e == end) {
+                let brush = cluster.style().brush.id;
+                if out.len() > 1 && out.last().is_some_and(|(e, _, _)| *e == end) {
                     // Ligature continuation with zero extra bytes — keep max advance.
                     if let Some(last) = out.last_mut() {
                         last.1 = cum;
                     }
                 } else {
-                    out.push((end, cum));
+                    out.push((end, cum, brush));
                 }
             }
         }
     }
+    if let Some(first) = out.get(1).map(|c| c.2) {
+        out[0].2 = first;
+    }
     out
 }
 
-/// Build a parley TextStyle from the element's computed styles (Blitz parity).
-fn text_style_for_element(
-    doc: &HtmlDocument,
-    element_id: NodeId,
-) -> Option<TextStyle<'static, 'static, TextBrush>> {
-    let node = doc.get_node(element_id)?;
-    let styles = node.primary_styles()?;
-    // Prefer the brush id from the original layout's first glyph run when present;
-    // fall back to the element id (Blitz root span brush).
-    let brush_id = node
-        .element_data()
-        .and_then(|el| el.inline_layout_data.as_ref())
-        .and_then(|tl| {
-            for line in tl.layout.lines() {
-                for item in line.items() {
-                    if let parley::PositionedLayoutItem::GlyphRun(run) = item {
-                        return Some(run.style().brush.id);
-                    }
+/// Per-run text styles recovered from Blitz's shaped layout.
+///
+/// Blitz pushes one parley style span per inline element, with
+/// `TextBrush { id: element node id }` and that element's full computed style
+/// (`construct.rs` `build_inline_layout_recursive`). Each cluster's
+/// `style().brush.id` therefore names the DOM node whose computed style shaped
+/// it; we rebuild the same [`TextStyle`] from that node with
+/// [`text_style_from_computed`].
+struct RunStyles {
+    /// The ellipsis element (Blitz's inline-context root span).
+    root_id: NodeId,
+    root: TextStyle<'static, 'static, TextBrush>,
+    /// Style for every non-root brush node seen in the layout.
+    by_brush: HashMap<NodeId, TextStyle<'static, 'static, TextBrush>>,
+    /// Byte ranges of `TextLayout.text`, in logical order, covering the whole
+    /// text, each with the brush node that styled it (adjacent equal brushes merged).
+    segments: Vec<(Range<usize>, NodeId)>,
+}
+
+impl RunStyles {
+    fn style_of(&self, id: NodeId) -> &TextStyle<'static, 'static, TextBrush> {
+        if id == self.root_id {
+            return &self.root;
+        }
+        self.by_brush.get(&id).unwrap_or(&self.root)
+    }
+
+    /// Push `text` in the style of brush `id` (a span unless it is the root).
+    fn push(&self, builder: &mut parley::TreeBuilder<'_, TextBrush>, id: NodeId, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if id == self.root_id {
+            builder.push_text(text);
+        } else {
+            builder.push_style_span(self.style_of(id).clone());
+            builder.push_text(text);
+            builder.pop_style_span();
+        }
+    }
+}
+
+fn run_styles(doc: &HtmlDocument, element_id: NodeId, tl: &TextLayout) -> Option<RunStyles> {
+    let root_styles = doc.get_node(element_id)?.primary_styles()?;
+    let root = text_style_from_computed(element_id, &root_styles);
+
+    let mut ranges: Vec<(Range<usize>, NodeId)> = Vec::new();
+    for line in tl.layout.lines() {
+        for run in line.runs() {
+            for cluster in run.clusters() {
+                let r = cluster.text_range();
+                if !r.is_empty() {
+                    ranges.push((r, cluster.style().brush.id));
                 }
             }
-            None
-        })
-        .unwrap_or(element_id);
-    Some(text_style_from_computed(brush_id, &styles))
+        }
+    }
+    ranges.sort_by_key(|(r, _)| r.start);
+
+    let text_len = tl.text.len();
+    let mut segments: Vec<(Range<usize>, NodeId)> = Vec::new();
+    let mut push_seg = |r: Range<usize>, id: NodeId| {
+        if r.is_empty() {
+            return;
+        }
+        if let Some(last) = segments.last_mut() {
+            if last.1 == id && last.0.end == r.start {
+                last.0.end = r.end;
+                return;
+            }
+        }
+        segments.push((r, id));
+    };
+    let mut pos = 0usize;
+    for (r, id) in ranges {
+        let start = r.start.max(pos);
+        let end = r.end.min(text_len);
+        if end <= start {
+            continue;
+        }
+        // Bytes no cluster claims (none expected) keep the root style.
+        push_seg(pos..start, element_id);
+        push_seg(start..end, id);
+        pos = end;
+    }
+    push_seg(pos..text_len, element_id);
+
+    let mut by_brush = HashMap::new();
+    for (_, id) in &segments {
+        if *id == element_id || by_brush.contains_key(id) {
+            continue;
+        }
+        let style = doc
+            .get_node(*id)
+            .and_then(|n| n.primary_styles())
+            .map(|s| text_style_from_computed(*id, &s))
+            .unwrap_or_else(|| root.clone());
+        by_brush.insert(*id, style);
+    }
+
+    Some(RunStyles {
+        root_id: element_id,
+        root,
+        by_brush,
+        segments,
+    })
 }
 
 /// Blitz applies base direction / text-align outside `TextStyle`
@@ -411,11 +527,15 @@ fn align_params_for_element(doc: &HtmlDocument, element_id: NodeId) -> Option<Al
     })
 }
 
-/// Shape `text` with the ellipsis element's computed style; returns a paint `TextLayout`.
+/// Shape `text[..cut.end]` + `"…"` with each run's own style (one parley span
+/// per inline run, like Blitz) and the ellipsis in the last visible run's
+/// style; returns a paint `TextLayout`.
+#[allow(clippy::too_many_arguments)]
 fn shape_text_layout(
     shaper: &mut EllipsisShaper,
     text: &str,
-    style: &TextStyle<'static, 'static, TextBrush>,
+    cut: &Cut,
+    runs: &RunStyles,
     scale: f32,
     max_advance: Option<f32>,
     template: &TextLayout,
@@ -423,9 +543,16 @@ fn shape_text_layout(
 ) -> Box<TextLayout> {
     let mut builder = shaper
         .layout_ctx
-        .tree_builder(&mut shaper.font_ctx, scale, true, style);
+        .tree_builder(&mut shaper.font_ctx, scale, true, &runs.root);
     builder.set_base_direction(align.base_direction);
-    builder.push_text(text);
+    for (range, id) in &runs.segments {
+        if range.start >= cut.end {
+            break;
+        }
+        let slice = text.get(range.start..range.end.min(cut.end)).unwrap_or("");
+        runs.push(&mut builder, *id, slice);
+    }
+    runs.push(&mut builder, cut.ellipsis_brush, ELLIPSIS);
     let mut layout = Layout::new();
     let shaped_text = builder.build_into(&mut layout);
     layout.break_all_lines(max_advance);
@@ -462,41 +589,48 @@ fn measure_ellipsis_advance(
     layout.full_width()
 }
 
-/// Binary search cluster boundaries so prefix advance + ellipsis fits `budget`
-/// (same units as cluster advances — scaled px).
+/// Where to cut: keep `text[..end]`, then draw `"…"` in `ellipsis_brush`'s style.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Cut {
+    end: usize,
+    ellipsis_brush: NodeId,
+}
+
+/// Pick the longest cluster prefix whose advance plus the ellipsis advance fits
+/// `budget` (scaled px). The ellipsis advance depends on the cut, because the
+/// ellipsis takes the style of the last visible cluster; `ellipsis_adv` gives
+/// it per brush. Returns `None` when the whole text fits.
 fn truncate_by_clusters(
-    original: &str,
     layout: &Layout<TextBrush>,
     budget: f32,
-    ellipsis_adv: f32,
-) -> String {
-    let clusters = cluster_cum_advances(layout);
+    fallback_brush: NodeId,
+    mut ellipsis_adv: impl FnMut(NodeId) -> f32,
+) -> Option<Cut> {
+    let clusters = cluster_cum_advances(layout, fallback_brush);
     if clusters.len() <= 1 {
-        return ELLIPSIS.to_string();
+        return Some(Cut {
+            end: 0,
+            ellipsis_brush: fallback_brush,
+        });
     }
-    let full = clusters.last().map(|(_, a)| *a).unwrap_or(0.0);
+    let full = clusters.last().map(|c| c.1).unwrap_or(0.0);
     if full + 0.5 <= budget {
-        return original.to_string();
+        return None;
     }
-    let target = (budget - ellipsis_adv).max(0.0);
-
-    let mut lo = 0usize;
-    let mut hi = clusters.len() - 1;
+    // Cumulative advances are non-decreasing, so with a single style this is the
+    // same "largest prefix that fits" answer the earlier binary search gave.
     let mut best = 0usize;
-    while lo <= hi {
-        let mid = (lo + hi) / 2;
-        if clusters[mid].1 <= target + 0.5 {
-            best = mid;
-            lo = mid + 1;
-        } else if mid == 0 {
+    for (i, &(_, cum, brush)) in clusters.iter().enumerate().rev() {
+        let target = (budget - ellipsis_adv(brush)).max(0.0);
+        if cum <= target + 0.5 {
+            best = i;
             break;
-        } else {
-            hi = mid - 1;
         }
     }
-    let end = clusters[best].0;
-    let prefix = original.get(..end).unwrap_or("");
-    format!("{prefix}{ELLIPSIS}")
+    Some(Cut {
+        end: clusters[best].0,
+        ellipsis_brush: clusters[best].2,
+    })
 }
 
 fn take_inline_layout(doc: &mut HtmlDocument, nid: NodeId) -> Option<Box<TextLayout>> {
@@ -525,13 +659,13 @@ fn prepare_one(
         return None;
     }
 
-    let style = text_style_for_element(doc, cand.element_id)?;
+    let runs = run_styles(doc, cand.element_id, &original_layout)?;
     let align = align_params_for_element(doc, cand.element_id)?;
     let key = TruncationKey {
         original: original_text.clone(),
         content_w_bits: width_key_bits(cand.content_w_css),
         scale_bits: scale.to_bits(),
-        style_fp: shaping_fingerprint(&style, &align),
+        style_fp: shaping_fingerprint(&runs, &align),
     };
 
     if let Some(entry) = cache.by_node.get(&cand.element_id) {
@@ -546,24 +680,27 @@ fn prepare_one(
         }
     }
 
-    // Cache miss: cut from shaped cluster advances, reshape truncated string
-    // directly (no DOM mutation, no document resolve).
+    // Cache miss: cut from Blitz's per-run shaped cluster advances, reshape the
+    // kept prefix with the same per-run styles (no DOM mutation, no resolve).
     let budget = cand.content_w_css * scale;
-    let ellipsis_adv = measure_ellipsis_advance(shaper, &style, scale, &align);
-    let truncated = truncate_by_clusters(
-        &original_text,
-        &original_layout.layout,
-        budget,
-        ellipsis_adv,
-    );
+    let mut ellipsis_advs: HashMap<NodeId, f32> = HashMap::new();
+    let first_brush = runs.segments.first().map_or(runs.root_id, |s| s.1);
+    let cut = truncate_by_clusters(&original_layout.layout, budget, first_brush, |brush| {
+        *ellipsis_advs.entry(brush).or_insert_with(|| {
+            measure_ellipsis_advance(shaper, runs.style_of(brush), scale, &align)
+        })
+    })?;
+    let prefix = original_text.get(..cut.end).unwrap_or("");
+    let truncated = format!("{prefix}{ELLIPSIS}");
     if truncated == original_text {
         return None;
     }
 
     let truncated_layout = shape_text_layout(
         shaper,
-        &truncated,
-        &style,
+        &original_text,
+        &cut,
+        &runs,
         scale,
         Some(budget),
         &original_layout,
