@@ -52,7 +52,7 @@ whose `background-size` is smaller than the box:
 A bump that changes the loop order, the shape or the transform layout does
 not break painting (an unrecognised run is replayed tile by tile), but loses
 the merge: `merged_runs_count_and_fallbacks_at_scale_1` and
-`dither_box_costs_at_most_twice_a_solid_fill` in
+`dither_box_reaches_the_renderer_as_one_merged_fill` in
 `hx-native/tests/tile_coalesce_67.rs` fail first. A bump that draws tiles
 differently (e.g. one fill with an extended brush) makes the pass a no-op;
 remove it then.
