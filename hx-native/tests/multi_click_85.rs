@@ -41,6 +41,9 @@ fn engine() -> Engine {
     e.declare_actions(&["deal.n"]);
     e.load_html(&page()).unwrap();
     let _ = e.paint(vp()).unwrap();
+    // One frozen press clock: clicks are exactly as far apart as the test
+    // moves it, whatever the load (Graph review).
+    e.test_advance_clock(Duration::ZERO);
     e
 }
 
@@ -188,7 +191,7 @@ fn double_click_selects_a_grouped_number_whole() {
     type_str(&mut e, "1,234.56");
     assert_eq!(e.test_editor_display("big").as_deref(), Some("1,234.56"));
     for frac in [0.6_f32, 0.75, 0.9] {
-        e.test_age_last_click(Duration::from_secs(1));
+        e.test_advance_clock(Duration::from_secs(1));
         let p = at(&e, "big", frac);
         clicks(&mut e, p, 2);
         assert_eq!(
@@ -256,22 +259,24 @@ fn slow_far_or_other_field_presses_start_a_new_click_run() {
     let mut e = engine();
     let p = at(&e, "txt", 0.3);
     click(&mut e, p.0, p.1);
-    e.test_age_last_click(Duration::from_millis(501));
+    e.test_advance_clock(Duration::from_millis(501));
     click(&mut e, p.0, p.1);
     assert_eq!(
         selection(&mut e),
         "",
         "a press 501 ms later is a new single click"
     );
-    // Just in time still counts.
-    let mut e = engine();
-    click(&mut e, p.0, p.1);
-    e.test_age_last_click(Duration::from_millis(450));
-    click(&mut e, p.0, p.1);
-    assert!(
-        !selection(&mut e).is_empty(),
-        "a press 450 ms later is a double-click"
-    );
+    // Just in time still counts, up to 500 ms exactly.
+    for ms in [450, 500] {
+        let mut e = engine();
+        click(&mut e, p.0, p.1);
+        e.test_advance_clock(Duration::from_millis(ms));
+        click(&mut e, p.0, p.1);
+        assert!(
+            !selection(&mut e).is_empty(),
+            "a press {ms} ms later is a double-click"
+        );
+    }
     // Moved more than 2 px.
     let mut e = engine();
     click(&mut e, p.0, p.1);
@@ -356,7 +361,7 @@ mod deals_fee {
         )
     }
 
-    fn eng() -> Engine {
+    pub(super) fn eng() -> Engine {
         let mut e = Engine::new(EngineConfig {
             paint_mode: PaintMode::Exact,
             ..Default::default()
@@ -364,6 +369,7 @@ mod deals_fee {
         e.declare_actions(&["deals.company.select", "deals.proposal.edit_map"]);
         e.load_html(&page()).expect("load");
         let _ = e.paint(vp());
+        e.test_advance_clock(Duration::ZERO);
         e
     }
 
@@ -449,4 +455,75 @@ fn multi_click_selection_partial_paint_equals_full() {
             "{id} x{n}: partial vs full"
         );
     }
+}
+
+/// Graph review: the click count and the arrow hold read one press clock.
+/// Frozen, a held ▲ repeats exactly when the test moves that clock on, and
+/// `sync` reads it the same way the click count does.
+#[test]
+fn the_arrow_hold_reads_the_shared_press_clock() {
+    struct NoSlices;
+    impl SliceSource for NoSlices {
+        fn version(&self, _: &str) -> Option<u64> {
+            None
+        }
+        fn action_states(&self) -> Vec<(String, ActionState)> {
+            vec![]
+        }
+    }
+    struct NoFragments;
+    impl FragmentSource for NoFragments {
+        fn render(&mut self, _: &str, _: &[&str]) -> String {
+            String::new()
+        }
+    }
+    let mut e = deals_fee::eng();
+    let up = e.test_element_box("deals-fee-up").unwrap();
+    let (x, y) = (up.0 + up.2 / 2.0, up.1 + up.3 / 2.0);
+    let mods = Modifiers::default();
+    let b = PointerButton::Primary;
+    e.input(InputEvent::PointerDown {
+        x,
+        y,
+        button: b,
+        mods,
+    });
+    assert_eq!(
+        e.attr("deals-fee", "value").as_deref(),
+        Some("4.7"),
+        "the press steps once"
+    );
+    e.sync(&NoSlices, &mut NoFragments).unwrap();
+    assert_eq!(
+        e.attr("deals-fee", "value").as_deref(),
+        Some("4.7"),
+        "the clock is frozen"
+    );
+    e.test_advance_clock(Duration::from_millis(399));
+    e.sync(&NoSlices, &mut NoFragments).unwrap();
+    assert_eq!(
+        e.attr("deals-fee", "value").as_deref(),
+        Some("4.7"),
+        "399 ms: no repeat yet"
+    );
+    e.test_advance_clock(Duration::from_millis(1));
+    e.sync(&NoSlices, &mut NoFragments).unwrap();
+    assert_eq!(
+        e.attr("deals-fee", "value").as_deref(),
+        Some("4.71"),
+        "400 ms: one repeat"
+    );
+    e.test_advance_clock(Duration::from_millis(200));
+    e.sync(&NoSlices, &mut NoFragments).unwrap();
+    assert_eq!(
+        e.attr("deals-fee", "value").as_deref(),
+        Some("4.73"),
+        "600 ms: two more"
+    );
+    e.input(InputEvent::PointerUp {
+        x,
+        y,
+        button: b,
+        mods,
+    });
 }

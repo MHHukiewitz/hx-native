@@ -54,8 +54,7 @@ use crate::text_edit::{
     delete_forward, delete_selection, editor_text, filter_number_insert, has_selection,
     insert_text, is_disabled, is_editable_input, move_end, move_home, move_left, move_right,
     number_is_sent, place_caret_at, prepare_focus_display, resolve_step_target, select_all,
-    select_word_at,
-    selected_text, step_and_regroup, step_direction, sync_value_from_editor,
+    select_word_at, selected_text, step_and_regroup, step_direction, sync_value_from_editor,
     text_outside_selection, TextEditSession, CARET_BLINK_HALF_PERIOD,
 };
 use crate::trigger::{
@@ -251,6 +250,10 @@ struct LiveSurface {
     /// Issue #85 (Ruling 7): the last primary press in a text field, so the
     /// next one can count as a double- or triple-click.
     last_text_click: Option<TextClick>,
+    /// The press clock frozen by a test (Graph review of #84/#86): when set,
+    /// [`Self::press_clock`] reads it instead of the wall clock, so the
+    /// click-count window and the arrow hold can't drift under load.
+    test_clock: Option<Instant>,
     focus: FocusState,
     /// Physical viewport size used for layout / hit-testing (updated on paint).
     layout_viewport: (u32, u32),
@@ -380,11 +383,11 @@ const MULTI_CLICK_SLOP_PX: f32 = 2.0;
 const MULTI_CLICK_MS: u128 = 500;
 
 impl TextClick {
-    fn continues(&self, id: &str, x: f32, y: f32) -> bool {
+    fn continues(&self, id: &str, x: f32, y: f32, now: Instant) -> bool {
         self.id == id
             && (x - self.x).abs() <= MULTI_CLICK_SLOP_PX
             && (y - self.y).abs() <= MULTI_CLICK_SLOP_PX
-            && self.at.elapsed().as_millis() <= MULTI_CLICK_MS
+            && now.saturating_duration_since(self.at).as_millis() <= MULTI_CLICK_MS
     }
 }
 
@@ -1523,19 +1526,18 @@ impl Engine {
             .unwrap_or(0)
     }
 
-    /// Test helper (issue #85): make the last text-field click `age` old, as
-    /// if the next press came that much later.
+    /// Test helper (issues #81, #85; Graph review): freeze the press clock
+    /// shared by the arrow hold and the click count, moved on by `by` (zero
+    /// just freezes it). Later presses read the frozen time, so a test's
+    /// clicks are exactly `by` apart, whatever the load on the machine.
     #[doc(hidden)]
-    pub fn test_age_last_click(&mut self, age: std::time::Duration) {
-        if let Some(click) = self
+    pub fn test_advance_clock(&mut self, by: std::time::Duration) {
+        if let Some(live) = self
             .surfaces
             .get_mut(&SurfaceId::DEFAULT)
             .and_then(|s| s.live.as_mut())
-            .and_then(|l| l.last_text_click.as_mut())
         {
-            if let Some(at) = click.at.checked_sub(age) {
-                click.at = at;
-            }
+            live.test_clock = Some(live.press_clock() + by);
         }
     }
 
@@ -1706,6 +1708,7 @@ impl LiveSurface {
             spin_hold: None,
             key_hold: None,
             last_text_click: None,
+            test_clock: None,
             focus: FocusState::default(),
             layout_viewport,
             layout_scale,
@@ -3525,11 +3528,7 @@ impl LiveSurface {
                 self.blur_text_edit_queued(ctx);
                 self.doc.clear_focus();
                 self.focus.focused_id = None;
-                self.press = Some(PressState {
-                    id: eid.clone(),
-                    button,
-                    mods,
-                });
+                self.set_press(eid, button, mods);
                 self.reconcile_open_select_after_focus();
                 return InputOutcome::Press { id };
             }
@@ -3543,14 +3542,15 @@ impl LiveSurface {
                     // A number box's text is one number, so its "word" is the
                     // whole field: `.` and `,` don't split it.
                     let count = if button == PointerButton::Primary {
+                        let now = self.press_clock();
                         let count = prev_text_click
-                            .filter(|c| c.continues(eid, x, y))
+                            .filter(|c| c.continues(eid, x, y, now))
                             .map_or(1, |c| c.count.saturating_add(1));
                         self.last_text_click = Some(TextClick {
                             id: eid.clone(),
                             x,
                             y,
-                            at: Instant::now(),
+                            at: now,
                             count,
                         });
                         count
@@ -3567,11 +3567,7 @@ impl LiveSurface {
                     self.queue_text_field_damage(nid);
                 }
                 self.range_drag_id = None;
-                self.press = Some(PressState {
-                    id: eid.clone(),
-                    button,
-                    mods,
-                });
+                self.set_press(eid, button, mods);
                 // Same class as #18 HOLD #3: close an open select when focus
                 // moves to a text field (incl. Secondary / right-click).
                 self.reconcile_open_select_after_focus();
@@ -3583,11 +3579,7 @@ impl LiveSurface {
             if button == PointerButton::Primary {
                 if let Some(out) = self.try_spin_press(ctx, eid) {
                     self.range_drag_id = None;
-                    self.press = Some(PressState {
-                        id: eid.clone(),
-                        button,
-                        mods,
-                    });
+                    self.set_press(eid, button, mods);
                     self.reconcile_open_select_after_focus();
                     return out;
                 }
@@ -3650,11 +3642,7 @@ impl LiveSurface {
         }
 
         if let Some(ref eid) = id {
-            self.press = Some(PressState {
-                id: eid.clone(),
-                button,
-                mods,
-            });
+            self.set_press(eid, button, mods);
             InputOutcome::Press { id }
         } else {
             self.press = None;
@@ -4093,7 +4081,7 @@ impl LiveSurface {
             target_nid,
             target_id,
             dir,
-            pressed_at: Instant::now(),
+            pressed_at: self.press_clock(),
             repeats: 0,
             reported,
             pinned: false,
@@ -4116,6 +4104,21 @@ impl LiveSurface {
         self.mark_dom_dirty();
         self.queue_text_field_damage(nid);
         changed
+    }
+
+    /// The one clock for press timing: the arrow hold (#81) and the click
+    /// count (#85). The wall clock, unless a test froze it.
+    fn press_clock(&self) -> Instant {
+        self.test_clock.unwrap_or_else(Instant::now)
+    }
+
+    /// Record the pointer press on `id` (the one place a press is built).
+    fn set_press(&mut self, id: &str, button: PointerButton, mods: Modifiers) {
+        self.press = Some(PressState {
+            id: id.to_string(),
+            button,
+            mods,
+        });
     }
 
     /// True while the primary press started on a `data-hx-step` arrow.
@@ -4156,7 +4159,10 @@ impl LiveSurface {
         if hold.pinned {
             return;
         }
-        let due = spin_repeats_due(held.unwrap_or_else(|| hold.pressed_at.elapsed()));
+        let due = spin_repeats_due(held.unwrap_or_else(|| {
+            self.press_clock()
+                .saturating_duration_since(hold.pressed_at)
+        }));
         let mut done = hold.repeats;
         let mut pinned = false;
         while done < due {
