@@ -2294,7 +2294,16 @@ impl LiveSurface {
             SwapMode::OuterHtml => {
                 let wrapper_id = {
                     let mut mutr = self.doc.mutate();
-                    let wrapper_id = mutr.create_element(qual_name!("div"), vec![]);
+                    // The wrapper is the fragment parser's context element,
+                    // so it must be an HTML `<div>`. `qual_name!("div")`
+                    // alone has no namespace, and html5ever then parses the
+                    // fragment as foreign content: a root that is not a
+                    // "breakout" tag (`<form>`, `<button>`, `<section>`, ...)
+                    // and its children become namespace-less elements, so
+                    // `<input>` is not void (it swallows its siblings) and no
+                    // HTML user-agent style applies (#svc-tabs laid out 0 px
+                    // tall with 0x0 buttons, #104).
+                    let wrapper_id = mutr.create_element(qual_name!("div", html), vec![]);
                     mutr.set_inner_html(wrapper_id, html);
                     wrapper_id
                 };
