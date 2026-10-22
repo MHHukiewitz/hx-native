@@ -12,6 +12,7 @@ mod dialect;
 mod ellipsis;
 mod engine;
 mod error;
+mod fields;
 mod focus;
 mod fonts;
 mod form_args;
@@ -21,9 +22,11 @@ mod paint;
 mod pending;
 mod scroll;
 mod select_ui;
+mod slider;
 mod stylo_text_style;
 mod svg;
 mod text_edit;
+mod tile_coalesce;
 mod trigger;
 mod types;
 pub mod worker;
@@ -45,6 +48,11 @@ pub use svg::{
     svg_warm_up, svg_warm_up_done, SvgRejection, DATA_IMAGE_MAX_PIXELS, DATA_IMAGE_MAX_SIDE,
     DATA_IMAGE_MAX_TOTAL_PIXELS, DATA_SVG_MAX_BYTES, FORBIDDEN_SVG_ELEMENTS,
     FORBIDDEN_SVG_PROPERTIES, SVG_IMAGE_MIME_TYPES, SVG_MAX_DEPTH,
+};
+#[doc(hidden)]
+pub use tile_coalesce::{
+    clear_tile_cache_for_test, set_tile_coalesce_for_test, take_tile_coalesce_counters_for_test,
+    TileCoalesceCounters,
 };
 pub use trigger::{FilterExpr, FromTarget, ParsedTrigger, TriggerEvent};
 pub use types::*;

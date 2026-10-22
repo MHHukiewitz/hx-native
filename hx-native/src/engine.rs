@@ -18,13 +18,14 @@ use crate::damage::{
 use crate::dialect::{validate_loaded_attrs, ElementBinding, SwapMode, SyncMode};
 use crate::ellipsis::{prepare_ellipsis_for_paint, EllipsisCache, EllipsisShaper};
 use crate::error::EngineError;
+use crate::fields::{align_text_inputs, paint_field_bevels};
 use crate::focus::{focusable_ids, ids_in_document_order, step_focus};
 use crate::fonts::{bundled_font_context, HostFonts};
 use crate::form_args::{
     capture_applied_controls, capture_form_controls, clamp_snap_value, clamp_value, closest_form,
     collect_action_args, collect_applied_control_nids, format_numeric, is_number_input,
-    is_numeric_input, parse_f64, set_range_value_from_x, step_numeric_value, write_value_attr,
-    NumericLimits, MAX_SAFE_NUMBER,
+    is_numeric_input, parse_f64, range_page, range_page_toward_x, range_to_end,
+    set_range_value_from_x, step_numeric_value, write_value_attr, NumericLimits, MAX_SAFE_NUMBER,
 };
 use crate::form_controls::{
     activate_checkable, checkbox_checked_by_name, control_is_disabled, form_control_at_point,
@@ -44,6 +45,9 @@ use crate::scroll::{
 use crate::select_ui::{
     collect_select_nids, control_rect_of, list_row_at, open_select_state, paint_select_overlays,
     select_damage_rects, select_row_damage_rect, select_ua_stylesheet, OpenSelect, SELECT_MAX_ROWS,
+};
+use crate::slider::{
+    all_sliders, grab_offset, paint_sliders, slider_geometry, slider_ua_stylesheet, SliderGeom,
 };
 use crate::svg::{
     check_svg_attribute, classify_url, css_mentions, css_urls, forbidden_element, probe_decode,
@@ -269,7 +273,19 @@ struct LiveSurface {
     /// Set when a range drag was active on the press that is about to release,
     /// so `PointerUp` can fire `change` once and suppress `click`.
     range_drag_released: Option<String>,
-    /// Open Win95 `<select>` drop list (engine-drawn overlay).
+    /// Issue #35: pointer offset from the thumb centre for the active range
+    /// drag (a press on the thumb grabs it in place).
+    range_grab: f32,
+    /// Issue #35: the active range press landed on the groove and paged one
+    /// block toward the pointer; moves and the release do not drag.
+    range_paging: bool,
+    /// Issue #35: the range's value when the press began; the release fires
+    /// `change` only when the value differs (HTML: no change, no event).
+    range_press_value: Option<String>,
+    /// Issue #35: engine-drawn slider geometry painted last frame; a change
+    /// damages that slider's old and new rects only.
+    last_sliders: Vec<SliderGeom>,
+    /// Open `<select>` drop list (engine-drawn overlay).
     open_select: Option<OpenSelect>,
     /// Hovered row in the open list (document coords from last move).
     select_hover_row: Option<usize>,
@@ -1384,6 +1400,26 @@ impl Engine {
         Some((t(g.up), t(g.down), t(g.track), g.thumb.map(t)))
     }
 
+    /// Test helper (issue #35): engine-drawn slider geometry for range input
+    /// `id` (CSS px): `(content, track, thumb, disabled)` as `(x, y, w, h)`.
+    #[doc(hidden)]
+    #[allow(clippy::type_complexity)]
+    pub fn test_slider(
+        &self,
+        id: &str,
+    ) -> Option<(
+        (f32, f32, f32, f32),
+        (f32, f32, f32, f32),
+        (f32, f32, f32, f32),
+        bool,
+    )> {
+        let live = self.live(SurfaceId::DEFAULT)?;
+        let nid = live.doc.get_element_by_id(id)?;
+        let g = crate::slider::slider_geometry(&live.doc, nid)?;
+        let t = |r: crate::select_ui::ControlRect| (r.x, r.y, r.w, r.h);
+        Some((t(g.content), t(g.track), t(g.thumb), g.disabled))
+    }
+
     /// Test helper (issue #15): total `hx-changed` class attribute writes on
     /// the default surface so far. Must not grow on an edit that keeps the
     /// same changed/unchanged state (flip-only mutation).
@@ -1548,7 +1584,10 @@ impl LiveSurface {
         let (bindings, sections) = index_bindings(declared_actions, &doc)?;
 
         doc.add_user_agent_stylesheet(select_ua_stylesheet());
+        doc.add_user_agent_stylesheet(slider_ua_stylesheet());
+        // #23: resolve, plus one more pass when a data: SVG was handed out.
         let passes = resolve_with_data_images(&mut doc, &svg_provider);
+        align_text_inputs(&mut doc);
         let select_nids = collect_select_nids(&doc);
         let applied_control_nids = collect_applied_control_nids(&doc);
         let mut live = Self {
@@ -1580,6 +1619,10 @@ impl LiveSurface {
             pending_damage: Vec::new(),
             range_drag_id: None,
             range_drag_released: None,
+            range_grab: 0.0,
+            range_paging: false,
+            range_press_value: None,
+            last_sliders: Vec::new(),
             open_select: None,
             select_hover_row: None,
             select_nids,
@@ -1647,6 +1690,8 @@ impl LiveSurface {
             self.paint_dirty = true;
         }
         self.settle_scroll_offsets();
+        // Issue #35: single-line typed fields with text-align right/center.
+        align_text_inputs(&mut self.doc);
         passes + image_passes - 1
     }
 
@@ -2731,6 +2776,16 @@ impl LiveSurface {
                 }
             }
         }
+        // A new `step` alone changes what the box shows (the step's decimals,
+        // Designer lock, #49 round 2): step 1 -> 0.01 shows `4.00`, 0.01 -> 1
+        // shows `4.1`, even when the value did not move (Graph review of #49 r2).
+        if changed && is_number && !focused_number {
+            let before = editor_text(&mut self.doc, nid);
+            apply_unfocused_display(&mut self.doc, nid);
+            if editor_text(&mut self.doc, nid) != before {
+                self.queue_text_field_damage(nid);
+            }
+        }
         changed
     }
 
@@ -3218,7 +3273,7 @@ impl LiveSurface {
             return self.on_scroll_drag_move(drag, y);
         }
         if let Some(ref rid) = self.range_drag_id.clone() {
-            if !self.element_is_disabled_id(rid) {
+            if !self.range_paging && !self.element_is_disabled_id(rid) {
                 let _ = self.apply_range_from_x(rid, x);
             }
         }
@@ -3374,14 +3429,22 @@ impl LiveSurface {
             }
 
             if let Some(nid) = self.doc.get_element_by_id(eid) {
-                self.doc.set_focus_to(nid);
+                if self.doc.set_focus_to(nid) {
+                    // Issue #35: a focus move alone (no value change) still
+                    // repaints (`:focus` styles, the slider focus dots).
+                    self.mark_dom_dirty_raw();
+                    self.mark_paint_dirty();
+                }
                 self.focus.focused_id = Some(eid.clone());
             }
         } else if let Some(ref c) = ctrl {
             if self.text_edit.is_some() {
                 self.blur_text_edit_queued(ctx);
             }
-            self.doc.set_focus_to(c.node_id);
+            if self.doc.set_focus_to(c.node_id) {
+                self.mark_dom_dirty_raw();
+                self.mark_paint_dirty();
+            }
             self.focus.focused_id = c.element_id.clone();
         } else if self.text_edit.is_some() {
             self.blur_text_edit_queued(ctx);
@@ -3393,7 +3456,21 @@ impl LiveSurface {
             if let Some(ref c) = ctrl {
                 if c.kind == FormControlKind::Range && !control_is_disabled(&self.doc, c.node_id) {
                     if let Some(ref eid) = c.element_id {
-                        self.apply_range_from_x(eid, x);
+                        // Issue #35: a press on the thumb grabs it in place
+                        // and drags; a press on the groove pages one block
+                        // toward the pointer (Win95 trackbar; one page per
+                        // press, no hold-to-repeat in v1).
+                        let geom = slider_geometry(&self.doc, c.node_id);
+                        let on_thumb = geom.as_ref().is_some_and(|g| g.thumb_contains(x, y));
+                        self.range_press_value = self.attr(eid, "value");
+                        self.range_paging = !on_thumb;
+                        if on_thumb {
+                            self.range_grab = geom.map(|g| grab_offset(&g, x, y)).unwrap_or(0.0);
+                            self.apply_range_from_x(eid, x);
+                        } else {
+                            self.range_grab = 0.0;
+                            self.apply_range_page(eid, x);
+                        }
                         self.range_drag_id = Some(eid.clone());
                     }
                 }
@@ -3432,13 +3509,16 @@ impl LiveSurface {
         let mut suppress_click = false;
         if let Some(ref rid) = self.range_drag_id.clone() {
             if button == PointerButton::Primary {
-                if !self.element_is_disabled_id(rid) {
+                // Issue #35: the release only repaints when the value moves
+                // (`apply_range_from_x` marks dirty and syncs outputs then);
+                // an unmoved release costs no frame.
+                if !self.range_paging && !self.element_is_disabled_id(rid) {
                     self.apply_range_from_x(rid, x);
-                    let _ = sync_outputs_for(&mut self.doc, rid);
-                    self.mark_dom_dirty();
-                    self.mark_paint_dirty();
                 }
-                self.range_drag_released = Some(rid.clone());
+                let now = self.attr(rid, "value");
+                if now != self.range_press_value.take() {
+                    self.range_drag_released = Some(rid.clone());
+                }
                 suppress_click = true;
             }
         }
@@ -3714,7 +3794,13 @@ impl LiveSurface {
             return;
         }
         prepare_focus_display(&mut self.doc, nid);
-        self.doc.set_focus_to(nid);
+        // Issue #35: the rebound node gains FOCUS here, after this frame's
+        // resolve; restyle now so its `:focus` look (outline) is in this
+        // frame instead of one frame late (partial == full on the swap frame).
+        if self.doc.set_focus_to(nid) {
+            self.needs_resolve = true;
+            self.ensure_resolved();
+        }
         if let Some(s) = self.text_edit.as_mut() {
             s.needs_prepare = false;
             s.caret_visible = true;
@@ -3837,7 +3923,7 @@ impl LiveSurface {
     ) -> Option<InputOutcome> {
         self.ensure_text_edit_prepared();
         let session = self.text_edit.take()?;
-        let _ = commit_field(&mut self.doc, session.node_id);
+        let _ = commit_field(&mut self.doc, session.node_id, &session.value_at_focus);
         self.mark_dom_dirty();
         self.queue_text_field_damage(session.node_id);
         let value_now = self.attr(&session.id, "value").unwrap_or_default();
@@ -3871,13 +3957,18 @@ impl LiveSurface {
     }
 
     fn hold_focused_number_to_commit(&mut self) {
-        let Some(nid) = self.text_edit.as_ref().map(|s| s.node_id) else {
+        let Some((nid, fallback)) = self
+            .text_edit
+            .as_ref()
+            .map(|s| (s.node_id, s.value_at_focus.clone()))
+        else {
             return;
         };
         if self.doc.get_node(nid).is_some_and(is_number_input)
             && editor_text(&mut self.doc, nid).is_some()
         {
-            let _ = crate::text_edit::sync_value_from_editor(&mut self.doc, nid, true, true);
+            let _ =
+                crate::text_edit::sync_value_from_editor(&mut self.doc, nid, true, true, &fallback);
         }
     }
 
@@ -3896,6 +3987,11 @@ impl LiveSurface {
             _ => session.value_at_focus.clone(),
         };
         let _ = crate::form_args::write_value_attr(&mut self.doc, session.node_id, &restored);
+        // The value attribute may already hold the restored value (a refused
+        // comma text such as "3,5" never reached it, #51), in which case the
+        // write above leaves the editor alone: rewrite it so the typed text
+        // does not stay on screen after Esc.
+        crate::text_edit::set_editor_text(&mut self.doc, session.node_id, &restored);
         apply_unfocused_display(&mut self.doc, session.node_id);
         self.doc.clear_focus();
         self.focus.focused_id = None;
@@ -3960,7 +4056,7 @@ impl LiveSurface {
                 }
                 cleaned
             } else {
-                // Commas accepted and ignored (not inserted while focused).
+                // Commas are kept while typing; commit judges them (#51).
                 filter_number_insert(&existing, &filtered, &limits)
             };
             if filtered.is_empty() {
@@ -3970,7 +4066,13 @@ impl LiveSurface {
         } else {
             insert_text(&mut self.doc, nid, &filtered);
         }
-        let _ = sync_value_from_editor(&mut self.doc, nid, is_number, false);
+        let _ = sync_value_from_editor(
+            &mut self.doc,
+            nid,
+            is_number,
+            false,
+            &session.value_at_focus,
+        );
         self.reset_caret_blink();
         self.mark_dom_dirty();
         self.queue_text_field_damage(nid);
@@ -3998,7 +4100,13 @@ impl LiveSurface {
                 .doc
                 .get_node(session.node_id)
                 .is_some_and(is_number_input);
-            let _ = sync_value_from_editor(&mut self.doc, session.node_id, is_number, false);
+            let _ = sync_value_from_editor(
+                &mut self.doc,
+                session.node_id,
+                is_number,
+                false,
+                &session.value_at_focus,
+            );
             self.reset_caret_blink();
             self.mark_dom_dirty();
             self.queue_text_field_damage(session.node_id);
@@ -4054,7 +4162,13 @@ impl LiveSurface {
             _ => return None,
         }
         let is_number = self.doc.get_node(nid).is_some_and(is_number_input);
-        let _ = sync_value_from_editor(&mut self.doc, nid, is_number, false);
+        let _ = sync_value_from_editor(
+            &mut self.doc,
+            nid,
+            is_number,
+            false,
+            &session.value_at_focus,
+        );
         self.reset_caret_blink();
         self.mark_dom_dirty();
         self.queue_text_field_damage(nid);
@@ -4302,9 +4416,21 @@ impl LiveSurface {
         collect_action_args(&self.doc, source_id, &rule_greyed)
     }
 
+    /// Issue #35: a groove press pages the value one block toward `x`.
+    fn apply_range_page(&mut self, id: &str, x: f32) -> bool {
+        self.ensure_resolved();
+        let changed = range_page_toward_x(&mut self.doc, id, x);
+        if changed {
+            let _ = sync_outputs_for(&mut self.doc, id);
+            self.mark_dom_dirty();
+            self.mark_paint_dirty();
+        }
+        changed
+    }
+
     fn apply_range_from_x(&mut self, id: &str, x: f32) -> bool {
         self.ensure_resolved();
-        let changed = set_range_value_from_x(&mut self.doc, id, x);
+        let changed = set_range_value_from_x(&mut self.doc, id, x, self.range_grab);
         if changed {
             let _ = sync_outputs_for(&mut self.doc, id);
             self.mark_dom_dirty();
@@ -4332,6 +4458,25 @@ impl LiveSurface {
             return None;
         }
         let is_number = is_number_input(node);
+        // Issue #35: Home / End on a focused range jump to min / max (the
+        // max snapped onto the step grid), committing like an arrow step.
+        // Round 3: PageUp / PageDown page one block, the same as a groove
+        // press. Handled here, before #34's scroll keys, so a slider inside
+        // a scroll container moves instead of scrolling it.
+        if !is_number && matches!(key, "Home" | "End" | "PageUp" | "PageDown") {
+            let changed = match key {
+                "PageUp" => range_page(&mut self.doc, nid, 1.0),
+                "PageDown" => range_page(&mut self.doc, nid, -1.0),
+                _ => range_to_end(&mut self.doc, nid, key == "End"),
+            };
+            if changed {
+                let _ = sync_outputs_for(&mut self.doc, &fid);
+                self.mark_dom_dirty();
+                self.mark_paint_dirty();
+                return Some(self.fire_change(ctx, &fid));
+            }
+            return Some(InputOutcome::None);
+        }
         let dir = if is_number {
             match key {
                 "ArrowUp" => 1,
@@ -4623,7 +4768,14 @@ impl LiveSurface {
         if key.pressed
             && matches!(
                 key.key.as_str(),
-                "ArrowUp" | "ArrowRight" | "ArrowDown" | "ArrowLeft"
+                "ArrowUp"
+                    | "ArrowRight"
+                    | "ArrowDown"
+                    | "ArrowLeft"
+                    | "Home"
+                    | "End"
+                    | "PageUp"
+                    | "PageDown"
             )
         {
             if let Some(out) = self.try_step_focused_numeric(ctx, &key.key) {
@@ -5073,7 +5225,7 @@ impl LiveSurface {
 
         // Probe: public resolve_stylist first so Node::damage() is readable,
         // then full resolve (stylist is a no-op; layout + paint-tree run).
-        let style_damaged = if force_full || !had_previous {
+        let mut style_damaged = if force_full || !had_previous {
             Vec::new()
         } else {
             self.doc.resolve_stylist(0.0);
@@ -5122,13 +5274,33 @@ impl LiveSurface {
             }
             self.last_bars = bars;
         }
-        pending.append(&mut self.pending_damage);
-
+        // Issue #35: an engine-drawn slider whose thumb / box / greying /
+        // clip changed damages its old and new rects (nothing else).
+        let sliders = all_sliders(&self.doc);
+        if sliders != self.last_sliders {
+            let changed = self
+                .last_sliders
+                .iter()
+                .filter(|g| !sliders.contains(g))
+                .chain(sliders.iter().filter(|g| !self.last_sliders.contains(g)));
+            for g in changed {
+                let r = g.damage_rect(scale).clamp_to_surface(width, height);
+                if !r.is_empty() {
+                    pending.push(r);
+                }
+            }
+            self.last_sliders = sliders;
+        }
         // Same-id swap: PlainEditor now exists — seed from value + caret at end
-        // before damage planning so partial frames match a full repaint.
+        // before damage planning so partial frames match a full repaint. Its
+        // refocus restyle and field damage join this frame's plan.
         if self.text_edit.as_ref().is_some_and(|s| s.needs_prepare) {
             self.ensure_text_edit_prepared();
+            if !force_full && had_previous {
+                style_damaged.extend(self.carried_style_damage.drain());
+            }
         }
+        pending.append(&mut self.pending_damage);
         // Opt-in grouping for inputs a load/swap just (re)built (issue #40),
         // with its damage folded into this frame's plan.
         if self.group_display_pending {
@@ -5279,7 +5451,12 @@ impl LiveSurface {
         drop(session);
         let mut frame = rgba?;
 
-        // Issue #26: engine-drawn Win95 scrollbars (under select overlays).
+        // Issue #35: engine-drawn typed-field bevels and range sliders (under
+        // the scrollbars, which own the reserved gutter strip).
+        paint_field_bevels(&self.doc, &mut frame, scale);
+        paint_sliders(&self.doc, &mut frame, scale);
+
+        // Issue #26: engine-drawn scrollbars (under select overlays).
         paint_scrollbars(&self.doc, &mut frame, scale, self.scroll_pressed);
 
         // Engine-drawn select face button + open list (above Blitz content).

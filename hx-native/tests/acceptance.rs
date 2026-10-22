@@ -2081,13 +2081,15 @@ fn k1_range_arrow_clamps_and_snaps() {
 "#;
     let mut eng = boot_form(html, &["time.set_speed"]);
     eng.test_set_focus("spd");
-    // 0 → Up 2 → Right 4 → Up clamp to max 5 → Down 4 → Left 2
+    // 0 → Up 2 → Right 4 → Up stays 4 (the highest grid value at or below
+    // the off-grid max 5, like stepUp; #49 round 2) → Down 2 → Left 0 → Up 2
     for (key, code, expect) in [
         ("ArrowUp", "ArrowUp", "2"),
         ("ArrowRight", "ArrowRight", "4"),
-        ("ArrowUp", "ArrowUp", "5"),
-        ("ArrowDown", "ArrowDown", "4"),
-        ("ArrowLeft", "ArrowLeft", "2"),
+        ("ArrowUp", "ArrowUp", "4"),
+        ("ArrowDown", "ArrowDown", "2"),
+        ("ArrowLeft", "ArrowLeft", "0"),
+        ("ArrowUp", "ArrowUp", "2"),
     ] {
         let _ = eng.input(InputEvent::Key(KeyEvent {
             key: key.into(),
@@ -2594,7 +2596,10 @@ html,body{margin:0}
             eng.complete(request, Ok(()));
         }
     }
-    assert_eq!(eng.attr("fee", "value").as_deref(), Some("5.00"));
+    // Designer lock (#49 round 2): `value` is the plain number, the box
+    // shows the step's decimals.
+    assert_eq!(eng.attr("fee", "value").as_deref(), Some("5"));
+    assert_eq!(eng.test_editor_display("fee").as_deref(), Some("5.00"));
     // Down steps back
     if let InputOutcome::Action { request, .. } = click(&mut eng, 100.0, 18.0) {
         eng.complete(request, Ok(()));
