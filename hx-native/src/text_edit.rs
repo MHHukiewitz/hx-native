@@ -62,6 +62,11 @@ pub struct TextEditSession {
     pub node_id: NodeId,
     /// Canonical `value` at focus time (Esc restores this).
     pub value_at_focus: String,
+    /// Canonical `value` the last `change` reported, or the focus-time value
+    /// when none fired yet. A commit fires `change` only when the value
+    /// differs from this, so an arrow step's `change` is not repeated by the
+    /// Enter / blur that follows it (issue #62).
+    pub value_at_change: String,
     /// Caret drawn this frame (toggles on blink).
     pub caret_visible: bool,
     pub last_blink: Instant,

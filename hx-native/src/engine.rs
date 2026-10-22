@@ -1243,6 +1243,7 @@ impl Engine {
                     live.text_edit = Some(TextEditSession {
                         id: id.to_string(),
                         node_id: nid,
+                        value_at_change: value_at_focus.clone(),
                         value_at_focus,
                         caret_visible: true,
                         last_blink: Instant::now(),
@@ -3421,21 +3422,29 @@ impl LiveSurface {
                 return focus_out.unwrap_or(InputOutcome::Press { id });
             }
 
+            // Issue #62: pressing ▲/▼ of the box being edited keeps the typed
+            // value uncommitted and the box focused (as Chrome's spinner does);
+            // the release commits it with the step (`try_spin_step`).
+            let spin_on_edited = self.spin_targets_edited_box(eid);
+
             // Click outside a text field (or on another control): commit/blur edit.
-            if self.text_edit.is_some()
+            if !spin_on_edited
+                && self.text_edit.is_some()
                 && self.text_edit.as_ref().map(|s| s.id.as_str()) != Some(eid.as_str())
             {
                 self.blur_text_edit_queued(ctx);
             }
 
-            if let Some(nid) = self.doc.get_element_by_id(eid) {
-                if self.doc.set_focus_to(nid) {
-                    // Issue #35: a focus move alone (no value change) still
-                    // repaints (`:focus` styles, the slider focus dots).
-                    self.mark_dom_dirty_raw();
-                    self.mark_paint_dirty();
+            if !spin_on_edited {
+                if let Some(nid) = self.doc.get_element_by_id(eid) {
+                    if self.doc.set_focus_to(nid) {
+                        // Issue #35: a focus move alone (no value change) still
+                        // repaints (`:focus` styles, the slider focus dots).
+                        self.mark_dom_dirty_raw();
+                        self.mark_paint_dirty();
+                    }
+                    self.focus.focused_id = Some(eid.clone());
                 }
-                self.focus.focused_id = Some(eid.clone());
             }
         } else if let Some(ref c) = ctrl {
             if self.text_edit.is_some() {
@@ -3775,6 +3784,7 @@ impl LiveSurface {
         self.focus.focused_id = Some(session.id.clone());
         if let Some(s) = self.text_edit.as_mut() {
             s.node_id = nid;
+            s.value_at_change = value.clone();
             s.value_at_focus = value;
             s.caret_visible = true;
             s.last_blink = Instant::now();
@@ -3852,12 +3862,44 @@ impl LiveSurface {
         }
     }
 
+    /// True when `hit_id` is a `data-hx-step` arrow whose target number box
+    /// is the one being edited (issue #62).
+    fn spin_targets_edited_box(&self, hit_id: &str) -> bool {
+        let Some(session) = self.text_edit.as_ref() else {
+            return false;
+        };
+        step_direction(&self.doc, hit_id).is_some()
+            && resolve_step_target(&self.doc, hit_id).is_some_and(|(nid, _)| nid == session.node_id)
+    }
+
     fn try_spin_step(&mut self, ctx: &mut ActionCtx<'_>, hit_id: &str) -> Option<InputOutcome> {
         let dir = step_direction(&self.doc, hit_id)?;
         let (target_nid, target_id) = resolve_step_target(&self.doc, hit_id)?;
         // Disabled target ignores clicks.
         if self.doc.get_node(target_nid).is_some_and(is_disabled) {
             return Some(InputOutcome::None);
+        }
+        // Issue #62: the box is being edited (its typed value is not
+        // committed yet). Step that typed value exactly as ArrowUp/ArrowDown
+        // would (off-grid snaps to the grid in the arrow's direction, an
+        // on-grid value moves one step, never past min/max), then commit it
+        // and blur: one `change`, never commit-then-step.
+        if let Some(session) = self.text_edit.clone().filter(|s| s.node_id == target_nid) {
+            let _ = step_and_regroup(&mut self.doc, target_nid, dir);
+            // `commit_text_edit` re-reads the box, marks the DOM dirty and
+            // queues the box's damage.
+            let committed = self.commit_text_edit(ctx, true);
+            // Focus ends on the arrow, as after a click on a committed value.
+            if let Some(nid) = self.doc.get_element_by_id(hit_id) {
+                self.doc.set_focus_to(nid);
+                self.focus.focused_id = Some(hit_id.to_string());
+            }
+            // Every spin click reports one `change`, as before, even when
+            // the value matches what the last `change` already reported.
+            return Some(match committed {
+                Some(InputOutcome::None) | None => self.fire_change(ctx, &session.id),
+                Some(out) => out,
+            });
         }
         let _ = step_and_regroup(&mut self.doc, target_nid, dir);
         self.mark_dom_dirty();
@@ -3876,6 +3918,19 @@ impl LiveSurface {
         if !is_editable_input(node) || is_disabled(node) {
             return None;
         }
+        // Graph review of #72: a click into the box already being edited
+        // only moves the caret. Re-seeding here put the typed text through
+        // the focus display (`7` became `7.00`) and reset `value_at_focus`
+        // and `value_at_change` to the typed value, so the Enter or blur
+        // that followed fired no `change` and Esc no longer reverted.
+        if self
+            .text_edit
+            .as_ref()
+            .is_some_and(|s| s.id == id && s.node_id == nid)
+        {
+            self.ensure_text_edit_prepared();
+            return None;
+        }
         // Commit previous field if switching.
         if self.text_edit.as_ref().map(|s| s.id.as_str()) != Some(id) {
             self.blur_text_edit_queued(ctx);
@@ -3887,6 +3942,7 @@ impl LiveSurface {
         self.text_edit = Some(TextEditSession {
             id: id.to_string(),
             node_id: nid,
+            value_at_change: value_at_focus.clone(),
             value_at_focus,
             caret_visible: true,
             last_blink: Instant::now(),
@@ -3922,7 +3978,9 @@ impl LiveSurface {
     }
 
     /// Commit the focused text/number field. If `clear_focus`, also clear focus.
-    /// Fires `change` only when the committed value differs from `value_at_focus`.
+    /// Fires `change` only when the committed value differs from
+    /// `value_at_change` (the focus-time value, or the value the last arrow
+    /// step's `change` already reported).
     fn commit_text_edit(
         &mut self,
         ctx: &mut ActionCtx<'_>,
@@ -3934,7 +3992,7 @@ impl LiveSurface {
         self.mark_dom_dirty();
         self.queue_text_field_damage(session.node_id);
         let value_now = self.attr(&session.id, "value").unwrap_or_default();
-        let change = if value_now != session.value_at_focus {
+        let change = if value_now != session.value_at_change {
             self.fire_change(ctx, &session.id)
         } else {
             InputOutcome::None
@@ -3952,6 +4010,7 @@ impl LiveSurface {
             self.text_edit = Some(TextEditSession {
                 id: session.id.clone(),
                 node_id: session.node_id,
+                value_at_change: value_now.clone(),
                 value_at_focus: value_now,
                 caret_visible: true,
                 last_blink: Instant::now(),
@@ -4515,6 +4574,12 @@ impl LiveSurface {
                 self.queue_text_field_damage(nid);
             } else {
                 self.mark_paint_dirty();
+            }
+            // Issue #62: this `change` reports the stepped value, so the
+            // Enter / blur that commits it must not report it again.
+            let stepped = self.attr(&fid, "value").unwrap_or_default();
+            if let Some(s) = self.text_edit.as_mut().filter(|s| s.node_id == nid) {
+                s.value_at_change = stepped;
             }
             Some(self.fire_change(ctx, &fid))
         } else {
