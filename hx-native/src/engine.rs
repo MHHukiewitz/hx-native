@@ -53,9 +53,9 @@ use crate::text_edit::{
     apply_group_display_all, apply_unfocused_display, backspace, caret_device_rect, commit_field,
     delete_forward, delete_selection, editor_text, filter_number_insert, has_selection,
     insert_text, is_disabled, is_editable_input, move_end, move_home, move_left, move_right,
-    place_caret_at, prepare_focus_display, resolve_step_target, select_all, selected_text,
-    step_and_regroup, step_direction, sync_value_from_editor, text_outside_selection,
-    TextEditSession, CARET_BLINK_HALF_PERIOD,
+    number_is_sent, place_caret_at, prepare_focus_display, resolve_step_target, select_all,
+    selected_text, step_and_regroup, step_direction, sync_value_from_editor,
+    text_outside_selection, TextEditSession, CARET_BLINK_HALF_PERIOD,
 };
 use crate::trigger::{
     filter_ctx_from_key, keydown_repeat_allowed, FilterCtx, FromTarget, TriggerEvent,
@@ -4138,7 +4138,8 @@ impl LiveSurface {
             self.queue_text_field_damage(hold.target_nid);
         }
         // Ruling 5 (b6f2c892): the box's value against the last value sent.
-        let already_sent = self.attr(&tid, "value").unwrap_or_default() == hold.reported;
+        let now = self.attr(&tid, "value").unwrap_or_default();
+        let already_sent = self.is_sent_value(hold.target_nid, &now, &hold.reported);
         self.mark_committed(hold.target_nid, &tid);
         if already_sent {
             return InputOutcome::None;
@@ -4154,8 +4155,25 @@ impl LiveSurface {
     /// does ▲ at max or ▼ at min.
     fn at_sent_value(&self, nid: NodeId, id: &str) -> bool {
         self.text_edit.as_ref().is_some_and(|s| {
-            s.node_id == nid && self.attr(id, "value").unwrap_or_default() == s.value_at_change
+            s.node_id == nid
+                && self.is_sent_value(
+                    nid,
+                    &self.attr(id, "value").unwrap_or_default(),
+                    &s.value_at_change,
+                )
         })
+    }
+
+    /// Issue #87 (Designer, HTML_CONTRACT §2 Ruling 5, Mainnet master
+    /// 04c95f50): whether `now` is the last value `sent` for `nid`. A number
+    /// box compares by number ([`number_is_sent`]): `4.1` is a sent `4.10`,
+    /// and text that does not parse sends nothing. Other boxes compare text.
+    fn is_sent_value(&self, nid: NodeId, now: &str, sent: &str) -> bool {
+        if self.doc.get_node(nid).is_some_and(is_number_input) {
+            number_is_sent(now, sent)
+        } else {
+            now == sent
+        }
     }
 
     /// Record `id`'s value as committed for the box being edited (issue #81):
@@ -4254,7 +4272,7 @@ impl LiveSurface {
         self.mark_dom_dirty();
         self.queue_text_field_damage(session.node_id);
         let value_now = self.attr(&session.id, "value").unwrap_or_default();
-        let change = if value_now != session.value_at_change {
+        let change = if !self.is_sent_value(session.node_id, &value_now, &session.value_at_change) {
             self.fire_change(ctx, &session.id)
         } else {
             InputOutcome::None
