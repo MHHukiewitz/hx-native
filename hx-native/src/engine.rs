@@ -24,9 +24,10 @@ use crate::fonts::{bundled_font_context, HostFonts};
 use crate::form_args::{
     capture_applied_controls, capture_form_controls, clamp_snap_value, clamp_value, closest_form,
     collect_action_args, collect_applied_control_nids, control_current_value,
-    control_value_in_args, format_numeric, is_number_input, is_numeric_input, parse_f64,
-    patch_control_arg, range_page, range_page_toward_x, range_to_end, set_range_value_from_x,
-    step_numeric_value, value_control_kind, write_value_attr, NumericLimits, MAX_SAFE_NUMBER,
+    control_value_in_args, format_numeric, is_number_input, is_numeric_input, is_range_input,
+    parse_f64, patch_control_arg, range_page, range_page_toward_x, range_to_end,
+    set_range_value_from_x, step_numeric_value, value_control_kind, write_value_attr,
+    NumericLimits, MAX_SAFE_NUMBER,
 };
 use crate::form_controls::{
     activate_checkable, checkbox_checked_by_name, control_is_disabled, form_control_at_point,
@@ -2732,9 +2733,10 @@ impl LiveSurface {
                     max: node_attr(&self.doc, input_nid, "max"),
                     step: node_attr(&self.doc, input_nid, "step"),
                 };
-                self.limits_markup.insert(key, snap);
+                self.limits_markup.insert(key.clone(), snap);
             }
-            if self.write_limits_onto(input_nid, &limits) {
+            let markup_max = self.limits_markup.get(&key).and_then(|m| m.max.clone());
+            if self.write_limits_onto(input_nid, &limits, markup_max) {
                 any_changed = true;
             }
         }
@@ -2874,9 +2876,30 @@ impl LiveSurface {
     /// clamp/snap its current value. Returns `true` when any attribute
     /// (including `value`) changed. Never fires `change` / `Action` — a
     /// clamp is a local value change only, never an edit the host sees.
-    fn write_limits_onto(&mut self, nid: NodeId, limits: &InputLimits) -> bool {
+    ///
+    /// Issue #101: `limits.max: None` (`InputLimits::at_least`) writes no
+    /// `max` on a number box and clears one from markup (the slice wins),
+    /// so it clamps at `min` only. A range slider needs a max: it keeps
+    /// `markup_max` (the input's markup `max`, from the first snapshot), or
+    /// none, which HTML reads as 100.
+    fn write_limits_onto(
+        &mut self,
+        nid: NodeId,
+        limits: &InputLimits,
+        markup_max: Option<String>,
+    ) -> bool {
+        let is_range = self.doc.get_node(nid).is_some_and(is_range_input);
         let min_s = format_numeric(limits.min);
-        let max_s = format_numeric(limits.max);
+        let want_max: Option<String> = match limits.max {
+            Some(max) => Some(format_numeric(max)),
+            None if is_range => markup_max.filter(|m| parse_f64(m).is_some_and(|v| v.is_finite())),
+            None => None,
+        };
+        let clamp_max = match limits.max {
+            Some(max) => Some(max),
+            None if is_range => Some(want_max.as_deref().and_then(parse_f64).unwrap_or(100.0)),
+            None => None,
+        };
         let step_s = limits
             .step
             .map(format_numeric)
@@ -2891,7 +2914,7 @@ impl LiveSurface {
         {
             let markup_disagrees = (cur_min.is_some()
                 && cur_min.as_deref() != Some(min_s.as_str()))
-                || (cur_max.is_some() && cur_max.as_deref() != Some(max_s.as_str()))
+                || (cur_max.is_some() && cur_max != want_max)
                 || (cur_step.is_some() && cur_step.as_deref() != Some(step_s.as_str()));
             if markup_disagrees {
                 eprintln!(
@@ -2908,8 +2931,11 @@ impl LiveSurface {
                 mutr.set_attribute(nid, qual_name!("min"), &min_s);
                 changed = true;
             }
-            if cur_max.as_deref() != Some(max_s.as_str()) {
-                mutr.set_attribute(nid, qual_name!("max"), &max_s);
+            if cur_max != want_max {
+                match &want_max {
+                    Some(v) => mutr.set_attribute(nid, qual_name!("max"), v),
+                    None => mutr.clear_attribute(nid, qual_name!("max")),
+                }
                 changed = true;
             }
             if cur_step.as_deref() != Some(step_s.as_str()) {
@@ -2920,7 +2946,7 @@ impl LiveSurface {
 
         let clamp_limits = NumericLimits {
             min: Some(limits.min),
-            max: Some(limits.max),
+            max: clamp_max,
             step: limits.step.unwrap_or(1.0),
             unconstrained: limits.step.is_none(),
         };
@@ -6747,17 +6773,16 @@ fn validate_input_limits(
     input: &str,
     limits: &InputLimits,
 ) -> Result<(), EngineError> {
-    let reason = if !limits.min.is_finite() || !limits.max.is_finite() {
+    // Issue #101: `max: None` (no max) skips the max checks.
+    let lmax = limits.max.unwrap_or(limits.min);
+    let reason = if !limits.min.is_finite() || !lmax.is_finite() {
         Some("min/max must be finite numbers".to_string())
-    } else if limits.min.abs() > MAX_SAFE_NUMBER || limits.max.abs() > MAX_SAFE_NUMBER {
+    } else if limits.min.abs() > MAX_SAFE_NUMBER || lmax.abs() > MAX_SAFE_NUMBER {
         Some(format!(
             "min/max must stay within ±{MAX_SAFE_NUMBER} (±2^53, the safe integer range)"
         ))
-    } else if limits.min > limits.max {
-        Some(format!(
-            "min ({}) must be <= max ({})",
-            limits.min, limits.max
-        ))
+    } else if limits.min > lmax {
+        Some(format!("min ({}) must be <= max ({})", limits.min, lmax))
     } else if let Some(step) = limits.step {
         if !step.is_finite() || step <= 0.0 {
             Some(format!("step ({step}) must be > 0 when present"))
