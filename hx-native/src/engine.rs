@@ -2286,10 +2286,12 @@ impl LiveSurface {
             }
         }
 
-        match swap {
+        let swapped_in: Vec<NodeId> = match swap {
             SwapMode::InnerHtml => {
                 let mut mutr = self.doc.mutate();
                 mutr.set_inner_html(target_id, html);
+                drop(mutr);
+                vec![target_id]
             }
             SwapMode::OuterHtml => {
                 let wrapper_id = {
@@ -2310,10 +2312,12 @@ impl LiveSurface {
                     mutr.replace_with_nodes(target_id, &children);
                 }
                 mutr.remove_and_drop_node(wrapper_id);
+                drop(mutr);
+                children
             }
-        }
+        };
         // Issue #89: a redraw never overwrites a newer committed value.
-        self.restore_catch_up_values();
+        self.restore_catch_up_values(&swapped_in);
 
         self.mark_dom_dirty();
         self.mark_paint_dirty();
@@ -4277,6 +4281,7 @@ impl LiveSurface {
                 sent,
                 committed,
                 game: None,
+                game_radio: None,
                 held: true,
             });
         }
@@ -4421,13 +4426,22 @@ impl LiveSurface {
     /// control with a held or unanswered commit gets that value back. A
     /// control the redraw removed is dropped from the catch-up. Runs inside
     /// the swap, whose subtree is already damaged.
-    fn restore_catch_up_values(&mut self) {
+    ///
+    /// Only a control inside the swapped-in nodes (`swapped_in`) was drawn
+    /// by this redraw (Graph review of #98): a redraw of another section (a
+    /// HUD on `time` redraws every tick) leaves the control, its put-back and
+    /// the game's value (`game`) as they are.
+    fn restore_catch_up_values(&mut self, swapped_in: &[NodeId]) {
         let entries = std::mem::take(&mut self.catch_up);
         let mut kept = Vec::with_capacity(entries.len());
         for e in entries {
             let Some(nid) = self.doc.get_element_by_id(&e.control_id) else {
                 continue;
             };
+            if !self.is_inside_any(nid, swapped_in) {
+                kept.push(e);
+                continue;
+            }
             let Some(node) = self.doc.get_node(nid) else {
                 continue;
             };
@@ -4435,6 +4449,19 @@ impl LiveSurface {
                 continue;
             };
             let mut e = e;
+            if value_control_kind(node) == "radio" {
+                // The radio of the group the game drew ticked ("" for none),
+                // read before the put-back changes the group.
+                let name = attr_of(node, "name").unwrap_or_default();
+                e.game_radio = Some(
+                    radios_in_group(&self.doc, &name)
+                        .into_iter()
+                        .filter_map(|r| self.doc.get_node(r))
+                        .find(|r| control_current_value(&self.doc, r).as_deref() == Some("true"))
+                        .map(|r| attr_of(r, "value").unwrap_or_else(|| "on".to_string()))
+                        .unwrap_or_default(),
+                );
+            }
             e.game = Some(now.clone());
             if now != e.committed {
                 self.put_control_value(nid, &e.control_id, &e.committed);
@@ -4442,6 +4469,18 @@ impl LiveSurface {
             kept.push(e);
         }
         self.catch_up = kept;
+    }
+
+    /// `nid` is one of `roots` or inside one of them.
+    fn is_inside_any(&self, nid: NodeId, roots: &[NodeId]) -> bool {
+        let mut cur = Some(nid);
+        while let Some(n) = cur {
+            if roots.contains(&n) {
+                return true;
+            }
+            cur = self.doc.get_node(n).and_then(|node| node.parent);
+        }
+        false
     }
 
     /// Issue #89: write `value` (in `control_current_value`'s encoding) into
@@ -4569,7 +4608,32 @@ impl LiveSurface {
                 kept.push(e);
                 continue;
             }
-            let game = e.game.clone().unwrap_or_else(|| e.sent.clone());
+            let game = e
+                .game
+                .clone()
+                .unwrap_or_else(|| self.effective_sent(&e.control_id, &e.sent));
+            if game == "false"
+                && self
+                    .doc
+                    .get_node(nid)
+                    .is_some_and(|n| value_control_kind(n) == "radio")
+            {
+                // A held radio pick: the group shows the radio the game drew
+                // or, with no redraw, the one the group last sent (Graph
+                // review of #98). Writing "false" to the held radio alone
+                // leaves it ticked.
+                self.put_radio_game(nid, e.game.as_ref().and(e.game_radio.as_deref()));
+                self.mark_paint_dirty();
+                continue;
+            }
+            // Issue #96: the box being edited greys in place next, and
+            // Ruling 6 (`reconcile_text_edit`) writes the session's
+            // `value_at_change` back. After a redraw that is the game's drawn
+            // value, not the last value sent, so the session takes it too.
+            if let Some(s) = self.text_edit.as_mut().filter(|s| s.node_id == nid) {
+                s.value_at_change = game.clone();
+                s.value_at_focus = game.clone();
+            }
             let shown = self
                 .doc
                 .get_node(nid)
@@ -4585,6 +4649,36 @@ impl LiveSurface {
             }
         }
         self.catch_up = kept;
+    }
+
+    /// Graph review of #98: tick the radio of `nid`'s group that the game
+    /// has, the one it drew (`drawn`, "" for none) or else the one the group
+    /// last sent, and untick `nid` when the game has none ticked.
+    fn put_radio_game(&mut self, nid: NodeId, drawn: Option<&str>) {
+        let Some(node) = self.doc.get_node(nid) else {
+            return;
+        };
+        let name = attr_of(node, "name").unwrap_or_default();
+        let want = drawn
+            .map(str::to_string)
+            .or_else(|| self.radio_sent.get(&name).cloned());
+        let target = want.and_then(|v| {
+            radios_in_group(&self.doc, &name).into_iter().find(|&r| {
+                self.doc
+                    .get_node(r)
+                    .is_some_and(|n| attr_of(n, "value").unwrap_or_else(|| "on".to_string()) == v)
+            })
+        });
+        match target {
+            Some(r) => {
+                let id = self.element_id_of(r).unwrap_or_default();
+                self.put_control_value(r, &id, "true");
+            }
+            None => {
+                self.put_checked(nid, false);
+                self.mark_dom_dirty();
+            }
+        }
     }
 
     /// Issue #89: the text being typed in the box being edited, when it is
