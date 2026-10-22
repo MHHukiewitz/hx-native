@@ -484,6 +484,9 @@ impl<'a, S: PaintScene> PaintScene for TileScene<'a, S> {
 }
 
 #[cfg(test)]
+mod stream_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use anyrender::recording::{RenderCommand, Scene};
