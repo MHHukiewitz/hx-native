@@ -23,7 +23,8 @@ use crate::types::{FontFace, FontStyle};
 /// DejaVu Sans (bundled). License: see `assets/fonts/LICENSE-DejaVu.txt`.
 pub const FONT_REGULAR: &[u8] = include_bytes!("../../assets/fonts/DejaVuSans.ttf");
 
-/// DejaVu Sans Bold (bundled, issue #56), same licence. Blitz 0.3.0-beta.4
+/// DejaVu Sans Bold (bundled, issue #56), same licence (upstream 2.37 text,
+/// including the Arev notice: `assets/fonts/LICENSE-DejaVu-2.37.txt`). Blitz 0.3.0-beta.4
 /// never paints parley's synthetic bold, so without a real 700 face every
 /// `font-weight: bold` in the fallback family painted regular. With it, bold
 /// text in an unknown family or a generic family resolves to a real bold.

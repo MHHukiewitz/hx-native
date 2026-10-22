@@ -93,4 +93,9 @@ Licensed under either of
 
 at your option.
 
+The bundled fonts in `assets/fonts/` (DejaVu Sans and DejaVu Sans Bold) are not
+under these licences: they are under the Bitstream Vera / Arev licence of the
+DejaVu project ([LICENSE-DejaVu.txt](assets/fonts/LICENSE-DejaVu.txt),
+upstream text in [LICENSE-DejaVu-2.37.txt](assets/fonts/LICENSE-DejaVu-2.37.txt)).
+
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
