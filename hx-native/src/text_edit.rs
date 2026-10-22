@@ -695,22 +695,15 @@ fn fallback_value(fallback: &str, limits: &NumericLimits, clamp: bool) -> String
 /// Commit a number/text field: clamp number, write canonical value. The
 /// caller (`commit_text_edit`) then shows a number box's display text
 /// (`prepare_focus_display` on Enter, `apply_unfocused_display` on blur).
-/// A number whose commas are not thousands grouping commits `fallback`
-/// (the value at focus) instead, see [`sync_value_from_editor`].
+/// A number whose commas are not thousands grouping, an empty box, or a
+/// lone sign or point commits `fallback` (the last value sent) instead, see
+/// [`sync_value_from_editor`].
 pub fn commit_field(doc: &mut HtmlDocument, nid: NodeId, fallback: &str) -> bool {
-    let (prev_value, limits) = {
+    let limits = {
         let Some(node) = doc.get_node(nid) else {
             return false;
         };
-        let is_number = is_number_input(node);
-        (
-            attr(node, "value").unwrap_or_else(|| "0".into()),
-            if is_number {
-                Some(numeric_limits(node))
-            } else {
-                None
-            },
-        )
+        is_number_input(node).then(|| numeric_limits(node))
     };
     let display = editor_text(doc, nid).unwrap_or_default();
     let canonical = if let Some(ref limits) = limits {
@@ -719,7 +712,13 @@ pub fn commit_field(doc: &mut HtmlDocument, nid: NodeId, fallback: &str) -> bool
         } else {
             let parsed = canonical_from_display(&display, limits, true);
             if parsed.is_empty() {
-                prev_value
+                // Issue #90 (Designer, HTML_CONTRACT §2 Ruling 5, Mainnet
+                // 98ac51a9): an empty box, or a lone `-` / `.`, is no
+                // number. Leaving it puts back the last value sent
+                // (`fallback`), so no later form post carries an empty or
+                // broken number. The live value attribute was already
+                // emptied while typing, so it can't be the fallback.
+                fallback_value(fallback, limits, true)
             } else {
                 parsed
             }

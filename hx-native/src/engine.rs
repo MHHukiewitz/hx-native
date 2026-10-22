@@ -4352,7 +4352,9 @@ impl LiveSurface {
         if self.key_hold.as_ref().is_some_and(|k| *k == session.id) {
             self.key_hold = None;
         }
-        let _ = commit_field(&mut self.doc, session.node_id, &session.value_at_focus);
+        // The fallback for text that is no number is the last value sent
+        // (Ruling 5, Mainnet 98ac51a9; issue #90).
+        let _ = commit_field(&mut self.doc, session.node_id, &session.value_at_change);
         self.mark_dom_dirty();
         self.queue_text_field_damage(session.node_id);
         let value_now = self.attr(&session.id, "value").unwrap_or_default();
