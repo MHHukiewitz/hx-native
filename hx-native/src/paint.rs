@@ -15,6 +15,7 @@ use peniko::{BlendMode, Color, Fill, FontData, StyleRef};
 use crate::damage::IntRect;
 use crate::error::EngineError;
 use crate::text_shadow::{ShadowScene, ShadowTable};
+use crate::tile_coalesce::TileScene;
 use crate::types::{PaintMode, RgbaImage};
 
 pub fn paint_rgba(
@@ -29,11 +30,15 @@ pub fn paint_rgba(
     let table = ShadowTable::build(doc, scale);
     let pixels = render_to_buffer::<VelloCpuImageRenderer, _>(
         |scene| {
-            let mut shadow = ShadowScene {
-                inner: scene,
-                table: &table,
-            };
-            paint_scene(&mut shadow, doc, scale, width, height, 0, 0);
+            let mut tiles = TileScene::new(scene);
+            {
+                let mut shadow = ShadowScene {
+                    inner: &mut tiles,
+                    table: &table,
+                };
+                paint_scene(&mut shadow, doc, scale, width, height, 0, 0);
+            }
+            tiles.finish();
         },
         width,
         height,
@@ -98,11 +103,18 @@ fn paint_exact_rect(
             };
             // Full-size clip so fragments outside the rect cannot leak.
             PaintScene::push_clip_layer(&mut cull, Fill::NonZero, Affine::IDENTITY, &clip);
-            let mut shadow = ShadowScene {
-                inner: &mut cull,
-                table,
-            };
-            paint_scene(&mut shadow, doc, scale, width, height, 0, 0);
+            // Shadows are emitted above the tile merge, and tile runs are merged
+            // before culling, so full and partial paints see the same commands
+            // (issues #57, #67).
+            let mut tiles = TileScene::new(&mut cull);
+            {
+                let mut shadow = ShadowScene {
+                    inner: &mut tiles,
+                    table,
+                };
+                paint_scene(&mut shadow, doc, scale, width, height, 0, 0);
+            }
+            tiles.finish();
             PaintScene::pop_layer(&mut cull);
         },
         width,
@@ -142,11 +154,15 @@ fn paint_shifted_rect(
                 shift: Some(shift),
                 skip_depth: 0,
             };
-            let mut shadow = ShadowScene {
-                inner: &mut cull,
-                table,
-            };
-            paint_scene(&mut shadow, doc, scale, width, height, 0, 0);
+            let mut tiles = TileScene::new(&mut cull);
+            {
+                let mut shadow = ShadowScene {
+                    inner: &mut tiles,
+                    table,
+                };
+                paint_scene(&mut shadow, doc, scale, width, height, 0, 0);
+            }
+            tiles.finish();
         },
         rw,
         rh,

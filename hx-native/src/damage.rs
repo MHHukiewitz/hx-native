@@ -348,9 +348,24 @@ pub(crate) fn ink_box_device(
 
     if let Some(style) = node.primary_styles() {
         let outline = style.get_outline();
-        let outline_w = outline.outline_width.0.to_f64_px() * scale;
+        // Issue #35: Blitz paints no outline for `none` / `hidden` / `auto`
+        // (render/border.rs `draw_outline`), while the computed width stays
+        // `medium` (3 px). Count the width only when an outline is drawn.
+        let drawn = !matches!(
+            outline.outline_style,
+            style::values::specified::outline::OutlineStyle::Auto
+        ) && !outline.outline_style.none_or_hidden();
+        let outline_w = if drawn {
+            outline.outline_width.0.to_f64_px() * scale
+        } else {
+            0.0
+        };
         // outline-offset can be negative (inward); only grow ink for outward offset.
-        let outline_off = outline.outline_offset.to_f64_px().max(0.0) * scale;
+        let outline_off = if drawn {
+            outline.outline_offset.to_f64_px().max(0.0) * scale
+        } else {
+            0.0
+        };
         let outline_pad = outline_w + outline_off;
         if outline_pad > 0.0 {
             x0 -= outline_pad;

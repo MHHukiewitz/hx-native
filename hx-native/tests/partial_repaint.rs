@@ -124,6 +124,10 @@ body { width: 800px; height: 400px; background: #1a1f2a; color: #e8ecf4;
 #glog { position: absolute; left: 600px; top: 240px; width: 180px; height: 100px;
   overflow-y: auto; background: #2a3140; font-size: 13px; line-height: 20px; padding-right: 4px; }
 #glog div { background: #3d7ea6; }
+#vol { position: absolute; left: 40px; top: 320px; width: 200px; height: 20px; }
+#num { position: absolute; left: 260px; top: 320px; width: 60px; height: 20px; padding: 2px 6px;
+  line-height: 16px; text-align: right; background: #fff; color: #000; border: 0; font-size: 11px;
+  box-shadow: inset -1px -1px #fff, inset 1px 1px #808080, inset -2px -2px #dfdfdf, inset 2px 2px #0a0a0a; }
 </style></head><body>
 <section id="sec-chips" hx-trigger="slice:time" hx-target="#chips" hx-swap="innerHTML">
   <div id="chips"></div>
@@ -141,6 +145,8 @@ body { width: 800px; height: 400px; background: #1a1f2a; color: #e8ecf4;
 <section id="sec-glog" hx-trigger="slice:glog" hx-target="#glog" hx-swap="innerHTML">
   <div id="glog"></div>
 </section>
+<input id="vol" type="range" name="vol" value="20" min="0" max="100" step="5">
+<input id="num" type="number" name="num" value="42">
 <div id="log">"##
         .to_string()
         + &(0..15)
@@ -534,6 +540,31 @@ fn run_scripted_sequence(scale: f64) {
         "author 4 px + 16 px gutter"
     );
 
+    // Step 8 (issue #35): drag the engine-drawn slider thumb. Mid-drag and
+    // release frames damage only the slider box; the value snaps to step 5.
+    // The release at the drag position moves nothing, so it costs no frame.
+    let vol = slider_drag(&mut eng, |e| {
+        let dr = e.paint(view.clone()).unwrap();
+        (!dr.skipped).then(|| {
+            assert!(!e.last_paint_stats().full_repaint);
+            dr
+        })
+    });
+    assert!(vol[0].is_some(), "mid-drag frame paints");
+    assert!(vol[1].is_none(), "an unmoved release skips its frame");
+    for out in vol.iter().flatten() {
+        let (x0, y0, x1, y1) = damage_union(out).expect("slider damage");
+        assert!(
+            x0 >= 40.0 * s - 1.0
+                && y0 >= 320.0 * s - 1.0
+                && x1 <= 240.0 * s + 1.0
+                && y1 <= 340.0 * s + 1.0,
+            "slider damage must stay in #vol at scale={scale}: {:?}",
+            out.damage
+        );
+    }
+    assert_eq!(eng.attr("vol", "value").as_deref(), Some("50"));
+
     // Final byte-identical: current eng last_frame vs fresh full load of same fragments.
     {
         let expected = eng.last_frame().unwrap().pixels.clone();
@@ -549,6 +580,7 @@ fn run_scripted_sequence(scale: f64) {
         eng_f.sync(&s_f, &mut f_f).unwrap();
         let _ = eng_f.paint(view.clone()).unwrap();
         let _ = eng_f.input(log_wheel());
+        let _ = slider_drag(&mut eng_f, |_| ());
         eng_f.mark_theme_or_stylesheet_changed();
         let full = eng_f.paint(view).unwrap();
         assert_eq!(
@@ -567,6 +599,38 @@ fn glog_html(n: usize) -> String {
 }
 
 /// Issue #26: one wheel notch down over `#log` (CSS px).
+/// Issue #35: press `#vol`'s thumb at its centre, move 60 CSS px right,
+/// release; `between` runs after the move and after the release.
+fn slider_drag<T>(eng: &mut Engine, mut between: impl FnMut(&mut Engine) -> T) -> Vec<T> {
+    let (_c, _t, th, _d) = eng.test_slider("vol").expect("vol slider");
+    let (x, y) = (th.0 + th.2 / 2.0, th.1 + th.3 / 2.0);
+    let ev = |kind: u8, x: f32| match kind {
+        0 => InputEvent::PointerDown {
+            x,
+            y,
+            button: PointerButton::Primary,
+            mods: Modifiers::default(),
+        },
+        1 => InputEvent::PointerMove {
+            x,
+            y,
+            mods: Modifiers::default(),
+        },
+        _ => InputEvent::PointerUp {
+            x,
+            y,
+            button: PointerButton::Primary,
+            mods: Modifiers::default(),
+        },
+    };
+    let _ = eng.input(ev(0, x));
+    let _ = eng.input(ev(1, x + 60.0));
+    let a = between(eng);
+    let _ = eng.input(ev(2, x + 60.0));
+    let b = between(eng);
+    vec![a, b]
+}
+
 fn log_wheel() -> InputEvent {
     InputEvent::Wheel {
         pos: (690.0, 160.0),
