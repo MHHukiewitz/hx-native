@@ -223,9 +223,15 @@ fn g2_decimals_and_step_any() {
         ("term", "0", true, "1", "1"),
     ] {
         let mut e = boot(1.0);
+        let sent = val(&e, id);
         let mut ch = vec![];
         type_in(&mut e, id, typed, &mut ch);
         arrow(&mut e, id, up, &mut ch);
+        // Issue #81 (Designer ruling 1): the box keeps the focus after the
+        // click, so leave it (Tab, no second `change`) to see the committed
+        // display this table checks; before #81 the click itself blurred.
+        assert_eq!(e.focus_state().focused_id.as_deref(), Some(id));
+        feed(&mut e, key("Tab", false, false), &mut ch);
         let disp = e.test_editor_display(id);
         eprintln!(
             "{id} typed {typed} {} -> {} shown {disp:?} ch {ch:?}",
@@ -233,7 +239,15 @@ fn g2_decimals_and_step_any() {
             val(&e, id)
         );
         assert_eq!(val(&e, id), want, "{id} {typed}");
-        assert_eq!(ch, vec![c(id, want)], "{id} {typed}");
+        // Ruling 5 (Mainnet b6f2c892, #81): ending on the sent value sends
+        // nothing (fee typed `6.125` ▼ to the sent `6.12`); before that
+        // ruling every row sent one `change`.
+        let sends = if want == sent {
+            vec![]
+        } else {
+            vec![c(id, want)]
+        };
+        assert_eq!(ch, sends, "{id} {typed}");
         assert_eq!(disp.as_deref(), Some(shown), "{id} {typed} shown");
     }
 }
@@ -516,7 +530,13 @@ fn g14_press_up_release_down() {
         val(&e, "term"),
         e.focus_state().focused_id
     );
-    assert!(ch.is_empty());
+    // Issue #81 (Designer ruling 2): the press steps 3.7 ▲ to 4 and the
+    // release, on the other arrow or anywhere, sends that one `change`;
+    // the box keeps the focus. Before #81 a release off the pressed arrow
+    // sent nothing.
+    assert_eq!(val(&e, "term"), "4");
+    assert_eq!(ch, vec![c("term", "4")]);
+    assert_eq!(e.focus_state().focused_id.as_deref(), Some("term"));
 }
 
 #[test]
