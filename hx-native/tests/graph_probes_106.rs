@@ -143,13 +143,10 @@ fn inline_svg_root_keeps_its_svg_box() {
     assert_eq!((r.2, r.3), (80.0, 30.0), "svg box {r:?}");
 }
 
-/// `<tr>` / `<td>` as an outerHTML root. With a `<div>` context the HTML
-/// fragment algorithm drops the `<tr>`/`<td>` tags (their ids are gone and
-/// the cells' text lands loose in the `<tbody>`). Not a #106 regression:
-/// before #106 they became namespace-less foreign elements, also wrong.
-/// Passes once the context is the target's parent (fix/0002).
+/// `<tr>` / `<td>` as an outerHTML root parse under their real parent
+/// (`<tbody>` / `<tr>`), like the `outerHTML` setter; a `<div>` context
+/// dropped their tags.
 #[test]
-#[ignore = "outerHTML context is a <div>, not the target's parent (fix/0002)"]
 fn table_row_and_cell_roots_swap_like_their_static_load() {
     let mut bad = vec![];
     for (label, open, close, a, b) in [
