@@ -301,19 +301,46 @@ pub enum InputRule {
 /// `step="any"` and falls back to a step of `1` for arrow/spin stepping,
 /// matching the existing missing-`step` default.
 ///
+/// `max: None` means no max (issue #101; Mainnet Services' Marketing budget):
+/// build it with [`InputLimits::at_least`]. A number box then gets no `max`
+/// attribute (one from markup is cleared, the slice wins), arrows and spin
+/// step up with no clamp, and typed or pasted values clamp at `min` only
+/// (the ±2^53 safe-number ceiling still holds). A range must have a real
+/// max (Designer ruling, 2026-10-22): `at_least` on a range is refused and
+/// logged with the element's id, and the range keeps its markup
+/// `min`/`max`/`step`.
+/// [`InputLimits::new`] always sets `Some(max)`. Reading `.max` directly is
+/// a breaking change from `f64` to `Option<f64>` (#101).
+///
 /// `#[non_exhaustive]` (PR27 round 2): a prospective future field must not
-/// break downstream struct literals. Build one with [`InputLimits::new`].
+/// break downstream struct literals. Build one with [`InputLimits::new`] or
+/// [`InputLimits::at_least`].
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq)]
 pub struct InputLimits {
     pub min: f64,
-    pub max: f64,
+    /// `None`: no max (issue #101; [`InputLimits::at_least`]).
+    pub max: Option<f64>,
     pub step: Option<f64>,
 }
 
 impl InputLimits {
+    /// Limits with both bounds: `min <= value <= max`.
     pub fn new(min: f64, max: f64, step: Option<f64>) -> Self {
-        Self { min, max, step }
+        Self {
+            min,
+            max: Some(max),
+            step,
+        }
+    }
+
+    /// Limits with a min and no max (issue #101).
+    pub fn at_least(min: f64, step: Option<f64>) -> Self {
+        Self {
+            min,
+            max: None,
+            step,
+        }
     }
 }
 

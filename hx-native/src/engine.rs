@@ -25,9 +25,10 @@ use crate::fonts::{bundled_font_context, HostFonts};
 use crate::form_args::{
     capture_applied_controls, capture_form_controls, clamp_snap_value, clamp_value, closest_form,
     collect_action_args, collect_applied_control_nids, control_current_value,
-    control_value_in_args, format_numeric, is_number_input, is_numeric_input, parse_f64,
-    patch_control_arg, range_page, range_page_toward_x, range_to_end, set_range_value_from_x,
-    step_numeric_value, value_control_kind, write_value_attr, NumericLimits, MAX_SAFE_NUMBER,
+    control_value_in_args, format_numeric, is_number_input, is_numeric_input, is_range_input,
+    parse_f64, patch_control_arg, range_page, range_page_toward_x, range_to_end,
+    set_range_value_from_x, step_numeric_value, value_control_kind, write_value_attr,
+    NumericLimits, MAX_SAFE_NUMBER,
 };
 use crate::form_controls::{
     activate_checkable, checkbox_checked_by_name, control_is_disabled, form_control_at_point,
@@ -2261,6 +2262,11 @@ impl LiveSurface {
         // re-authored host `disabled` on the swapped-in markup is never
         // mistaken for a stale engine-owned grey.
         self.invalidate_rule_disabled_in(target_id);
+        // Graph review of #102: the markup `min`/`max`/`step` snapshot of an
+        // input this swap re-renders is retaken from its new markup, so a
+        // range under `InputLimits::at_least` follows a new markup `max` and
+        // removing the limits later restores the markup the game drew last.
+        self.invalidate_limits_markup_in(target_id);
 
         // Record old subtree ink from the last paint snapshot (no resolve here —
         // sync must not run style/layout). compute_plan merges these so old
@@ -2756,13 +2762,33 @@ impl LiveSurface {
 
         let mut any_changed = false;
         for (key, input_nid, limits) in resolved {
+            // Designer ruling (2026-10-22 12:45 America/Asuncion, #101): a
+            // range must have a real max. `at_least` (no max) on a range is
+            // refused: nothing is applied, the input keeps (or gets back) its
+            // markup `min`/`max`/`step`, and the refusal is logged with the
+            // element's id on each `input_limits()` refresh.
+            if limits.max.is_none() && self.doc.get_node(input_nid).is_some_and(is_range_input) {
+                if validate {
+                    let id = node_id_attr(&self.doc, input_nid).unwrap_or_default();
+                    eprintln!(
+                        "hx_native: refused InputLimits::at_least (no max) for range input                          id=`{id}` (action `{}`, input `{}`): a range must have a real max;                          it keeps its markup min/max/step",
+                        key.0, key.1
+                    );
+                }
+                if let Some(snap) = self.limits_markup.get(&key).cloned() {
+                    if self.restore_markup_onto(input_nid, Some(&snap)) {
+                        any_changed = true;
+                    }
+                }
+                continue;
+            }
             if !self.limits_markup.contains_key(&key) {
                 let snap = MarkupSnapshot {
                     min: node_attr(&self.doc, input_nid, "min"),
                     max: node_attr(&self.doc, input_nid, "max"),
                     step: node_attr(&self.doc, input_nid, "step"),
                 };
-                self.limits_markup.insert(key, snap);
+                self.limits_markup.insert(key.clone(), snap);
             }
             if self.write_limits_onto(input_nid, &limits) {
                 any_changed = true;
@@ -2779,8 +2805,9 @@ impl LiveSurface {
     /// key that `self.limits_cache` carried but `raw` no longer does (PR27
     /// round 2, non-blocking item): the slice stopped declaring limits for
     /// that input, so the engine's override must stop too. Restores the
-    /// markup snapshot taken the first time the engine wrote over it, or
-    /// clears the three attributes when there was nothing to restore.
+    /// markup snapshot taken the first time the engine wrote over it. With
+    /// no snapshot the engine never wrote over the current markup, so the
+    /// input is left as it is.
     fn remove_stale_limits(&mut self, raw: &[(String, String, InputLimits)]) {
         let new_keys: HashSet<(String, String)> =
             raw.iter().map(|(a, i, _)| (a.clone(), i.clone())).collect();
@@ -2795,11 +2822,17 @@ impl LiveSurface {
         }
         let mut any_changed = false;
         for key in removed {
-            let snap = self.limits_markup.remove(&key);
+            // Graph review of #102: no snapshot means the engine has not
+            // written over this input's current markup (a refused range, or
+            // a swap re-rendered it since), so there is nothing to undo, and
+            // clearing would wipe the markup `min`/`max`/`step`.
+            let Some(snap) = self.limits_markup.remove(&key) else {
+                continue;
+            };
             let (action, input_name) = key;
             for form_nid in self.forms_for_action(&action) {
                 for input_nid in self.range_or_number_inputs_named(form_nid, &input_name) {
-                    if self.restore_markup_onto(input_nid, snap.as_ref()) {
+                    if self.restore_markup_onto(input_nid, Some(&snap)) {
                         any_changed = true;
                     }
                 }
@@ -2904,9 +2937,15 @@ impl LiveSurface {
     /// clamp/snap its current value. Returns `true` when any attribute
     /// (including `value`) changed. Never fires `change` / `Action` — a
     /// clamp is a local value change only, never an edit the host sees.
+    ///
+    /// Issue #101: `limits.max: None` (`InputLimits::at_least`) writes no
+    /// `max` on a number box and clears one from markup (the slice wins),
+    /// so it clamps at `min` only. A range never gets here with no max
+    /// (`apply_limits_to_doc` refuses it, Designer ruling).
     fn write_limits_onto(&mut self, nid: NodeId, limits: &InputLimits) -> bool {
         let min_s = format_numeric(limits.min);
-        let max_s = format_numeric(limits.max);
+        let want_max: Option<String> = limits.max.map(format_numeric);
+        let clamp_max = limits.max;
         let step_s = limits
             .step
             .map(format_numeric)
@@ -2921,7 +2960,7 @@ impl LiveSurface {
         {
             let markup_disagrees = (cur_min.is_some()
                 && cur_min.as_deref() != Some(min_s.as_str()))
-                || (cur_max.is_some() && cur_max.as_deref() != Some(max_s.as_str()))
+                || (cur_max.is_some() && cur_max != want_max)
                 || (cur_step.is_some() && cur_step.as_deref() != Some(step_s.as_str()));
             if markup_disagrees {
                 eprintln!(
@@ -2938,8 +2977,11 @@ impl LiveSurface {
                 mutr.set_attribute(nid, qual_name!("min"), &min_s);
                 changed = true;
             }
-            if cur_max.as_deref() != Some(max_s.as_str()) {
-                mutr.set_attribute(nid, qual_name!("max"), &max_s);
+            if cur_max != want_max {
+                match &want_max {
+                    Some(v) => mutr.set_attribute(nid, qual_name!("max"), v),
+                    None => mutr.clear_attribute(nid, qual_name!("max")),
+                }
                 changed = true;
             }
             if cur_step.as_deref() != Some(step_s.as_str()) {
@@ -2950,7 +2992,7 @@ impl LiveSurface {
 
         let clamp_limits = NumericLimits {
             min: Some(limits.min),
-            max: Some(limits.max),
+            max: clamp_max,
             step: limits.step.unwrap_or(1.0),
             unconstrained: limits.step.is_none(),
         };
@@ -3108,6 +3150,35 @@ impl LiveSurface {
             .collect();
         for id in stale {
             self.rule_disabled.remove(&id);
+        }
+    }
+
+    /// Drop the `limits_markup` snapshot of every `(action, input)` whose
+    /// inputs all sit inside `target_id` (the swap replaces their markup).
+    /// A key with an input outside the swap keeps its snapshot: that input
+    /// still carries the engine's attributes, not markup.
+    fn invalidate_limits_markup_in(&mut self, target_id: NodeId) {
+        if self.limits_markup.is_empty() {
+            return;
+        }
+        let stale: Vec<(String, String)> = self
+            .limits_markup
+            .keys()
+            .filter(|(action, input)| {
+                let inputs: Vec<NodeId> = self
+                    .forms_for_action(action)
+                    .into_iter()
+                    .flat_map(|f| self.range_or_number_inputs_named(f, input))
+                    .collect();
+                !inputs.is_empty()
+                    && inputs
+                        .iter()
+                        .all(|&n| n == target_id || self.is_descendant(target_id, n))
+            })
+            .cloned()
+            .collect();
+        for key in stale {
+            self.limits_markup.remove(&key);
         }
     }
 
@@ -6881,17 +6952,16 @@ fn validate_input_limits(
     input: &str,
     limits: &InputLimits,
 ) -> Result<(), EngineError> {
-    let reason = if !limits.min.is_finite() || !limits.max.is_finite() {
+    // Issue #101: `max: None` (no max) skips the max checks.
+    let lmax = limits.max.unwrap_or(limits.min);
+    let reason = if !limits.min.is_finite() || !lmax.is_finite() {
         Some("min/max must be finite numbers".to_string())
-    } else if limits.min.abs() > MAX_SAFE_NUMBER || limits.max.abs() > MAX_SAFE_NUMBER {
+    } else if limits.min.abs() > MAX_SAFE_NUMBER || lmax.abs() > MAX_SAFE_NUMBER {
         Some(format!(
             "min/max must stay within ±{MAX_SAFE_NUMBER} (±2^53, the safe integer range)"
         ))
-    } else if limits.min > limits.max {
-        Some(format!(
-            "min ({}) must be <= max ({})",
-            limits.min, limits.max
-        ))
+    } else if limits.min > lmax {
+        Some(format!("min ({}) must be <= max ({})", limits.min, lmax))
     } else if let Some(step) = limits.step {
         if !step.is_finite() || step <= 0.0 {
             Some(format!("step ({step}) must be > 0 when present"))
