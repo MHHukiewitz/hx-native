@@ -137,3 +137,49 @@ fn grow_note_screen_equals_full_repaint() {
 fn shrink_note_screen_equals_full_repaint() {
     check(LONG, SHORT)
 }
+
+/// #88: the release resolves the swapped DOM before the paint. That paint's
+/// partial frame (and the host's damage-only texture) must still equal a
+/// full repaint.
+fn check_release_between(from: &'static str, to: &'static str) {
+    let mut h = Host::new(from);
+    let (x, y, w, bh) = h.e.test_element_box("add").unwrap();
+    let at = (x + w / 2.0, y + bh / 2.0);
+    let m = Modifiers::default();
+    h.e.input(InputEvent::PointerDown {
+        x: at.0,
+        y: at.1,
+        button: PointerButton::Primary,
+        mods: m,
+    });
+    h.swap(to);
+    h.e.input(InputEvent::PointerUp {
+        x: at.0,
+        y: at.1,
+        button: PointerButton::Primary,
+        mods: m,
+    });
+    h.e.input(InputEvent::PointerLeave);
+    h.paint();
+    let full = Host::new(to);
+    let truth = full.e.last_frame().unwrap();
+    assert_eq!(
+        diff_rows(h.e.last_frame().unwrap(), truth),
+        None,
+        "{from:?} -> {to:?}: engine frame != full repaint"
+    );
+    assert_eq!(
+        diff_rows(h.screen.as_ref().unwrap(), truth),
+        None,
+        "{from:?} -> {to:?}: damage-only texture != full repaint"
+    );
+}
+
+#[test]
+fn release_between_swap_and_paint_grow_keeps_partial_equal_to_full() {
+    check_release_between(SHORT, LONG)
+}
+#[test]
+fn release_between_swap_and_paint_shrink_keeps_partial_equal_to_full() {
+    check_release_between(LONG, SHORT)
+}
