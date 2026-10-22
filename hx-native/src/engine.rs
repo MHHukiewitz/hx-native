@@ -4214,7 +4214,7 @@ impl LiveSurface {
             .clone()
             .filter(|s| s.node_id == hold.target_nid)
         {
-            let _ = commit_field(&mut self.doc, hold.target_nid, &session.value_at_focus);
+            let _ = commit_field(&mut self.doc, hold.target_nid, &session.value_at_change);
             prepare_focus_display(&mut self.doc, hold.target_nid);
             self.reset_caret_blink();
             let _ = sync_outputs_for(&mut self.doc, &tid);
@@ -4352,7 +4352,9 @@ impl LiveSurface {
         if self.key_hold.as_ref().is_some_and(|k| *k == session.id) {
             self.key_hold = None;
         }
-        let _ = commit_field(&mut self.doc, session.node_id, &session.value_at_focus);
+        // The fallback for text that is no number is the last value sent
+        // (Ruling 5, Mainnet 98ac51a9; issue #90).
+        let _ = commit_field(&mut self.doc, session.node_id, &session.value_at_change);
         self.mark_dom_dirty();
         self.queue_text_field_damage(session.node_id);
         let value_now = self.attr(&session.id, "value").unwrap_or_default();
@@ -4409,7 +4411,7 @@ impl LiveSurface {
         let Some((nid, fallback)) = self
             .text_edit
             .as_ref()
-            .map(|s| (s.node_id, s.value_at_focus.clone()))
+            .map(|s| (s.node_id, s.value_at_change.clone()))
         else {
             return;
         };
