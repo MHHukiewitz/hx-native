@@ -49,6 +49,11 @@ use crate::select_ui::{
 use crate::slider::{
     all_sliders, grab_offset, paint_sliders, slider_geometry, slider_ua_stylesheet, SliderGeom,
 };
+use crate::svg::{
+    check_svg_attribute, classify_url, css_mentions, css_urls, forbidden_element, probe_decode,
+    spawn_svg_warm_up, DataSvg, DataSvgProvider, RasterImage, SvgRejection,
+    DATA_IMAGE_MAX_TOTAL_PIXELS, SVG_MAX_DEPTH, SVG_SHEET_FORBIDDEN_PROPERTIES,
+};
 use crate::text_edit::{
     apply_group_display_all, apply_unfocused_display, backspace, caret_device_rect, commit_field,
     delete_forward, delete_selection, editor_text, filter_number_insert, has_selection,
@@ -188,6 +193,8 @@ struct LiveSurface {
     /// Issue #28: this engine's validated host fonts (shared Blobs), used by
     /// the ellipsis shaper so truncation measures with the same faces.
     fonts: Arc<HostFonts>,
+    /// Issue #23: this document's only resource source (`data:` SVGs).
+    svg_provider: Arc<DataSvgProvider>,
     bindings: HashMap<String, ElementBinding>,
     /// section_id -> subscribed slice names
     sections: HashMap<String, Vec<String>>,
@@ -417,6 +424,9 @@ impl Engine {
         config: EngineConfig,
         fonts: Result<Arc<HostFonts>, EngineError>,
     ) -> Self {
+        // Issue #23: pay the one-time first-SVG system font scan off the
+        // host's thread, once per process.
+        spawn_svg_warm_up();
         let (fonts, font_error) = match fonts {
             Ok(f) => (f, None),
             Err(e) => (Arc::new(HostFonts::default()), Some(e)),
@@ -1414,6 +1424,15 @@ impl Engine {
     /// the default surface so far. Must not grow on an edit that keeps the
     /// same changed/unchanged state (flip-only mutation).
     #[doc(hidden)]
+    /// Test helper (issue #23): `(served, refused)` resource requests on the
+    /// default surface's `data:` SVG provider.
+    pub fn test_data_svg_counts(&self) -> (u64, u64) {
+        self.live(SurfaceId::DEFAULT)
+            .map(|l| (l.svg_provider.served(), l.svg_provider.refused()))
+            .unwrap_or((0, 0))
+    }
+
+    #[doc(hidden)]
     pub fn test_hx_changed_write_count(&self) -> u64 {
         self.live(SurfaceId::DEFAULT)
             .map(|l| l.hx_changed_write_count)
@@ -1550,7 +1569,14 @@ impl LiveSurface {
     ) -> Result<Self, EngineError> {
         let layout_viewport = (size.width, size.height);
         let layout_scale = size.scale;
-        let mut doc = parse_html_document_scaled(html, layout_viewport, layout_scale, fonts);
+        let svg_provider = DataSvgProvider::new();
+        let mut doc = parse_html_document_scaled(
+            html,
+            layout_viewport,
+            layout_scale,
+            fonts,
+            Some(Arc::clone(&svg_provider)),
+        );
 
         // HTML contract §2: strict dialect on loaded HTML, then index bindings.
         let known_ids = collect_element_ids(&doc);
@@ -1559,7 +1585,8 @@ impl LiveSurface {
 
         doc.add_user_agent_stylesheet(select_ua_stylesheet());
         doc.add_user_agent_stylesheet(slider_ua_stylesheet());
-        doc.resolve(0.0);
+        // #23: resolve, plus one more pass when a data: SVG was handed out.
+        let passes = resolve_with_data_images(&mut doc, &svg_provider);
         align_text_inputs(&mut doc);
         let select_nids = collect_select_nids(&doc);
         let applied_control_nids = collect_applied_control_nids(&doc);
@@ -1603,7 +1630,8 @@ impl LiveSurface {
             ellipsis_cache: EllipsisCache::default(),
             ellipsis_shaper: None,
             fonts: Arc::clone(fonts),
-            resolve_count: 1,
+            svg_provider,
+            resolve_count: passes,
             fail_next_paint: false,
             panic_next_paint: false,
             text_edit: None,
@@ -1642,8 +1670,10 @@ impl LiveSurface {
     /// container first needs its gutter (issue #26 round 3).
     fn resolve_doc(&mut self) -> u64 {
         self.prune_gutters();
-        self.doc.resolve(0.0);
-        self.resolve_count = self.resolve_count.saturating_add(1);
+        // #23: a pass that hands out a data: SVG gets one more resolve so
+        // the image is in this frame (counted, not a gutter pass).
+        let image_passes = resolve_with_data_images(&mut self.doc, &self.svg_provider);
+        self.resolve_count = self.resolve_count.saturating_add(image_passes);
         let mut passes = 1;
         // Gutters are sticky and only ever added, so this terminates; a
         // gutter that makes a nested container overflow (narrower content)
@@ -1662,7 +1692,7 @@ impl LiveSurface {
         self.settle_scroll_offsets();
         // Issue #35: single-line typed fields with text-align right/center.
         align_text_inputs(&mut self.doc);
-        passes
+        passes + image_passes - 1
     }
 
     /// Scroll containers with an id that need a gutter but have none yet.
@@ -1889,6 +1919,7 @@ impl LiveSurface {
     ) -> Result<(), EngineError> {
         // Validation-only parse (ids / dialect); never laid out or painted,
         // so it does not need the host fonts.
+        // No resource provider: validation never fetches or decodes images.
         let frag_doc = parse_html_document(html, self.layout_viewport, &HostFonts::default());
         let mut known_ids = collect_element_ids(&self.doc);
         for id in ids_removed_by_swap(&self.doc, target_nid, swap) {
@@ -5513,6 +5544,9 @@ fn validate_loaded_tree(
 ) -> Result<(), EngineError> {
     let root = doc.root_node().id;
     let mut stack = vec![root];
+    // #23: SVG `<image>` payloads that passed the static checks, decoded
+    // once at the end (one throwaway document for the whole tree).
+    let mut images: Vec<(String, RasterImage)> = Vec::new();
     while let Some(nid) = stack.pop() {
         let Some(node) = doc.get_node(nid) else {
             continue;
@@ -5529,6 +5563,7 @@ fn validate_loaded_tree(
             .map(|el| el.name.local.to_string())
             .unwrap_or_default();
         validate_loaded_attrs(&id_attr, &attrs, known_ids, Some(&tag))?;
+        validate_svg_content(doc, node, &id_attr, &tag, &attrs, &mut images)?;
         let input_ty = attrs
             .iter()
             .find(|(k, _)| k == "type")
@@ -5545,6 +5580,33 @@ fn validate_loaded_tree(
                 }
             }
         }
+    }
+    // #23 (Graph's #52 HOLD): anyrender_svg decodes every `<image>`
+    // reference on every paint, so the whole load or swap gets one budget,
+    // counting each reference (also repeated bytes).
+    let mut total: u64 = 0;
+    for (label, img) in &images {
+        total += img.pixels;
+        if total > DATA_IMAGE_MAX_TOTAL_PIXELS {
+            return Err(EngineError::InvalidSvg {
+                id: label.clone(),
+                rejection: SvgRejection::ImagePixelBudget {
+                    pixels: images.iter().map(|(_, i)| i.pixels).sum(),
+                    limit: DATA_IMAGE_MAX_TOTAL_PIXELS,
+                },
+            });
+        }
+    }
+    let mut probed: Vec<&RasterImage> = Vec::new();
+    for (label, img) in &images {
+        if probed.iter().any(|p| p.data == img.data) {
+            continue;
+        }
+        probed.push(img);
+        probe_decode(std::slice::from_ref(img)).map_err(|rejection| EngineError::InvalidSvg {
+            id: label.clone(),
+            rejection,
+        })?;
     }
     Ok(())
 }
@@ -5603,17 +5665,38 @@ fn index_bindings(
     Ok((bindings, sections))
 }
 
+/// Validation-only parse: no resource provider at all.
 fn parse_html_document(html: &str, layout_viewport: (u32, u32), fonts: &HostFonts) -> HtmlDocument {
-    parse_html_document_scaled(html, layout_viewport, 1.0, fonts)
+    parse_html_document_scaled(html, layout_viewport, 1.0, fonts, None)
 }
 
-/// `net_provider: None`: CSS `@font-face` (and every other resource) is
-/// never fetched (issue #28); host fonts come only from `EngineConfig::fonts`.
+/// Resolve, and when the pass handed out a `data:` SVG (issue #23) resolve
+/// once more so Blitz takes the loaded image in before this paint. Blitz
+/// only ingests a load at the start of the next `resolve`, and its
+/// per-document image cache means the extra pass happens only on a URL's
+/// first use in a document. Returns the passes run (1 or 2).
+fn resolve_with_data_images(doc: &mut HtmlDocument, provider: &DataSvgProvider) -> u64 {
+    let before = provider.served();
+    doc.resolve(0.0);
+    if provider.served() != before {
+        doc.resolve(0.0);
+        2
+    } else {
+        1
+    }
+}
+
+/// The only resource provider is [`DataSvgProvider`] (issue #23): it answers
+/// `data:image/svg+xml` URLs that pass the SVG gate and drops everything
+/// else, so CSS `@font-face` is never served (issue #28) and host fonts come
+/// only from `EngineConfig::fonts`. `None` (validation parses) fetches
+/// nothing at all.
 fn parse_html_document_scaled(
     html: &str,
     layout_viewport: (u32, u32),
     scale: f64,
     fonts: &HostFonts,
+    svg_provider: Option<Arc<DataSvgProvider>>,
 ) -> HtmlDocument {
     let font_ctx = bundled_font_context(fonts);
     let (w, h) = layout_viewport;
@@ -5625,7 +5708,7 @@ fn parse_html_document_scaled(
             font_ctx: Some(font_ctx),
             style_threading: StyleThreading::Sequential,
             incremental: Some(true),
-            net_provider: None,
+            net_provider: svg_provider.map(|p| p as Arc<dyn blitz_traits::net::NetProvider>),
             ..Default::default()
         },
     )
@@ -5741,6 +5824,135 @@ fn node_attr(doc: &HtmlDocument, nid: NodeId, name: &str) -> Option<String> {
 /// Stable `id` attribute of node `nid`, if any (non-empty).
 fn node_id_attr(doc: &HtmlDocument, nid: NodeId) -> Option<String> {
     node_attr(doc, nid, "id").filter(|s| !s.is_empty())
+}
+
+/// Elements from `node` up to and including its outermost SVG-namespace
+/// ancestor (`node` itself counts), or `None` when `node` is not inside an
+/// inline `<svg>`. Walks parents without recursion.
+fn inline_svg_depth(doc: &HtmlDocument, node: &blitz_dom::Node) -> Option<usize> {
+    let mut depth = 0;
+    let mut svg_depth = None;
+    let mut cur = Some(node);
+    while let Some(n) = cur {
+        if let Some(el) = n.element_data() {
+            depth += 1;
+            if el.name.ns == ns!(svg) {
+                svg_depth = Some(depth);
+            }
+        }
+        cur = n.parent.and_then(|p| doc.get_node(p));
+    }
+    svg_depth
+}
+
+/// `node` is a `<clipPath>` (any prefix or case) or inside one. Walks
+/// parents without recursion.
+fn inside_clip_path(doc: &HtmlDocument, node: &blitz_dom::Node) -> bool {
+    let mut cur = Some(node);
+    while let Some(n) = cur {
+        if let Some(el) = n.element_data() {
+            let name = &*el.name.local;
+            if name
+                .rsplit(':')
+                .next()
+                .unwrap_or(name)
+                .eq_ignore_ascii_case("clipPath")
+            {
+                return true;
+            }
+        }
+        cur = n.parent.and_then(|p| doc.get_node(p));
+    }
+    false
+}
+
+/// Issue #23 SVG gate on one element of loaded HTML or a swap fragment.
+/// Inside an inline `<svg>` (any element, in any namespace, under any
+/// prefix, because Blitz serialises the subtree by local name for usvg):
+/// a name in [`FORBIDDEN_SVG_ELEMENTS`](crate::FORBIDDEN_SVG_ELEMENTS),
+/// nesting past [`SVG_MAX_DEPTH`], a forbidden property, or a non-`data:`
+/// href rejects the load or swap; an `<image>` href must pass the raster
+/// rules. Anywhere: a `data:image/svg+xml` URL (in `<style>` text, a
+/// `style` attribute, or a `src` / `href`) that fails the gate rejects it.
+fn validate_svg_content(
+    doc: &HtmlDocument,
+    node: &blitz_dom::Node,
+    id_attr: &str,
+    tag: &str,
+    attrs: &[(String, String)],
+    images: &mut Vec<(String, RasterImage)>,
+) -> Result<(), EngineError> {
+    let label = || {
+        if id_attr.is_empty() {
+            format!("<{tag}>")
+        } else {
+            id_attr.to_string()
+        }
+    };
+    let reject = |rejection: SvgRejection| EngineError::InvalidSvg {
+        id: label(),
+        rejection,
+    };
+    if let Some(depth) = inline_svg_depth(doc, node) {
+        if depth > SVG_MAX_DEPTH {
+            return Err(reject(SvgRejection::TooDeep {
+                depth,
+                limit: SVG_MAX_DEPTH,
+            }));
+        }
+        if let Some(element) = forbidden_element(tag) {
+            return Err(reject(SvgRejection::ForbiddenElement {
+                element: element.to_string(),
+            }));
+        }
+        // #23 (Mike, 2026-10-21): `<image>` only with a data: href of an
+        // allowed raster type; every other href must be data: too. `href`,
+        // `xlink:href` and prefixed spellings share the local name; all are
+        // checked when several are present.
+        let in_clip_path = inside_clip_path(doc, node);
+        for (name, value) in attrs {
+            if let Some(img) =
+                check_svg_attribute(tag, name, value, in_clip_path).map_err(reject)?
+            {
+                images.push((label(), img));
+            }
+        }
+        // usvg takes every element whose local name is `style` as a sheet
+        // (roxmltree `has_tag_name("style")` ignores the namespace), so
+        // `<svg:style>` and `<x:style>` are sheets too (Graph, #52 round 4).
+        let tag_local = tag.rsplit(':').next().unwrap_or(tag);
+        if tag_local.eq_ignore_ascii_case("style") {
+            if let Some(p) = css_mentions(&node.text_content(), SVG_SHEET_FORBIDDEN_PROPERTIES) {
+                return Err(reject(SvgRejection::ForbiddenProperty {
+                    property: p.to_string(),
+                }));
+            }
+        }
+    }
+    let mut urls = Vec::new();
+    for (name, value) in attrs {
+        match name.as_str() {
+            "style" => urls.extend(css_urls(value)),
+            "src" | "href" => urls.push(value.clone()),
+            _ => {}
+        }
+    }
+    if tag == "style" {
+        urls.extend(css_urls(&node.text_content()));
+    }
+    for url in urls {
+        match classify_url(&url) {
+            DataSvg::Rejected(rejection) => {
+                return Err(EngineError::InvalidSvg {
+                    id: label(),
+                    rejection,
+                })
+            }
+            DataSvg::Ok(_, nested) => images.extend(nested.into_iter().map(|i| (label(), i))),
+            DataSvg::NotSvg => {}
+        }
+    }
+    Ok(())
 }
 
 fn element_id_and_attrs(node: &blitz_dom::Node) -> (String, Vec<(String, String)>) {

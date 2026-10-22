@@ -405,8 +405,17 @@ pub(crate) fn snapshot_bounds(doc: &HtmlDocument, scale: f64) -> BoundsSnapshot 
         let Some(node) = doc.get_node(nid) else {
             continue;
         };
-        for &c in &node.children {
-            stack.push(c);
+        // #23: an inline `<svg>` is one replaced box; its SVG children have no
+        // layout (Blitz reports them at the origin with zero size), so they
+        // must not be snapshotted or every swap would damage the top-left
+        // corner. The `<svg>` box covers their ink.
+        let is_svg = node
+            .element_data()
+            .is_some_and(|el| el.name.ns == blitz_dom::ns!(svg));
+        if !is_svg {
+            for &c in &node.children {
+                stack.push(c);
+            }
         }
         if !node.is_element() {
             continue;
