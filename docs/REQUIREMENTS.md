@@ -411,6 +411,13 @@ The engine reads exactly these custom properties, as computed on the control (st
 
 The select's field border, background and text are a UA sheet using `var(--hx-bevel-sh / -hi, …)`, `var(--hx-select-bg, …)` and `var(--hx-select-ink, …)`, so ordinary author CSS on `select` still overrides them. Shapes CSS cannot express stay engine geometry: the two-band bevel structure, the arrow triangles, the 16 px scrollbar / select-button strip and the 18 px open-list row. Title-bar tokens are not read; the engine draws no title bar.
 
+## Text shadow (issue #57)
+
+1. **Zero-blur `text-shadow` is engine-drawn.** Blitz 0.3.0-beta.4 computes `text-shadow` but never paints it. The engine draws each zero-blur shadow of a glyph run right before the run, offset in the element's local space and filled with the shadow's computed colour (`currentcolor` resolves to the run's `color`), last shadow first so the first one in CSS order ends up on top. This covers text in anonymous blocks and in `::before` / `::after`. It is author CSS, not engine chrome: no `--hx-*` variable is involved.
+2. **Partial repaint equals full repaint.** Damage grows each element's ink by the shadow offsets (and 1.5× blur) of the runs it lays out. Restyling an inline element (an `<a>` in a `<p>`, which has no box of its own) damages the block that lays out its text, before and after, so greying that adds, removes or recolours a shadow repaints like a full paint (#60 review).
+3. **No cost without shadows.** A document without any non-empty computed `text-shadow` skips the shadow table and the damage-pad walk (one style read per node).
+4. **Not drawn (documented limits):** shadows with a non-zero blur radius (the whole shadow is skipped; the others on the run still paint); **underlines and other text decorations** (Blitz paints them as fills, not glyph runs); **list markers**; text inside `<input>` / `<textarea>` editors (not an inline layout). A run whose painted origin does not match the recorded one within half a device pixel paints without a shadow (fail safe). Pin-sensitive: see `BLITZ_PIN.md`.
+
 ## Range / number limits from the `actions` slice (issue #16)
 
 **Locked (Designer + Game + UI, 2026-10-19; Mike's Floor lock covers #14/#15/#16). Relaxed by Mike 2026-10-21 (#35 round 2):** markup may carry `min`, `max` and `step` on `<input type=range|number>` (mock 34b does); Game's `actions` slice (`actions.<action>.limits.<input name>`) stays the source of truth and wins over markup wherever both are present.

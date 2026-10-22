@@ -32,6 +32,32 @@ must update `local_transform_device` in `hx-native/src/damage.rs`.
 Public helpers: `element_border_box_css`, `element_border_box_device`
 (also used by form range geometry and, after #18 rebases, select control rects).
 
+## Engine-drawn `text-shadow` (issue #57, pin-sensitive)
+
+Blitz 0.3.0-beta.4 computes `text-shadow` but never paints it.
+`hx-native/src/text_shadow.rs` draws zero-blur shadows in the `PaintScene`
+wrapper (`ShadowScene`) right before the glyph run they belong to. It depends
+on these beta.4 internals; a Blitz bump must re-check each one, and drop the
+module once Blitz paints `text-shadow` itself:
+
+| Assumption | Where in Blitz beta.4 |
+|-----|------|
+| `draw_glyphs` gets the run's `FontData`, `font_size` and parley's positioned glyph `x`/`y` unchanged (the run key) | `blitz-paint/src/text.rs` `stroke_text` |
+| Inline-root transform = `parent * translate(location) * node.transform()`, then the node's own scroll offset applied **twice** (`cx.transform.then_translate(-scroll)` and `content_position - scroll`), then `translate(padding + border + block_offset)` | `blitz-paint/src/render.rs` `render_element`, `draw_inline_layout` |
+| Each run's brush is `TextBrush { id }` of the run's own node (its computed `text-shadow` and `color`) | `blitz-dom/src/node/text.rs` |
+| Anonymous blocks (mixed inline and block children) and `::before` / `::after` boxes are not in the DOM `children` list; they are found through `Node::anonymous_blocks`, `before()` and `after()` | `blitz-dom/src/layout/construct.rs` `create_anonymous_block`, `node.rs` |
+| Text inside `<input>` / `<textarea>` editors is not an inline layout, so it gets no shadow | `render.rs` `draw_text_input_text` |
+
+A run whose origin does not match within 0.5 device px paints without a
+shadow (fail safe). Shadows with a blur radius are skipped. Damage
+(`damage.rs` `ink_box_device`) grows each element's ink by the offsets (and
+1.5× blur) of the shadows on the runs it lays out.
+
+Known, unrelated to #57: in `PaintMode::Shifted`, synthetic italic (the run's
+skew `glyph_transform`) repaints differently from a full paint (172 px on a
+20 px "Hi"), most likely because `CullScene` shifts `glyph_transform` as
+well as `transform`. Exact is unaffected. Not fixed here.
+
 ## Tiled gradient fills (pin-sensitive, #67)
 
 `hx-native/src/tile_coalesce.rs` (`TileScene`, wrapped around every

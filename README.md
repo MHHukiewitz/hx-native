@@ -84,6 +84,12 @@ Map them from your own design tokens. Mainnet's Win95 look, for example:
 
 Everything else (text fields, buttons, checkboxes, borders, shadows, `text-align`) is plain CSS painted by Blitz; the engine only corrects two Blitz beta.4 bugs on single-line inputs so your computed CSS shows (`text-align` and the order of multiple inset `box-shadow`s). See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md), "Range slider and number fields (issue #35)".
 
+## Text shadow (issue #57)
+
+Blitz 0.3.0-beta.4 computes `text-shadow` but does not paint it, so the engine draws zero-blur text shadows itself: author CSS, CSS order (first on top), `currentcolor`, alpha, scale and partial repaint included.
+
+Not drawn: shadows with a blur radius (skipped; the others on the same text still paint), **underlines and other text decorations**, **list markers**, and the text inside `<input>` / `<textarea>`. See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md), "Text shadow (issue #57)".
+
 ## License
 
 Licensed under either of

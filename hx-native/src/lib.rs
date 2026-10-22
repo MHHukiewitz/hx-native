@@ -25,6 +25,7 @@ mod select_ui;
 mod slider;
 mod stylo_text_style;
 mod text_edit;
+mod text_shadow;
 mod tile_coalesce;
 mod trigger;
 mod types;
@@ -43,6 +44,8 @@ pub use memory::{
     DOCUMENT_ESTIMATE_BASE_BYTES, DOCUMENT_ESTIMATE_PER_HTML_BYTE, RGBA_BYTES_PER_PIXEL,
 };
 pub use pending::PendingTimeout;
+#[doc(hidden)]
+pub use text_shadow::{take_text_shadow_counters_for_test, TextShadowCounters};
 #[doc(hidden)]
 pub use tile_coalesce::{
     clear_tile_cache_for_test, set_tile_coalesce_for_test, take_tile_coalesce_counters_for_test,
