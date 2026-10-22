@@ -19,8 +19,10 @@ pub struct EngineConfig {
     /// [`DEFAULT_HIDDEN_SURFACE_BUDGET_BYTES`].
     pub hidden_surface_budget_bytes: u64,
     /// Host-supplied font faces (issue #28). Empty by default, which keeps
-    /// the bundled-DejaVu-only behaviour. Faces are registered in this
-    /// order, after bundled DejaVu Sans, under the family / weight / style
+    /// the bundled-DejaVu-only behaviour. Pass both the regular and the bold
+    /// face of a family: Blitz paints no synthetic bold (issue #56). Faces
+    /// are registered in this order, after bundled DejaVu Sans 400 and 700,
+    /// under the family / weight / style
     /// given here (not the names inside the font file). DejaVu stays the
     /// generic (`sans-serif`, `serif`, `monospace`, `system-ui`) and
     /// unknown-family fallback. CSS `@font-face` rules stay ignored: the
