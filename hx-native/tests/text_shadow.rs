@@ -289,7 +289,7 @@ impl FragmentSource for Frags {
 
 const SWAP_PAGE: &str = "<!DOCTYPE html><html><head><style>html,body{margin:0;background:#fff;color:#000}\
     body{font-family:\"DejaVu Sans\";font-size:20px}#sec{position:absolute;left:20px;top:20px}\
-    .s{text-shadow:7px 6px #f00}.n{text-shadow:-6px -7px #00f}.far{text-shadow:24px 18px #f00}</style></head><body>\
+    .s{text-shadow:7px 6px #f00}.n{text-shadow:-6px -7px #00f}.far{text-shadow:24px 18px #f00}.up{text-shadow:2px -18px #f00}</style></head><body>\
     <section id=\"sec\" hx-trigger=\"slice:t\" hx-target=\"#sec\" hx-swap=\"innerHTML\"><b>Hi</b></section></body></html>";
 
 fn swap(mode: PaintMode, scale: f64, before: &str, after: &str) -> (RgbaImage, RgbaImage) {
@@ -338,6 +338,9 @@ fn swap_partial_equals_full() {
         ("<b>Hi</b>", "<b class=s>Hi</b>"),
         ("<b class=s>Hi</b>", "<b class=n>Hi</b>"),
         ("<b class=n>Hi</b>", "<span>Hi</span>"),
+        // Far enough up to leave the line box's leading (top pad).
+        ("<b class=up>Hi</b>", "<b>Hi</b>"),
+        ("<b>Hi</b>", "<b class=up>Hi</b>"),
     ];
     for mode in [PaintMode::Exact, PaintMode::Shifted] {
         for scale in [1.0, 2.0] {
