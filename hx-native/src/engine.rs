@@ -2422,8 +2422,27 @@ impl LiveSurface {
             );
             return;
         }
-        self.form_baselines
-            .insert(form_id.to_string(), self.capture_form_current(form_id));
+        let mut baseline = self.capture_form_current(form_id);
+        // Issue #94 (Mainnet 5983ff17): a control with an unanswered commit
+        // keeps the game's last value as its baseline, never the put-back,
+        // so the form reads as changed until the game answers.
+        if !self.catch_up.is_empty() {
+            for (i, (nid, ..)) in capture_form_controls(&self.doc, form_id)
+                .into_iter()
+                .enumerate()
+            {
+                if let Some(e) = self
+                    .catch_up
+                    .iter()
+                    .find(|e| self.doc.get_element_by_id(&e.control_id) == Some(nid))
+                {
+                    if let Some(slot) = baseline.get_mut(i) {
+                        slot.1 = e.game.clone().unwrap_or_else(|| e.sent.clone());
+                    }
+                }
+            }
+        }
+        self.form_baselines.insert(form_id.to_string(), baseline);
     }
 
     /// `true` (clean, so the action greys) when `form_id`'s live values equal
@@ -3944,6 +3963,9 @@ impl LiveSurface {
     }
 
     fn reconcile_text_edit(&mut self) {
+        // Issue #94: greying (markup, actions slice or a rule) drops a held
+        // change before the box being edited is reconciled.
+        self.drop_greyed_catch_up();
         let Some(session) = self.text_edit.clone() else {
             return;
         };
@@ -4233,6 +4255,7 @@ impl LiveSurface {
                 source_id: source_id.to_string(),
                 sent,
                 committed,
+                game: None,
                 held: true,
             });
         }
@@ -4331,14 +4354,9 @@ impl LiveSurface {
             self.catch_up.retain(|e| e.source_id != source_id);
             return;
         };
-        if let Some(reason) = self.disabled_actions.get(&action_name).cloned() {
-            self.catch_up.retain(|e| e.source_id != source_id);
-            self.released_outcomes.push(InputOutcome::Blocked {
-                name: action_name,
-                reason,
-                source_id: source_id.to_string(),
-                trigger: TriggerInfo::Change,
-            });
+        if self.disabled_actions.contains_key(&action_name) {
+            // Issue #94: a greyed control drops its held change.
+            self.drop_greyed_catch_up();
             return;
         }
         let mut args = self.action_args_for(source_id);
@@ -4392,31 +4410,99 @@ impl LiveSurface {
             let Some(now) = control_current_value(&self.doc, node) else {
                 continue;
             };
+            let mut e = e;
+            e.game = Some(now.clone());
             if now != e.committed {
-                match value_control_kind(node) {
-                    "select" => {
-                        if let Some(i) = select_options(&self.doc, nid)
-                            .iter()
-                            .position(|o| o.value == e.committed)
-                        {
-                            select_set_index(&mut self.doc, nid, i);
-                        }
-                    }
-                    "checkbox" => {
-                        toggle_checkbox(&mut self.doc, nid);
-                    }
-                    "radio" => {
-                        if e.committed == "true" {
-                            let _ = select_radio(&mut self.doc, nid);
-                        }
-                    }
-                    _ => {
-                        let _ = write_value_attr(&mut self.doc, nid, &e.committed);
-                    }
-                }
-                let _ = sync_outputs_for(&mut self.doc, &e.control_id);
+                self.put_control_value(nid, &e.control_id, &e.committed);
             }
             kept.push(e);
+        }
+        self.catch_up = kept;
+    }
+
+    /// Issue #89: write `value` (in `control_current_value`'s encoding) into
+    /// control `nid` (`id`): the selected option, the tick, the checked
+    /// radio, or the `value` attribute.
+    fn put_control_value(&mut self, nid: NodeId, id: &str, value: &str) {
+        let Some(node) = self.doc.get_node(nid) else {
+            return;
+        };
+        match value_control_kind(node) {
+            "select" => {
+                if let Some(i) = select_options(&self.doc, nid)
+                    .iter()
+                    .position(|o| o.value == value)
+                {
+                    select_set_index(&mut self.doc, nid, i);
+                }
+            }
+            "checkbox" => {
+                let checked = control_current_value(&self.doc, node).as_deref() == Some("true");
+                if checked != (value == "true") {
+                    // A greyed box refuses the toggle; write the state.
+                    if !toggle_checkbox(&mut self.doc, nid) {
+                        self.doc.snapshot_node_state_only(nid);
+                        if let Some(el) = self
+                            .doc
+                            .get_node_mut(nid)
+                            .and_then(|n| n.element_data_mut())
+                        {
+                            blitz_dom::BaseDocument::toggle_checkbox(el);
+                        }
+                    }
+                }
+            }
+            "radio" => {
+                if value == "true" {
+                    let _ = select_radio(&mut self.doc, nid);
+                }
+            }
+            _ => {
+                let _ = write_value_attr(&mut self.doc, nid, value);
+            }
+        }
+        let _ = sync_outputs_for(&mut self.doc, id);
+        self.mark_dom_dirty();
+    }
+
+    /// Issue #94 (Designer, HTML_CONTRACT `hx-sync`, Mainnet master
+    /// 5983ff17): when the game greys a control (its markup, an `actions`
+    /// state or an input rule) while it holds a change, the held change is
+    /// dropped, as Ruling 6 drops typed text, and the control shows the
+    /// game's value: the value a redraw drew, else the last value sent.
+    fn drop_greyed_catch_up(&mut self) {
+        if self.catch_up.is_empty() {
+            return;
+        }
+        let entries = std::mem::take(&mut self.catch_up);
+        let mut kept = Vec::with_capacity(entries.len());
+        for e in entries {
+            let Some(nid) = self.doc.get_element_by_id(&e.control_id) else {
+                continue;
+            };
+            let action_greyed = self
+                .bindings
+                .get(&e.source_id)
+                .and_then(|b| b.hx_post.as_ref())
+                .is_some_and(|a| self.disabled_actions.contains_key(a));
+            if !(action_greyed || control_is_disabled(&self.doc, nid)) {
+                kept.push(e);
+                continue;
+            }
+            let game = e.game.clone().unwrap_or_else(|| e.sent.clone());
+            let shown = self
+                .doc
+                .get_node(nid)
+                .and_then(|n| control_current_value(&self.doc, n));
+            if shown.as_deref() != Some(game.as_str()) {
+                self.put_control_value(nid, &e.control_id, &game);
+                if self.text_edit.as_ref().is_some_and(|s| s.node_id == nid) {
+                    set_editor_text(&mut self.doc, nid, &game);
+                }
+                apply_unfocused_display(&mut self.doc, nid);
+                self.queue_text_field_damage(nid);
+                self.mark_paint_dirty();
+            }
         }
         self.catch_up = kept;
     }

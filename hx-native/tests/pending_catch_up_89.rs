@@ -22,20 +22,29 @@ font:12px \"DejaVu Sans\"}input,select{display:block;width:200px;height:22px;mar
 font-style:normal;font-size:8px}#up{top:4px}#dn{top:15px}</style>";
 
 /// The game's side: what each section renders, and a version to bump.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Game {
     fee: String,
     version: u64,
     sync_attr: &'static str,
+    /// The game greys the fee in its markup (#94).
+    disabled: bool,
+    /// The `actions` slice and its version (#94).
+    actions: Vec<(String, ActionState)>,
+    actions_version: u64,
 }
 
-struct Slices(u64);
+struct Slices(Game);
 impl SliceSource for Slices {
     fn version(&self, name: &str) -> Option<u64> {
-        (name == "deal").then_some(self.0)
+        match name {
+            "deal" => Some(self.0.version),
+            "actions" => Some(self.0.actions_version),
+            _ => None,
+        }
     }
     fn action_states(&self) -> Vec<(String, ActionState)> {
-        Vec::new()
+        self.0.actions.clone()
     }
 }
 
@@ -43,16 +52,20 @@ struct Frags(Rc<RefCell<Game>>);
 impl FragmentSource for Frags {
     fn render(&mut self, _s: &str, _slices: &[&str]) -> String {
         let g = self.0.borrow();
-        fee_html(&g.fee, g.sync_attr)
+        let grey = if g.disabled { " disabled" } else { "" };
+        fee_html(&g.fee, &format!("{}{grey}", g.sync_attr))
     }
 }
 
-fn fee_html(value: &str, sync_attr: &str) -> String {
+/// The deal form the game draws: the fee box with its arrows, and an
+/// Apply button (#94's `RequiresChange` baseline).
+fn fee_html(value: &str, extra_attrs: &str) -> String {
     format!(
-        "<span id=\"spin\"><input id=\"fee\" type=\"number\" name=\"fee\" value=\"{value}\" min=\"0\" \
-         max=\"100.00\" step=\"0.01\" hx-post=\"deal.fee\" hx-trigger=\"change\"{sync_attr} />\
+        "<form id=\"df\"><span id=\"spin\"><input id=\"fee\" type=\"number\" name=\"fee\" value=\"{value}\" min=\"0\" \
+         max=\"100.00\" step=\"0.01\" hx-post=\"deal.fee\" hx-trigger=\"change\"{extra_attrs} />\
          <i id=\"up\" data-hx-step=\"up\" data-hx-step-for=\"fee\">U</i>\
-         <i id=\"dn\" data-hx-step=\"down\" data-hx-step-for=\"fee\">D</i></span>"
+         <i id=\"dn\" data-hx-step=\"down\" data-hx-step-for=\"fee\">D</i></span>\
+         <button id=\"apply\" hx-post=\"deal.apply\">Apply</button></form>"
     )
 }
 
@@ -68,17 +81,19 @@ fn deal_with(sync_attr: &'static str, timeout_frames: u32) -> Deal {
         fee: "4.69".into(),
         version: 1,
         sync_attr,
+        actions_version: 1,
+        ..Default::default()
     }));
     let mut e = Engine::new(EngineConfig {
         paint_mode: PaintMode::Exact,
         pending_timeout_frames: timeout_frames,
         ..Default::default()
     });
-    e.declare_actions(&["deal.fee"]);
+    e.declare_actions(&["deal.fee", "deal.apply"]);
     e.load_html(&format!(
-        "<!DOCTYPE html><html><head>{STYLE}</head><body><form id=\"f\">\
+        "<!DOCTYPE html><html><head>{STYLE}</head><body>\
          <section id=\"deal\" hx-trigger=\"slice:deal\" hx-target=\"#deal\" hx-swap=\"innerHTML\">{}</section>\
-         <input id=\"b\" type=\"text\" name=\"b\" value=\"x\" /></form></body></html>",
+         <input id=\"b\" type=\"text\" name=\"b\" value=\"x\" /></body></html>",
         fee_html("4.69", sync_attr)
     ))
     .unwrap();
@@ -95,12 +110,27 @@ fn deal() -> Deal {
 impl Deal {
     /// The game redraws the deal section with its own fee.
     fn redraw(&mut self) {
-        let v = self.game.borrow().version;
-        self.e
-            .sync(&Slices(v), &mut Frags(self.game.clone()))
-            .unwrap();
+        self.sync_only();
         self.game.borrow_mut().version += 1;
+    }
+
+    /// Sync without redrawing the deal section (e.g. a new `actions` slice).
+    fn sync_only(&mut self) {
+        let g = self.game.borrow().clone();
+        self.e
+            .sync(&Slices(g), &mut Frags(self.game.clone()))
+            .unwrap();
         let _ = self.e.paint(vp()).unwrap();
+    }
+
+    /// The game publishes `actions` (greying) without a redraw.
+    fn set_actions(&mut self, actions: Vec<(String, ActionState)>) {
+        {
+            let mut g = self.game.borrow_mut();
+            g.actions = actions;
+            g.actions_version += 1;
+        }
+        self.sync_only();
     }
 
     /// The game answers `fee` with `answer` (its own value, e.g. a clamp)
@@ -513,4 +543,142 @@ fn a_select_and_a_range_catch_up() {
     let caught = finish(&mut e, &o1);
     assert_eq!(changes_of(&caught, "vol"), ["8"], "range");
     assert!(finish(&mut e, &caught).is_empty());
+}
+
+/// #94 (Designer, Mainnet 5983ff17): the game greys the fee while 4.71 is
+/// held: the held change is dropped (no catch-up) and the box shows the
+/// game's value, by the `actions` slice (the last value sent, 4.7) or by a
+/// greyed redraw (the value it draws, 4.65).
+#[test]
+fn greyed_while_held_drops_the_held_change() {
+    let mut d = deal();
+    let o1 = d.click("up"); // 4.7 sent
+    d.click("up"); // 4.71 held
+    d.set_actions(vec![(
+        "deal.fee".into(),
+        ActionState::Disabled {
+            reason: "Locked".into(),
+        },
+    )]);
+    assert_eq!(d.fee(), "4.7", "the game's value: the last value sent");
+    let after = d.complete(&o1, true);
+    assert!(changes(&after).is_empty(), "no catch-up: {after:?}");
+    assert!(after.is_empty(), "nothing at all: {after:?}");
+
+    let mut d = deal();
+    let o1 = d.click("up");
+    d.click("up");
+    d.game.borrow_mut().disabled = true;
+    d.answer_redraw("4.65");
+    assert_eq!(d.fee(), "4.65", "the greyed redraw's value");
+    let after = d.complete(&o1, true);
+    assert!(after.is_empty(), "{after:?}");
+    d.game.borrow_mut().disabled = false;
+    d.redraw();
+    assert_eq!(d.fee(), "4.65");
+    assert!(d.e.take_outcomes().is_empty());
+}
+
+/// #94: the unapplied-change baseline stays at the game's last value while a
+/// change is held: a redraw that answers 4.7 while 4.71 is held puts 4.71
+/// back, and the form still reads as changed (Apply ungreyed) until the
+/// game answers 4.71. (The game publishes its `actions` slice with each
+/// redraw, which is when the redrawn form's baseline is taken.)
+#[test]
+fn the_baseline_stays_at_the_games_value_while_a_change_is_held() {
+    let mut d = deal();
+    let apply = vec![(
+        "deal.apply".to_string(),
+        ActionState::RequiresChange {
+            form: "df".into(),
+            reason: "Nothing to apply".into(),
+        },
+    )];
+    d.set_actions(apply.clone());
+    assert!(d.e.attr("apply", "disabled").is_some(), "clean at load");
+    let o1 = d.click("up"); // 4.7 sent
+    d.answer_redraw("4.7"); // the game draws 4.7 while it is still pending
+    d.set_actions(apply.clone());
+    assert!(d.e.attr("apply", "disabled").is_some(), "the game drew 4.7");
+    d.click("up"); // 4.71 held
+    assert!(d.e.attr("apply", "disabled").is_none(), "4.71 is a change");
+    d.answer_redraw("4.7"); // an older redraw: 4.71 is put back
+    d.set_actions(apply.clone());
+    assert_eq!(d.fee(), "4.71");
+    assert!(
+        d.e.attr("apply", "disabled").is_none(),
+        "the put-back is not the baseline: the form still reads as changed"
+    );
+    let caught = d.complete(&o1, true);
+    assert_eq!(changes(&caught), ["4.71"]);
+    d.answer_redraw("4.7"); // still the older answer: 4.71 is unanswered
+    d.set_actions(apply.clone());
+    assert!(
+        d.e.attr("apply", "disabled").is_none(),
+        "until the game answers"
+    );
+    d.complete(&caught, true);
+    d.answer_redraw("4.71"); // the game's answer
+    d.set_actions(apply);
+    assert!(
+        d.e.attr("apply", "disabled").is_some(),
+        "answered: clean again"
+    );
+}
+
+/// A checkbox catches up too: ticked (sent), unticked while that is
+/// pending (held), and the catch-up posts the form without the box. Ticked
+/// back before the answer, it needs no catch-up.
+#[test]
+fn a_checkbox_catches_up() {
+    let page = "<!DOCTYPE html><html><head></head><body>\
+         <input id=\"tick\" type=\"checkbox\" name=\"tick\" value=\"yes\" hx-post=\"deal.tick\" hx-trigger=\"change\" style=\"display:block;width:20px;height:20px\" />\
+         </body></html>";
+    let ticks = |outs: &[InputOutcome]| -> Vec<Option<String>> {
+        outs.iter()
+            .filter_map(|o| match o {
+                InputOutcome::Action {
+                    trigger: TriggerInfo::Change,
+                    args,
+                    ..
+                } => Some(
+                    args.iter()
+                        .find(|(k, _)| k == "tick")
+                        .map(|(_, v)| v.clone()),
+                ),
+                _ => None,
+            })
+            .collect()
+    };
+    for clicks in [2, 3] {
+        let mut e = Engine::new(EngineConfig::default());
+        e.declare_actions(&["deal.tick"]);
+        e.load_html(page).unwrap();
+        let _ = e.paint(vp()).unwrap();
+        let b = e.test_element_box("tick").unwrap();
+        let (x, y) = (b.0 + b.2 / 2.0, b.1 + b.3 / 2.0);
+        let mut first = Vec::new();
+        for i in 0..clicks {
+            let mods = Modifiers::default();
+            let button = PointerButton::Primary;
+            let mut o = press(&mut e, InputEvent::PointerDown { x, y, button, mods });
+            o.extend(press(&mut e, InputEvent::PointerUp { x, y, button, mods }));
+            if i == 0 {
+                first = o;
+            } else {
+                assert!(ticks(&o).is_empty(), "click {i} is held");
+            }
+        }
+        assert_eq!(ticks(&first), [Some("yes".to_string())]);
+        let caught = finish(&mut e, &first);
+        if clicks == 2 {
+            assert_eq!(ticks(&caught), [None], "unticked: posted without the box");
+            assert!(finish(&mut e, &caught).is_empty());
+        } else {
+            assert!(
+                caught.is_empty(),
+                "ticked again: the sent value, {caught:?}"
+            );
+        }
+    }
 }

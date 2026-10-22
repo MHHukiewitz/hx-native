@@ -120,6 +120,11 @@ pub struct CatchUp {
     pub sent: String,
     /// The player's newest committed value, same encoding.
     pub committed: String,
+    /// The value the game last drew in the control, when a redraw drew one
+    /// while the commit was unanswered (the redraw's value the put-back
+    /// replaced). `None`: the game's value is `sent`. Issue #94: the
+    /// unapplied-change baseline and a greyed control use it.
+    pub game: Option<String>,
     /// A commit is held back: the catch-up has not been sent. `false` once
     /// the catch-up is in flight; the entry then only guards redraws until
     /// its answer.
