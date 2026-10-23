@@ -176,42 +176,46 @@ fn table_row_and_cell_roots_swap_like_their_static_load() {
     assert!(bad.is_empty(), "{bad:#?}");
 }
 
-/// Pre-existing, not #106: at scale 1.25 any swapped-in text (innerHTML
-/// too, and a `<div>` root that parsed the same before #106) lays out up
-/// to 1 px narrower/shorter than the same markup loaded fresh, so partial
-/// != a fresh full paint. Scale 1 is exact. Separate issue.
+/// Issue #107 (was `#[ignore]`d): at a fractional scale (and at 2) every
+/// swapped-in root, and an innerHTML swap, lays out and paints exactly like
+/// the same markup loaded fresh, so a partial repaint equals a full paint.
+/// The root cause was a surface styled at scale 1 and painted at another
+/// scale (see `tests/scale_107.rs`).
 #[test]
-#[ignore = "pre-existing: swapped text at scale 1.25 is 1 px off a fresh load"]
 fn scaled_swap_matches_static() {
     let mut bad = vec![];
-    for (label, a, b) in roots() {
-        let (s, e, px) = compare(&id, &a, &b, 1.25);
-        if s != e || !px {
+    for scale in [1.25, 1.5, 2.0] {
+        for (label, a, b) in roots() {
+            let (s, e, px) = compare(&id, &a, &b, scale);
+            if s != e || !px {
+                bad.push(format!(
+                    "{label} @{scale}: static {s:?} swapped {e:?} pixels_equal={px}"
+                ));
+            }
+        }
+        // innerHTML control: same root markup, only the children swapped.
+        let inner = |x: &str| {
+            format!("<div id=\"root\" hx-trigger=\"slice:panel\" class=\"row\">{x}</div>")
+        };
+        let mut s = Engine::new(cfg());
+        s.load_html(&page(&inner("<button id=\"b\">AA</button>")))
+            .unwrap();
+        s.paint(Viewport::with_scale(320, 200, scale)).unwrap();
+        let mut e = Engine::new(cfg());
+        e.load_html(&page(&inner("<button id=\"b\">A</button>")))
+            .unwrap();
+        e.paint(Viewport::with_scale(320, 200, scale)).unwrap();
+        e.sync(&Sl(1), &mut Fr("<button id=\"b\">AA</button>".into()))
+            .unwrap();
+        e.paint(Viewport::with_scale(320, 200, scale)).unwrap();
+        let px = e.last_frame().unwrap().pixels == s.last_frame().unwrap().pixels;
+        if probe(&s) != probe(&e) || !px {
             bad.push(format!(
-                "{label}: static {s:?} swapped {e:?} pixels_equal={px}"
+                "innerHTML @{scale}: static {:?} swapped {:?} pixels_equal={px}",
+                probe(&s),
+                probe(&e)
             ));
         }
-    }
-    // innerHTML control: same root markup, only the children swapped.
-    let inner =
-        |x: &str| format!("<div id=\"root\" hx-trigger=\"slice:panel\" class=\"row\">{x}</div>");
-    let mut s = Engine::new(cfg());
-    s.load_html(&page(&inner("<button id=\"b\">AA</button>")))
-        .unwrap();
-    s.paint(Viewport::with_scale(320, 200, 1.25)).unwrap();
-    let mut e = Engine::new(cfg());
-    e.load_html(&page(&inner("<button id=\"b\">A</button>")))
-        .unwrap();
-    e.paint(Viewport::with_scale(320, 200, 1.25)).unwrap();
-    e.sync(&Sl(1), &mut Fr("<button id=\"b\">AA</button>".into()))
-        .unwrap();
-    e.paint(Viewport::with_scale(320, 200, 1.25)).unwrap();
-    if probe(&s) != probe(&e) {
-        bad.push(format!(
-            "innerHTML: static {:?} swapped {:?}",
-            probe(&s),
-            probe(&e)
-        ));
     }
     assert!(bad.is_empty(), "{bad:#?}");
 }

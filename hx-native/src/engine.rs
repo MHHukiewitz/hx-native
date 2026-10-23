@@ -10,6 +10,7 @@ use blitz_dom::{
 };
 use blitz_html::{HtmlDocument, HtmlProvider};
 use blitz_traits::shell::{ColorScheme, Viewport as BlitzViewport};
+use style::invalidation::element::restyle_hints::RestyleHint;
 
 use crate::damage::{
     collect_style_damaged, compute_raw_damage, element_border_box_css, ink_box_device,
@@ -6435,12 +6436,27 @@ impl LiveSurface {
                 .filter(|r| !r.is_empty()),
         );
 
+        let styled_scale = self.doc.viewport().scale_f64();
         self.doc.set_viewport(BlitzViewport::new(
             width,
             height,
             scale as f32,
             ColorScheme::Light,
         ));
+        // Issue #107: stylo snaps some computed values (a 1 px border becomes
+        // whole device pixels) to the device scale at cascade time. Blitz only
+        // re-shapes its text when the scale changes, so nodes styled at the
+        // old scale (`load_html` parses at scale 1, a window moves to another
+        // monitor) would keep the old numbers while a later swap styles new
+        // nodes at the new scale. Recascade everything once, like Blitz does
+        // for a colour-scheme change.
+        if (styled_scale - scale as f32 as f64).abs() > f64::EPSILON {
+            if let Some(root) = self.doc.try_root_element().map(|n| n.id) {
+                if let Some(node) = self.doc.get_node_mut(root) {
+                    node.set_restyle_hint(RestyleHint::recascade_subtree());
+                }
+            }
+        }
 
         // Graph review (PR #24 follow-up): drain damage an input-time
         // `ensure_resolved` already carried (its one-shot restyle flags are
