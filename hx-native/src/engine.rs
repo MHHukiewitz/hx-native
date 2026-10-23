@@ -39,6 +39,7 @@ use crate::form_controls::{
 use crate::memory::estimate_surface_engine_bytes;
 use crate::paint::{paint_damage_into, paint_rgba};
 use crate::pending::{CatchUp, PendingEntry, PendingState, PendingTimeout, QueuedRelease};
+use crate::radio::RadioShifts;
 use crate::scroll::{
     all_bars, author_padding_right_css, bar_geometry, bar_hit, bar_unoccluded, can_scroll,
     container_damage_rect, containers_at, gutter_css, is_scroll_container, max_offset_y,
@@ -366,6 +367,8 @@ struct LiveSurface {
     gutter_sheet: Option<UserAgentStylesheet>,
     /// A gutter made another container overflow: resolve again next time.
     gutter_followup: bool,
+    /// Issue #116: post-layout radio baseline shifts (see `radio.rs`).
+    radio_shifts: RadioShifts,
 }
 
 /// Thumb drag state (issue #26).
@@ -1727,12 +1730,15 @@ impl LiveSurface {
 
         doc.add_user_agent_stylesheet(select_ua_stylesheet());
         doc.add_user_agent_stylesheet(slider_ua_stylesheet());
-        doc.resolve(0.0);
+        // Issue #116: radio baseline shifts ride on every layout pass.
+        let mut radio_shifts = RadioShifts::default();
+        radio_shifts.resolve(&mut doc);
         align_text_inputs(&mut doc);
         let select_nids = collect_select_nids(&doc);
         let applied_control_nids = collect_applied_control_nids(&doc);
         let mut live = Self {
             doc,
+            radio_shifts,
             bindings,
             sections,
             slice_versions: HashMap::new(),
@@ -1818,7 +1824,7 @@ impl LiveSurface {
     /// container first needs its gutter (issue #26 round 3).
     fn resolve_doc(&mut self) -> u64 {
         self.prune_gutters();
-        self.doc.resolve(0.0);
+        self.radio_shifts.resolve(&mut self.doc);
         self.resolve_count = self.resolve_count.saturating_add(1);
         let mut passes = 1;
         // Gutters are sticky and only ever added, so this terminates; a
@@ -1827,7 +1833,7 @@ impl LiveSurface {
         // costs at most GUTTER_MAX_PASSES extra layouts per frame.
         const GUTTER_MAX_PASSES: u64 = 3;
         while passes <= GUTTER_MAX_PASSES && self.reserve_new_gutters() {
-            self.doc.resolve(0.0);
+            self.radio_shifts.resolve(&mut self.doc);
             self.resolve_count = self.resolve_count.saturating_add(1);
             passes += 1;
         }

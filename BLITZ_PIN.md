@@ -82,3 +82,33 @@ the merge: `merged_runs_count_and_fallbacks_at_scale_1` and
 `hx-native/tests/tile_coalesce_67.rs` fail first. A bump that draws tiles
 differently (e.g. one fill with an extended brush) makes the pass a no-op;
 remove it then.
+
+## Radio baseline and ring scale (pin-sensitive, #116)
+
+`hx-native/src/radio.rs` works around two behaviours of **0.3.0-beta.4**:
+
+- **Baseline.** `blitz-dom` gives a radio no baseline (it is not in
+  `is_replaced_element`, so it lays out as a block and parley gets an inline
+  box with `baseline == None`), so the *margin-box* bottom sits on the line
+  baseline. Chrome puts the *border-box* bottom there. `RadioShifts` undoes its
+  previous shift, runs `BaseDocument::resolve`, then moves each in-flow inline
+  radio down by its `margin-bottom` in both `unrounded_layout` and
+  `final_layout`. A UA `vertical-align` shim is not an option: Blitz pushes
+  `InlineBox.vertical_align` to parley unscaled, so it breaks at scale != 1.
+  Radios with `vertical-align: middle | text-top | text-bottom | top | bottom`
+  (or `alignment-baseline`/`baseline-shift` keywords) align by their margin box
+  in both engines and are not shifted.
+- **Ring scale.** `blitz-paint` `render/form_controls.rs::draw_input` draws the
+  ring, gap and dot as circles of radius `8k`, `6k`, `4k` with
+  `k = (min_device_dim - 4) / 16`; the `4` is device px. `RadioRings` (hooked
+  into `ShadowScene::fill` in `text_shadow.rs`) matches those circles by centre
+  and radius and repaints them with `k = (min_css_dim - 4) / 16 * scale`.
+
+A bump that gives radios a baseline, scales the `4`, or changes the circle
+radii makes the matching a no-op (unmatched circles paint unchanged); remove
+the pass then. Tests: `hx-native/tests/radio_baseline_116.rs`.
+
+Known, unrelated to #116: in `PaintMode::Shifted`, `CullScene` compares the
+*shifted* shape bounds with the *unshifted* clip, so small shapes (a radio's
+dot at scale 1.5) can be culled in a partial repaint. Exact is unaffected. Not
+fixed here.
