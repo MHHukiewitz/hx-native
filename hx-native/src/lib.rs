@@ -20,6 +20,7 @@ mod form_controls;
 mod memory;
 mod paint;
 mod pending;
+mod radio;
 mod scroll;
 mod select_ui;
 mod slider;

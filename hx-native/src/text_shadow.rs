@@ -45,6 +45,8 @@ use parley::PositionedLayoutItem;
 use peniko::{BlendMode, Color, Fill, FontData, StyleRef};
 use style::color::ColorSpace;
 
+use crate::radio::RadioRings;
+
 /// Max distance (device px) between the recorded and the painted run origin.
 const ORIGIN_TOLERANCE: f64 = 0.5;
 
@@ -66,6 +68,8 @@ struct Candidate {
 #[derive(Debug, Default)]
 pub(crate) struct ShadowTable {
     runs: HashMap<u64, Vec<Candidate>>,
+    /// Issue #116: radio ring circles to rescale (see `radio.rs`).
+    radios: RadioRings,
 }
 
 fn run_key(font: &FontData, font_size: f32, glyphs: impl Iterator<Item = (u32, f32, f32)>) -> u64 {
@@ -167,7 +171,10 @@ impl ShadowTable {
     /// Record every shadowed run. A document without any `text-shadow`
     /// returns an empty table after one style read per node.
     pub(crate) fn build(doc: &HtmlDocument, scale: f64) -> Self {
-        let mut table = Self::default();
+        let mut table = Self {
+            radios: RadioRings::build(doc, scale),
+            ..Self::default()
+        };
         if !document_has_text_shadow(doc) {
             bump(|c| c.tables_skipped += 1);
             return table;
@@ -338,6 +345,11 @@ impl<S: PaintScene> PaintScene for ShadowScene<'_, S> {
         brush_transform: Option<Affine>,
         shape: &impl Shape,
     ) {
+        if let Some(circle) = self.table.radios.rescale(transform, shape) {
+            self.inner
+                .fill(style, transform, brush, brush_transform, &circle);
+            return;
+        }
         self.inner
             .fill(style, transform, brush, brush_transform, shape);
     }
