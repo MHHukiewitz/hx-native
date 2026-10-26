@@ -49,7 +49,7 @@ use crate::scroll::{
 };
 use crate::select_ui::{
     collect_select_nids, control_rect_of, list_row_at, open_select_state, paint_select_overlays,
-    select_damage_rects, select_row_damage_rect, select_ua_stylesheet, OpenSelect, SELECT_MAX_ROWS,
+    select_damage_rects, select_row_damage_rect, select_ua_stylesheet, OpenSelect, SELECT_ROW_H,
 };
 use crate::slider::{
     all_sliders, grab_offset, paint_sliders, slider_geometry, slider_ua_stylesheet, SliderGeom,
@@ -1477,6 +1477,24 @@ impl Engine {
             crate::scroll::offset_y(&live.doc, nid),
             crate::scroll::max_offset_y(&live.doc, nid),
         ))
+    }
+
+    /// Test helper (issue #121): the open `<select>` list on the default
+    /// surface as `(first visible option, highlighted option)`, or `None`
+    /// when no list is open.
+    #[doc(hidden)]
+    pub fn test_open_select(&self) -> Option<(usize, usize)> {
+        let live = self.live(SurfaceId::DEFAULT)?;
+        let o = live.open_select.as_ref()?;
+        Some((o.top, o.highlight))
+    }
+
+    /// Test helper (issue #121): the open list's rect `(x, y, w, h)` in CSS px.
+    #[doc(hidden)]
+    pub fn test_open_select_rect(&self) -> Option<(f32, f32, f32, f32)> {
+        let live = self.live(SurfaceId::DEFAULT)?;
+        let r = live.open_select.as_ref()?.list_rect;
+        Some((r.x, r.y, r.w, r.h))
     }
 
     /// Test helper (issue #26 round 3): content box of `id` in CSS px
@@ -3415,7 +3433,14 @@ impl LiveSurface {
         if !delta.1.is_finite() || delta.1 == 0.0 {
             return InputOutcome::None;
         }
-        if self.open_select.is_some() {
+        if let Some(open) = self.open_select.clone() {
+            // Issue #121: a wheel over the open list scrolls the list (or is
+            // swallowed when everything fits) and never closes it. A wheel
+            // elsewhere closes the list, as before, then scrolls whatever is
+            // under the pointer.
+            if open.list_rect.contains(x, y) {
+                return self.wheel_open_list(delta.1, unit);
+            }
             self.close_select();
         }
         for nid in containers_at(&self.doc, x, y) {
@@ -3433,6 +3458,40 @@ impl LiveSurface {
             }
         }
         InputOutcome::None
+    }
+
+    /// Issue #121: a wheel over the open `<select>` list. Positive `dy`
+    /// scrolls up. Rows move whole: a `Line` is [`SCROLL_LINE_ROWS`] rows, a
+    /// `Page` is the visible rows less one, a `Pixel` is a row per
+    /// [`SELECT_ROW_H`] px with the fraction carried. The wheel is consumed
+    /// (`Scrolled`, so the host does not also scroll its own UI behind the
+    /// list) whether or not the list could move.
+    fn wheel_open_list(&mut self, dy: f32, unit: WheelUnit) -> InputOutcome {
+        let Some(open) = self.open_select.clone() else {
+            return InputOutcome::None;
+        };
+        let n = select_options(&self.doc, open.select_nid).len();
+        let visible = OpenSelect::visible_rows(n);
+        let rows = match unit {
+            WheelUnit::Pixel => -dy / SELECT_ROW_H,
+            WheelUnit::Line => -dy * SCROLL_LINE_ROWS,
+            WheelUnit::Page => -dy * visible.saturating_sub(1).max(1) as f32,
+        };
+        let moved = self
+            .open_select
+            .as_mut()
+            .is_some_and(|os| os.scroll_by(rows, n));
+        if moved {
+            // The rows under a still pointer changed: drop the stale hover so
+            // the next pointer move re-targets the highlight.
+            self.select_hover_row = None;
+            let rect = open.list_rect.as_device(self.layout_scale);
+            self.push_pending_damage(rect);
+            self.mark_paint_dirty();
+        }
+        InputOutcome::Scrolled {
+            id: open.select_id.clone(),
+        }
     }
 
     /// Issue #26: primary press on an engine-drawn scrollbar.
@@ -3887,7 +3946,7 @@ impl LiveSurface {
                 let opts = select_options(&self.doc, open.select_nid);
                 let n = opts.len();
                 if let Some(row) = list_row_at(open, x, y, n) {
-                    let pick = row.min(SELECT_MAX_ROWS - 1).min(n.saturating_sub(1));
+                    let pick = row.min(n.saturating_sub(1));
                     if !opts[pick].disabled && !control_is_disabled(&self.doc, open.select_nid) {
                         let changed = select_set_index(&mut self.doc, open.select_nid, pick);
                         self.close_select();
@@ -4239,6 +4298,14 @@ impl LiveSurface {
         let disabled = control_is_disabled(&self.doc, open.select_nid);
         if !node_ok || !id_ok || disabled {
             self.close_select();
+            return;
+        }
+        // A swap may have changed the option list under the open select.
+        let n = select_options(&self.doc, open.select_nid).len();
+        if n == 0 {
+            self.close_select();
+        } else if let Some(os) = self.open_select.as_mut() {
+            os.clamp_to(n);
         }
     }
 
@@ -5715,13 +5782,14 @@ impl LiveSurface {
                 return Some(InputOutcome::None);
             }
             let opts = select_options(&self.doc, open.select_nid);
-            let rows = opts.len().min(SELECT_MAX_ROWS);
+            let rows = opts.len();
             match key.key.as_str() {
                 "ArrowDown" => {
                     if let Some(os) = self.open_select.as_mut() {
                         if os.highlight + 1 < rows {
                             os.highlight += 1;
                         }
+                        os.reveal_highlight(rows);
                     }
                     self.mark_paint_dirty();
                     return Some(InputOutcome::None);
@@ -5729,6 +5797,7 @@ impl LiveSurface {
                 "ArrowUp" => {
                     if let Some(os) = self.open_select.as_mut() {
                         os.highlight = os.highlight.saturating_sub(1);
+                        os.reveal_highlight(rows);
                     }
                     self.mark_paint_dirty();
                     return Some(InputOutcome::None);
