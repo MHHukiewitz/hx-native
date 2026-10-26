@@ -14,6 +14,7 @@ use peniko::{BlendMode, Color, Fill, FontData, StyleRef};
 
 use crate::damage::IntRect;
 use crate::error::EngineError;
+use crate::inset_shadow::InsetScene;
 use crate::text_shadow::{ShadowScene, ShadowTable};
 use crate::tile_coalesce::TileScene;
 use crate::types::{PaintMode, RgbaImage};
@@ -32,11 +33,15 @@ pub fn paint_rgba(
         |scene| {
             let mut tiles = TileScene::new(scene);
             {
-                let mut shadow = ShadowScene {
-                    inner: &mut tiles,
-                    table: &table,
-                };
-                paint_scene(&mut shadow, doc, scale, width, height, 0, 0);
+                let mut inset = InsetScene::new(&mut tiles);
+                {
+                    let mut shadow = ShadowScene {
+                        inner: &mut inset,
+                        table: &table,
+                    };
+                    paint_scene(&mut shadow, doc, scale, width, height, 0, 0);
+                }
+                inset.finish();
             }
             tiles.finish();
         },
@@ -103,16 +108,20 @@ fn paint_exact_rect(
             };
             // Full-size clip so fragments outside the rect cannot leak.
             PaintScene::push_clip_layer(&mut cull, Fill::NonZero, Affine::IDENTITY, &clip);
-            // Shadows are emitted above the tile merge, and tile runs are merged
-            // before culling, so full and partial paints see the same commands
-            // (issues #57, #67).
+            // Shadows are emitted above the tile merge, inset shadow layers are
+            // folded and tile runs are merged before culling, so full and
+            // partial paints see the same commands (issues #57, #67).
             let mut tiles = TileScene::new(&mut cull);
             {
-                let mut shadow = ShadowScene {
-                    inner: &mut tiles,
-                    table,
-                };
-                paint_scene(&mut shadow, doc, scale, width, height, 0, 0);
+                let mut inset = InsetScene::new(&mut tiles);
+                {
+                    let mut shadow = ShadowScene {
+                        inner: &mut inset,
+                        table,
+                    };
+                    paint_scene(&mut shadow, doc, scale, width, height, 0, 0);
+                }
+                inset.finish();
             }
             tiles.finish();
             PaintScene::pop_layer(&mut cull);
@@ -156,11 +165,15 @@ fn paint_shifted_rect(
             };
             let mut tiles = TileScene::new(&mut cull);
             {
-                let mut shadow = ShadowScene {
-                    inner: &mut tiles,
-                    table,
-                };
-                paint_scene(&mut shadow, doc, scale, width, height, 0, 0);
+                let mut inset = InsetScene::new(&mut tiles);
+                {
+                    let mut shadow = ShadowScene {
+                        inner: &mut inset,
+                        table,
+                    };
+                    paint_scene(&mut shadow, doc, scale, width, height, 0, 0);
+                }
+                inset.finish();
             }
             tiles.finish();
         },

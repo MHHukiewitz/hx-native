@@ -17,6 +17,7 @@ mod focus;
 mod fonts;
 mod form_args;
 mod form_controls;
+mod inset_shadow;
 mod memory;
 mod paint;
 mod pending;
@@ -40,6 +41,10 @@ pub use dialect::{
 pub use engine::{DirtySet, Engine};
 pub use error::EngineError;
 pub use form_args::{args_get, args_get_all};
+#[doc(hidden)]
+pub use inset_shadow::{
+    set_inset_shadow_fast_path_for_test, take_inset_shadow_counters_for_test, InsetShadowCounters,
+};
 pub use memory::{
     estimate_document_bytes, estimate_rgba_bytes, estimate_surface_engine_bytes,
     DOCUMENT_ESTIMATE_BASE_BYTES, DOCUMENT_ESTIMATE_PER_HTML_BYTE, RGBA_BYTES_PER_PIXEL,
