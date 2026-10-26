@@ -83,6 +83,37 @@ the merge: `merged_runs_count_and_fallbacks_at_scale_1` and
 differently (e.g. one fill with an extended brush) makes the pass a no-op;
 remove it then.
 
+## Zero-blur inset box-shadow (pin-sensitive, #123)
+
+`hx-native/src/inset_shadow.rs` (`InsetScene`, between `ShadowScene` and
+`TileScene` in `paint.rs`) relies on how **0.3.0-beta.4** `blitz-paint`
+`render/box_shadow.rs::draw_inset_box_shadow` paints one inset layer:
+
+- `push_layer(NonZero, Mix::Normal, 1.0, T, padding_box_path)`, `fill` of the
+  same path with the shadow colour, `push_layer(NonZero, Compose::DestOut,
+  1.0, T, padding_box_path)`, `draw_box_shadow` of the hole in white, then two
+  `pop_layer`s, with nothing in between;
+- the padding box path of a box with sharp corners is a `MoveTo` and three
+  `LineTo`s (`kurbo_css` `insert_point`);
+- the hole is `padding_box.inflate(-spread * scale)`, moved by the offset in
+  **CSS px, not device px** (a 1 px bevel moves 1 device px at scale 2), with
+  the averaged corner radius and `blur * scale` as the standard deviation;
+- a transparent layer ends the loop (`return`, not `continue`).
+
+vello_cpu 0.3 draws the hole with its blurred rounded rect shader (`powf` per
+pixel) even at zero blur; at zero blur that is a hard step at each pixel
+centre. With no blur and no radius, under a pure translation, with both
+rects on whole device px, `InsetScene` paints the padding box minus the hole
+as one even-odd fill (inside the outer layer only for a translucent colour).
+Everything else is replayed unchanged.
+
+A bump that changes the command order or the path makes the fast path a
+no-op (the layer replays): `whole_pixel_layers_take_the_fast_path_and_the_rest_replay`
+and `a_bevelled_panel_paints_every_layer_as_one_fill` in
+`hx-native/tests/inset_shadow_123.rs` fail first. A bump that scales the
+offset changes the pixels of both paths alike; a bump that paints zero-blur
+inset shadows as fills makes the pass redundant; remove it then.
+
 ## Radio baseline and ring scale (pin-sensitive, #116)
 
 `hx-native/src/radio.rs` works around two behaviours of **0.3.0-beta.4**:

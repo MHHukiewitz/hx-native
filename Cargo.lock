@@ -703,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "hx-native"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyrender",
  "anyrender_vello_cpu",
