@@ -28,8 +28,11 @@ type SelectRowCache = HashMap<SelectRowCacheKey, RgbaImage>;
 static SELECT_ROW_CACHE: LazyLock<Mutex<SelectRowCache>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Max visible rows in the open drop list (no scrolling in v1).
+/// Max visible rows in the open drop list. A longer list scrolls (issue #121).
 pub const SELECT_MAX_ROWS: usize = 8;
+
+/// Width of the slim scroll indicator drawn on a scrolling open list.
+pub const SELECT_BAR_W: f32 = 8.0;
 
 /// Row height in CSS pixels.
 pub const SELECT_ROW_H: f32 = 18.0;
@@ -79,12 +82,73 @@ option[selected] {
 pub struct OpenSelect {
     pub select_nid: NodeId,
     pub select_id: Option<String>,
-    /// Highlighted row index into the option list (capped to first 8).
+    /// Highlighted row: an index into the full option list (not the window).
     pub highlight: usize,
+    /// Index of the first option shown in the list (issue #121). Always 0
+    /// when the options fit in [`SELECT_MAX_ROWS`] rows.
+    pub top: usize,
+    /// Wheel remainder below one row, in rows (signed), carried to the next
+    /// wheel event so a fine trackpad scroll still moves the list.
+    pub wheel_rem: f32,
     /// Document-space rect of the closed control (for positioning the list).
     pub control_rect: ControlRect,
     /// Document-space rect of the open list.
     pub list_rect: ControlRect,
+}
+
+impl OpenSelect {
+    /// Number of rows shown for `option_count` options.
+    pub fn visible_rows(option_count: usize) -> usize {
+        option_count.min(SELECT_MAX_ROWS)
+    }
+
+    /// Largest `top` for `option_count` options.
+    pub fn max_top(option_count: usize) -> usize {
+        option_count.saturating_sub(SELECT_MAX_ROWS)
+    }
+
+    /// Clamp `top` and `highlight` to `option_count` options (a swap may have
+    /// changed the list under an open select).
+    pub fn clamp_to(&mut self, option_count: usize) {
+        self.highlight = self.highlight.min(option_count.saturating_sub(1));
+        self.top = self.top.min(Self::max_top(option_count));
+    }
+
+    /// Scroll the window the least that shows the highlighted row.
+    pub fn reveal_highlight(&mut self, option_count: usize) {
+        let rows = Self::visible_rows(option_count);
+        if rows == 0 {
+            self.top = 0;
+        } else if self.highlight < self.top {
+            self.top = self.highlight;
+        } else if self.highlight >= self.top + rows {
+            self.top = self.highlight + 1 - rows;
+        }
+        self.top = self.top.min(Self::max_top(option_count));
+    }
+
+    /// Move the window by `rows` (positive = down), clamped. Returns whether
+    /// `top` changed.
+    pub fn scroll_by(&mut self, rows: f32, option_count: usize) -> bool {
+        let max = Self::max_top(option_count);
+        if max == 0 {
+            self.wheel_rem = 0.0;
+            return false;
+        }
+        let total = self.wheel_rem + rows;
+        let whole = total.trunc();
+        let before = self.top;
+        let want = self.top as f32 + whole;
+        self.top = want.clamp(0.0, max as f32) as usize;
+        // Running into either end drops the remainder, as the scroll
+        // containers clamp: no stored overscroll to unwind later.
+        self.wheel_rem = if want < 0.0 || want > max as f32 {
+            0.0
+        } else {
+            total - whole
+        };
+        self.top != before
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -136,19 +200,20 @@ pub fn list_rect_below(control: ControlRect, option_count: usize) -> ControlRect
     }
 }
 
-/// Row index under `(x,y)` in the open list, if any.
+/// Option index under `(x,y)` in the open list, if any (the scroll window
+/// is applied: the first visible row is option `open.top`).
 pub fn list_row_at(open: &OpenSelect, x: f32, y: f32, option_count: usize) -> Option<usize> {
     if !open.list_rect.contains(x, y) {
         return None;
     }
-    let rows = option_count.min(SELECT_MAX_ROWS);
+    let rows = OpenSelect::visible_rows(option_count);
     let local_y = y - open.list_rect.y - 1.0;
     if local_y < 0.0 {
         return None;
     }
     let idx = (local_y / SELECT_ROW_H) as usize;
     if idx < rows {
-        Some(idx)
+        Some(open.top + idx)
     } else {
         None
     }
@@ -167,9 +232,13 @@ pub fn select_damage_rects(open: Option<&OpenSelect>, scale: f64) -> Vec<IntRect
     rects
 }
 
-/// Device-pixel damage for one list row (highlight change).
+/// Device-pixel damage for one list row (highlight change). `row` is an option
+/// index; a row outside the scroll window damages the whole list.
 pub fn select_row_damage_rect(open: &OpenSelect, row: usize, scale: f64) -> IntRect {
-    let y = open.list_rect.y + 1.0 + row as f32 * SELECT_ROW_H;
+    let Some(rel) = row.checked_sub(open.top) else {
+        return open.list_rect.as_device(scale);
+    };
+    let y = open.list_rect.y + 1.0 + rel as f32 * SELECT_ROW_H;
     ControlRect {
         x: open.list_rect.x,
         y,
@@ -239,9 +308,19 @@ pub fn paint_select_overlays(
         return;
     };
     let opts = select_options(doc, open.select_nid);
-    let rows = opts.len().min(SELECT_MAX_ROWS);
+    let rows = OpenSelect::visible_rows(opts.len());
+    let top = open.top.min(OpenSelect::max_top(opts.len()));
     let pal = palette_for(doc, open.select_nid);
-    paint_open_list(frame, open, &opts[..rows], scale, hover_row, &pal);
+    paint_open_list(
+        frame,
+        open,
+        &opts[top..top + rows],
+        top,
+        opts.len(),
+        scale,
+        hover_row,
+        &pal,
+    );
 }
 
 /// Run `paint` but keep every pixel outside `clip` (CSS px) as it was.
@@ -303,10 +382,13 @@ fn paint_dropdown_button(frame: &mut RgbaImage, control: &ControlRect, scale: f6
     fill_triangle_down(frame, cx, cy, 4.0, scale, pal.ink);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_open_list(
     frame: &mut RgbaImage,
     open: &OpenSelect,
     opts: &[crate::form_controls::SelectOption],
+    first: usize,
+    total: usize,
     scale: f64,
     hover_row: Option<usize>,
     pal: &Palette,
@@ -326,7 +408,7 @@ fn paint_open_list(
             w: list.w - 2.0,
             h: SELECT_ROW_H,
         };
-        let highlighted = Some(i) == hover_row || i == open.highlight;
+        let highlighted = Some(first + i) == hover_row || first + i == open.highlight;
         if highlighted {
             fill_rect(frame, &row, scale, pal.select_hl);
         }
@@ -337,6 +419,43 @@ fn paint_open_list(
         };
         blit_label(frame, &row, scale, &opt.text, &css_hex(bg), &css_hex(fg));
     }
+
+    // A list longer than its window shows a slim bar so the scroll is visible.
+    if total > opts.len() && !opts.is_empty() {
+        paint_list_bar(frame, &list, first, opts.len(), total, scale, pal);
+    }
+}
+
+/// Slim track + raised thumb on the right edge of a scrolling open list.
+fn paint_list_bar(
+    frame: &mut RgbaImage,
+    list: &ControlRect,
+    first: usize,
+    rows: usize,
+    total: usize,
+    scale: f64,
+    pal: &Palette,
+) {
+    let track = ControlRect {
+        x: list.x + list.w - 1.0 - SELECT_BAR_W,
+        y: list.y + 1.0,
+        w: SELECT_BAR_W,
+        h: list.h - 2.0,
+    };
+    fill_rect(frame, &track, scale, pal.track);
+    let th = (track.h * rows as f32 / total as f32)
+        .max(crate::scroll::THUMB_MIN_PX)
+        .min(track.h);
+    let max_top = (total - rows).max(1) as f32;
+    let ty = track.y + (track.h - th) * (first as f32 / max_top);
+    let thumb = ControlRect {
+        x: track.x,
+        y: ty,
+        w: track.w,
+        h: th,
+    };
+    fill_rect(frame, &thumb, scale, pal.face);
+    stroke_raised(frame, &thumb, scale, pal);
 }
 
 /// Rasterize a short label via a throwaway Blitz document and blit into `frame`.
@@ -475,15 +594,19 @@ pub fn open_select_state(doc: &HtmlDocument, ctrl: &FormControlRef) -> Option<Op
     if opts.is_empty() {
         return None;
     }
-    let highlight = select_selected_index(&opts).min(opts.len().min(SELECT_MAX_ROWS) - 1);
+    let highlight = select_selected_index(&opts).min(opts.len() - 1);
     let list_rect = list_rect_below(rect, opts.len());
-    Some(OpenSelect {
+    let mut open = OpenSelect {
         select_nid: ctrl.node_id,
         select_id: ctrl.element_id.clone(),
         highlight,
+        top: 0,
+        wheel_rem: 0.0,
         control_rect: rect,
         list_rect,
-    })
+    };
+    open.reveal_highlight(opts.len());
+    Some(open)
 }
 
 #[allow(dead_code)]
