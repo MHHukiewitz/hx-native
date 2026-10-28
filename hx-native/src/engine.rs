@@ -1769,7 +1769,7 @@ impl LiveSurface {
 
         // HTML contract §2: strict dialect on loaded HTML, then index bindings.
         let known_ids = collect_element_ids(&doc);
-        validate_loaded_tree(declared_actions, &doc, &known_ids)?;
+        validate_loaded_tree(declared_actions, &doc, &[doc.root_node().id], &known_ids)?;
         let (bindings, sections) = index_bindings(declared_actions, &doc)?;
 
         doc.add_user_agent_stylesheet(select_ua_stylesheet());
@@ -2109,6 +2109,15 @@ impl LiveSurface {
     /// Validate fragment HTML **before** applying a swap so a bad fragment is
     /// never silently inserted. Errors surface on `sync` via `EngineError`.
     ///
+    /// The fragment is parsed in the same context the swap parses it in (the
+    /// target for `innerHTML`, the target's parent for `outerHTML`, see
+    /// [`swap_parse_context`]), under a copy of that context's ancestor chain
+    /// (element names and namespaces only). A target inside an inline `<svg>`
+    /// therefore makes the fragment SVG content here too, and the #23 SVG gate
+    /// counts the real `<svg>` depth, `<clipPath>` ancestry included (Graph's
+    /// #52 HOLD at 122ee963: parsed as its own document, a fragment swapped
+    /// into an `<svg>` skipped the gate).
+    ///
     /// `hx-target` / `hx-indicator` `#id` refs resolve against the document **as
     /// it will be after the swap**: current document ids, minus ids the swap
     /// removes, plus ids introduced by the fragment. Sibling indicators outside
@@ -2123,16 +2132,40 @@ impl LiveSurface {
     ) -> Result<(), EngineError> {
         // Validation-only parse (ids / dialect); never laid out or painted,
         // so it does not need the host fonts.
-        // No resource provider: validation never fetches or decodes images.
-        let frag_doc = parse_html_document(html, self.layout_viewport, &HostFonts::default());
+        // No resource provider: validation never fetches or decodes images,
+        // and the mirrored chain is detached, so nothing in it is "in the
+        // document" for Blitz to load.
+        let mut frag_doc = parse_html_document("", self.layout_viewport, &HostFonts::default());
+        let chain: Vec<QualName> = match swap_parse_context(&self.doc, target_nid, swap) {
+            Some(ctx) => element_chain(&self.doc, ctx),
+            None => vec![qual_name!("div", html)],
+        };
+        let context = {
+            let mut mutr = frag_doc.mutate();
+            let mut parent: Option<NodeId> = None;
+            for name in chain {
+                let el = mutr.create_element(name, vec![]);
+                if let Some(p) = parent {
+                    mutr.append_children(p, &[el]);
+                }
+                parent = Some(el);
+            }
+            let context = parent.expect("chain has at least the context element");
+            mutr.set_inner_html(context, html);
+            context
+        };
+        let roots: Vec<NodeId> = frag_doc
+            .get_node(context)
+            .map(|n| n.children.to_vec())
+            .unwrap_or_default();
         let mut known_ids = collect_element_ids(&self.doc);
         for id in ids_removed_by_swap(&self.doc, target_nid, swap) {
             known_ids.remove(&id);
         }
-        for id in collect_element_ids(&frag_doc) {
+        for id in collect_subtree_ids(&frag_doc, context, false) {
             known_ids.insert(id);
         }
-        validate_loaded_tree(declared_actions, &frag_doc, &known_ids)
+        validate_loaded_tree(declared_actions, &frag_doc, &roots, &known_ids)
     }
 
     /// Re-index bindings after a DOM mutation (swap / attribute edits).
@@ -2366,14 +2399,10 @@ impl LiveSurface {
                 // target's parent, so a `<tr>` root parses under its
                 // `<tbody>` and a root inside `<svg>` stays foreign. Without
                 // an element parent, an HTML `<div>`.
-                let context = self
-                    .doc
-                    .get_node(target_id)
-                    .and_then(|n| n.parent)
+                let context = swap_parse_context(&self.doc, target_id, swap)
                     .and_then(|p| self.doc.get_node(p))
                     .and_then(|p| p.element_data())
                     .map(|e| e.name.clone())
-                    .filter(|q| !(q.ns == ns!(html) && q.local == local_name!("html")))
                     .unwrap_or_else(|| qual_name!("div", html));
                 let wrapper_id = {
                     let mut mutr = self.doc.mutate();
@@ -6886,13 +6915,16 @@ impl Drop for SuppressCaretFocus<'_> {
 /// Walk a freshly parsed tree (document or fragment) and enforce the locked
 /// attribute dialect. Does **not** run on live-DOM reindex after the engine
 /// writes `data-hx-reason`.
+/// Validate the subtrees under `roots` (the whole document on load, the
+/// parsed fragment's top-level nodes on a swap). Ancestors of `roots` are
+/// not validated themselves, but the SVG gate reads them for context.
 fn validate_loaded_tree(
     declared_actions: &HashSet<String>,
     doc: &HtmlDocument,
+    roots: &[NodeId],
     known_ids: &HashSet<String>,
 ) -> Result<(), EngineError> {
-    let root = doc.root_node().id;
-    let mut stack = vec![root];
+    let mut stack = roots.to_vec();
     // #23: SVG `<image>` payloads that passed the static checks, decoded
     // once at the end (one throwaway document for the whole tree).
     let mut images: Vec<(String, RasterImage)> = Vec::new();
@@ -7109,6 +7141,41 @@ fn collect_subtree_ids(doc: &HtmlDocument, root: NodeId, include_root: bool) -> 
         }
     }
     ids
+}
+
+/// The element a swap parses its fragment in, like the DOM setters: the
+/// target for `innerHTML`, the target's parent for `outerHTML`. `None` when
+/// that parent is missing, not an element, or the HTML `<html>` element; the
+/// swap then parses under an HTML `<div>`.
+fn swap_parse_context(doc: &HtmlDocument, target: NodeId, swap: SwapMode) -> Option<NodeId> {
+    match swap {
+        SwapMode::InnerHtml => Some(target),
+        SwapMode::OuterHtml => {
+            let parent = doc.get_node(target)?.parent?;
+            let el = doc.get_node(parent)?.element_data()?;
+            if el.name.ns == ns!(html) && el.name.local == local_name!("html") {
+                None
+            } else {
+                Some(parent)
+            }
+        }
+    }
+}
+
+/// Element names from the outermost element ancestor of `node` down to
+/// `node` itself (non-element ancestors skipped). Walks parents without
+/// recursion.
+fn element_chain(doc: &HtmlDocument, node: NodeId) -> Vec<QualName> {
+    let mut chain = Vec::new();
+    let mut cur = doc.get_node(node);
+    while let Some(n) = cur {
+        if let Some(el) = n.element_data() {
+            chain.push(el.name.clone());
+        }
+        cur = n.parent.and_then(|p| doc.get_node(p));
+    }
+    chain.reverse();
+    chain
 }
 
 fn ids_removed_by_swap(doc: &HtmlDocument, target: NodeId, swap: SwapMode) -> HashSet<String> {
