@@ -19,8 +19,10 @@ pub struct EngineConfig {
     /// [`DEFAULT_HIDDEN_SURFACE_BUDGET_BYTES`].
     pub hidden_surface_budget_bytes: u64,
     /// Host-supplied font faces (issue #28). Empty by default, which keeps
-    /// the bundled-DejaVu-only behaviour. Faces are registered in this
-    /// order, after bundled DejaVu Sans, under the family / weight / style
+    /// the bundled-DejaVu-only behaviour. Pass both the regular and the bold
+    /// face of a family: Blitz paints no synthetic bold (issue #56). Faces
+    /// are registered in this order, after bundled DejaVu Sans 400 and 700,
+    /// under the family / weight / style
     /// given here (not the names inside the font file). DejaVu stays the
     /// generic (`sans-serif`, `serif`, `monospace`, `system-ui`) and
     /// unknown-family fallback. CSS `@font-face` rules stay ignored: the
@@ -28,6 +30,16 @@ pub struct EngineConfig {
     /// [`Engine::try_new`](crate::Engine::try_new) with
     /// [`EngineError::InvalidFont`](crate::EngineError::InvalidFont).
     pub fonts: Vec<FontFace>,
+    /// Issue #81 (Designer, HTML_CONTRACT §2 Ruling 5): the host forwards
+    /// key releases (`KeyEvent { pressed: false, .. }`) for every key press
+    /// it forwards. When `true`, ArrowUp/ArrowDown on a focused number box
+    /// step on keydown (and on key repeat) without a `change`, and the key
+    /// release sends exactly one `change`, only when the value moved past
+    /// what the game last got. When `false` (the default, for hosts without
+    /// key releases), the first keydown sends its `change` at once, key
+    /// repeat steps silently, and a key release, Enter or blur reports the
+    /// repeat steps.
+    pub key_releases: bool,
 }
 
 impl Default for EngineConfig {
@@ -38,6 +50,7 @@ impl Default for EngineConfig {
             paint_mode: PaintMode::Exact,
             hidden_surface_budget_bytes: DEFAULT_HIDDEN_SURFACE_BUDGET_BYTES,
             fonts: Vec::new(),
+            key_releases: false,
         }
     }
 }
@@ -288,19 +301,46 @@ pub enum InputRule {
 /// `step="any"` and falls back to a step of `1` for arrow/spin stepping,
 /// matching the existing missing-`step` default.
 ///
+/// `max: None` means no max (issue #101; Mainnet Services' Marketing budget):
+/// build it with [`InputLimits::at_least`]. A number box then gets no `max`
+/// attribute (one from markup is cleared, the slice wins), arrows and spin
+/// step up with no clamp, and typed or pasted values clamp at `min` only
+/// (the ±2^53 safe-number ceiling still holds). A range must have a real
+/// max (Designer ruling, 2026-10-22): `at_least` on a range is refused and
+/// logged with the element's id, and the range keeps its markup
+/// `min`/`max`/`step`.
+/// [`InputLimits::new`] always sets `Some(max)`. Reading `.max` directly is
+/// a breaking change from `f64` to `Option<f64>` (#101).
+///
 /// `#[non_exhaustive]` (PR27 round 2): a prospective future field must not
-/// break downstream struct literals. Build one with [`InputLimits::new`].
+/// break downstream struct literals. Build one with [`InputLimits::new`] or
+/// [`InputLimits::at_least`].
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq)]
 pub struct InputLimits {
     pub min: f64,
-    pub max: f64,
+    /// `None`: no max (issue #101; [`InputLimits::at_least`]).
+    pub max: Option<f64>,
     pub step: Option<f64>,
 }
 
 impl InputLimits {
+    /// Limits with both bounds: `min <= value <= max`.
     pub fn new(min: f64, max: f64, step: Option<f64>) -> Self {
-        Self { min, max, step }
+        Self {
+            min,
+            max: Some(max),
+            step,
+        }
+    }
+
+    /// Limits with a min and no max (issue #101).
+    pub fn at_least(min: f64, step: Option<f64>) -> Self {
+        Self {
+            min,
+            max: None,
+            step,
+        }
     }
 }
 

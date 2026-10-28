@@ -48,8 +48,8 @@ pub enum EngineError {
     /// `ttcf` file tag even with one face, is rejected), an empty family, a
     /// weight outside `1..=1000`, a duplicate of an earlier entry (same
     /// family compared case-insensitively per character as fontique does,
-    /// same weight and style), or a face that ties with the bundled
-    /// "DejaVu Sans" 400 normal (width is not compared, so a condensed face
+    /// same weight and style), or a face that ties with a bundled
+    /// "DejaVu Sans" face, 400 or 700 normal (#56; width is not compared, so a condensed face
     /// under that name is refused too). The byte check covers the tables
     /// fontique reads to register a face, not glyph outlines: a corrupt
     /// outline table passes and paints missing glyphs. `index` is the

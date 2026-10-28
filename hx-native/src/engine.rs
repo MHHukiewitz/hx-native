@@ -6,9 +6,11 @@ use std::time::Instant;
 
 use blitz_dom::{
     local_name, ns, qual_name, DocumentConfig, LocalName, NodeId, QualName, StyleThreading,
+    UserAgentStylesheet,
 };
 use blitz_html::{HtmlDocument, HtmlProvider};
 use blitz_traits::shell::{ColorScheme, Viewport as BlitzViewport};
+use style::invalidation::element::restyle_hints::RestyleHint;
 
 use crate::damage::{
     collect_style_damaged, compute_raw_damage, element_border_box_css, ink_box_device,
@@ -23,18 +25,21 @@ use crate::focus::{focusable_ids, ids_in_document_order, step_focus};
 use crate::fonts::{bundled_font_context, HostFonts};
 use crate::form_args::{
     capture_applied_controls, capture_form_controls, clamp_snap_value, clamp_value, closest_form,
-    collect_action_args, collect_applied_control_nids, format_numeric, is_number_input,
-    is_numeric_input, parse_f64, range_page, range_page_toward_x, range_to_end,
-    set_range_value_from_x, step_numeric_value, write_value_attr, NumericLimits, MAX_SAFE_NUMBER,
+    collect_action_args, collect_applied_control_nids, control_current_value,
+    control_value_in_args, format_numeric, is_number_input, is_numeric_input, is_range_input,
+    parse_f64, patch_control_arg, range_page, range_page_toward_x, range_to_end,
+    set_range_value_from_x, step_numeric_value, value_control_kind, write_value_attr,
+    NumericLimits, MAX_SAFE_NUMBER,
 };
 use crate::form_controls::{
     activate_checkable, checkbox_checked_by_name, control_is_disabled, form_control_at_point,
-    named_controls_in_form, select_options, select_radio, select_set_index, select_step,
-    sync_outputs_for, toggle_checkbox, FormControlKind, FormControlRef,
+    named_controls_in_form, radios_in_group, select_options, select_radio, select_set_index,
+    select_step, sync_outputs_for, toggle_checkbox, FormControlKind, FormControlRef,
 };
 use crate::memory::estimate_surface_engine_bytes;
 use crate::paint::{paint_damage_into, paint_rgba};
-use crate::pending::{PendingEntry, PendingState, PendingTimeout, QueuedRelease};
+use crate::pending::{CatchUp, PendingEntry, PendingState, PendingTimeout, QueuedRelease};
+use crate::radio::RadioShifts;
 use crate::scroll::{
     all_bars, author_padding_right_css, bar_geometry, bar_hit, bar_unoccluded, can_scroll,
     container_damage_rect, containers_at, gutter_css, is_scroll_container, max_offset_y,
@@ -44,7 +49,7 @@ use crate::scroll::{
 };
 use crate::select_ui::{
     collect_select_nids, control_rect_of, list_row_at, open_select_state, paint_select_overlays,
-    select_damage_rects, select_row_damage_rect, select_ua_stylesheet, OpenSelect, SELECT_MAX_ROWS,
+    select_damage_rects, select_row_damage_rect, select_ua_stylesheet, OpenSelect, SELECT_ROW_H,
 };
 use crate::slider::{
     all_sliders, grab_offset, paint_sliders, slider_geometry, slider_ua_stylesheet, SliderGeom,
@@ -58,9 +63,9 @@ use crate::text_edit::{
     apply_group_display_all, apply_unfocused_display, backspace, caret_device_rect, commit_field,
     delete_forward, delete_selection, editor_text, filter_number_insert, has_selection,
     insert_text, is_disabled, is_editable_input, move_end, move_home, move_left, move_right,
-    place_caret_at, prepare_focus_display, resolve_step_target, select_all, selected_text,
-    step_and_regroup, step_direction, sync_value_from_editor, text_outside_selection,
-    TextEditSession, CARET_BLINK_HALF_PERIOD,
+    number_is_sent, place_caret_at, prepare_focus_display, resolve_step_target, select_all,
+    select_word_at, selected_text, set_editor_text, step_and_regroup, step_direction,
+    sync_value_from_editor, text_outside_selection, TextEditSession, CARET_BLINK_HALF_PERIOD,
 };
 use crate::trigger::{
     filter_ctx_from_key, keydown_repeat_allowed, FilterCtx, FromTarget, TriggerEvent,
@@ -115,6 +120,8 @@ impl RequestLedger {
 /// Engine state a surface needs while handling input or completions.
 struct ActionCtx<'a> {
     surface: SurfaceId,
+    /// [`EngineConfig::key_releases`] (issue #81).
+    key_releases: bool,
     declared_actions: &'a HashSet<String>,
     requests: &'a mut RequestLedger,
 }
@@ -246,6 +253,19 @@ struct LiveSurface {
     released_outcomes: Vec<InputOutcome>,
     hover_id: Option<String>,
     press: Option<PressState>,
+    /// Issue #81 (Designer ruling 2): a ▲/▼ press held on a number box's
+    /// arrow, stepping on press and repeating until the release.
+    spin_hold: Option<SpinHold>,
+    /// Issue #81: the number box whose ArrowUp/
+    /// ArrowDown steps sent no `change` yet; the key release reports once.
+    key_hold: Option<String>,
+    /// Issue #85 (Ruling 7): the last primary press in a text field, so the
+    /// next one can count as a double- or triple-click.
+    last_text_click: Option<TextClick>,
+    /// The press clock frozen by a test (Graph review of #84/#86): when set,
+    /// [`Self::press_clock`] reads it instead of the wall clock, so the
+    /// click-count window and the arrow hold can't drift under load.
+    test_clock: Option<Instant>,
     focus: FocusState,
     /// Physical viewport size used for layout / hit-testing (updated on paint).
     layout_viewport: (u32, u32),
@@ -282,6 +302,22 @@ struct LiveSurface {
     /// Issue #35: the range's value when the press began; the release fires
     /// `change` only when the value differs (HTML: no change, no event).
     range_press_value: Option<String>,
+    /// Issue #89 (Designer, HTML_CONTRACT `hx-sync`, Mainnet master
+    /// 188feffd): value controls whose newest committed value the game has
+    /// not answered yet, at most one per control, in commit order.
+    catch_up: Vec<CatchUp>,
+    /// Issue #89: the value control a `change` being fired came from (the
+    /// trigger may bubble to its form), so a held `change` knows its box.
+    change_origin: Option<String>,
+    /// Issue #89: text the player was typing, not committed, in the box a
+    /// redraw replaced: the rebound editor gets it back (box id, text).
+    kept_typing: Option<(String, String)>,
+    /// Issue #94 (Graph review): per radio group `name`, the value the last
+    /// request a radio of that group sent carried. A radio's catch-up
+    /// compares with it, since another radio of the group may have sent
+    /// after the held one's request (b, then c, then b while b is pending).
+    /// At most one entry per radio group in the document.
+    radio_sent: HashMap<String, String>,
     /// Issue #35: engine-drawn slider geometry painted last frame; a change
     /// damages that slider's old and new rects only.
     last_sliders: Vec<SliderGeom>,
@@ -332,11 +368,14 @@ struct LiveSurface {
     /// for every container with an engine-reserved 16 px gutter. Sticky per
     /// id: kept across same-id swaps, dropped once no element has the id.
     gutters: BTreeMap<String, String>,
-    /// Detached engine-owned element carrying the gutter stylesheet (never
-    /// in the tree, so never serialized and never hit-tested).
-    gutter_sheet_node: Option<NodeId>,
+    /// The engine-owned gutter stylesheet, installed in the user-agent
+    /// origin through Blitz's user-agent sheet API. Issue #100: not tied to
+    /// a node, so Blitz's node-id ordering of `<style>` sheets never sees it.
+    gutter_sheet: Option<UserAgentStylesheet>,
     /// A gutter made another container overflow: resolve again next time.
     gutter_followup: bool,
+    /// Issue #116: post-layout radio baseline shifts (see `radio.rs`).
+    radio_shifts: RadioShifts,
 }
 
 /// Thumb drag state (issue #26).
@@ -355,6 +394,68 @@ struct MarkupSnapshot {
     min: Option<String>,
     max: Option<String>,
     step: Option<String>,
+}
+
+/// Issue #85: the last primary press in a text field. The next press
+/// continues the run (double-, triple-click) on the same field within
+/// [`MULTI_CLICK_SLOP_PX`] and [`MULTI_CLICK_MS`], as Blitz counts clicks.
+#[derive(Clone, Debug)]
+struct TextClick {
+    id: String,
+    x: f32,
+    y: f32,
+    at: Instant,
+    count: u32,
+}
+
+/// Issue #85: how far apart (CSS px, each axis) presses of one click run may be.
+const MULTI_CLICK_SLOP_PX: f32 = 2.0;
+/// Issue #85: the most time between presses of one click run.
+const MULTI_CLICK_MS: u128 = 500;
+
+impl TextClick {
+    fn continues(&self, id: &str, x: f32, y: f32, now: Instant) -> bool {
+        self.id == id
+            && (x - self.x).abs() <= MULTI_CLICK_SLOP_PX
+            && (y - self.y).abs() <= MULTI_CLICK_SLOP_PX
+            && now.saturating_duration_since(self.at).as_millis() <= MULTI_CLICK_MS
+    }
+}
+
+/// Issue #81 (Designer ruling 2, HTML_CONTRACT §2): one ▲/▼ press held on
+/// a number box's arrow. The press steps once; after
+/// [`SPIN_REPEAT_DELAY`] the box steps again every [`SPIN_REPEAT_INTERVAL`]
+/// (no speed-up) until the release, which sends the one `change`.
+#[derive(Clone, Debug)]
+struct SpinHold {
+    target_nid: NodeId,
+    target_id: Option<String>,
+    dir: i32,
+    pressed_at: Instant,
+    /// Repeat steps done so far (the press step not counted).
+    repeats: u32,
+    /// The value the game last got for the box when the press began (the
+    /// last `change`, or the value at focus): the release reports only a
+    /// value that differs from it (issue #81, Ruling 5).
+    reported: String,
+    /// A repeat step found the box held at min or max: later repeats would
+    /// move nothing, so the hold stops dirtying the box (Graph review).
+    pinned: bool,
+}
+
+/// Issue #81: the wait before a held arrow starts repeating.
+const SPIN_REPEAT_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
+/// Issue #81: the time between repeat steps of a held arrow.
+const SPIN_REPEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Repeat steps due `held` after the press (issue #81): none before
+/// [`SPIN_REPEAT_DELAY`], then one at the delay and one per interval after.
+fn spin_repeats_due(held: std::time::Duration) -> u32 {
+    if held < SPIN_REPEAT_DELAY {
+        return 0;
+    }
+    let past = (held - SPIN_REPEAT_DELAY).as_millis() / SPIN_REPEAT_INTERVAL.as_millis();
+    u32::try_from(past).unwrap_or(u32::MAX - 1) + 1
 }
 
 #[derive(Clone, Debug)]
@@ -631,10 +732,11 @@ impl Engine {
     /// upload is still reported on the first paint after it becomes visible.
     pub fn paint_surface(&mut self, id: SurfaceId) -> Result<PaintOutput, EngineError> {
         let t0 = Instant::now();
+        // Issue #89: a timeout runs the catch-up before this frame renders.
+        self.tick_surface_pending(id);
         let last_used = self.touch_lru();
         self.frame_count = self.frame_count.saturating_add(1);
         let paint_mode = self.config.paint_mode;
-        let timeout_frames = self.config.pending_timeout_frames;
 
         let surface = self
             .surfaces
@@ -648,7 +750,6 @@ impl Engine {
             .as_mut()
             .ok_or(EngineError::SurfaceEvicted(id))?;
 
-        live.pending.tick_frames(timeout_frames);
         let result = live.render(size, paint_mode)?;
         self.style_layout_passes = self
             .style_layout_passes
@@ -795,12 +896,14 @@ impl Engine {
             surfaces,
             declared_actions,
             requests,
+            config,
             ..
         } = self;
         match surfaces.get_mut(&id).and_then(|s| s.live.as_mut()) {
             Some(live) => {
                 let mut ctx = ActionCtx {
                     surface: id,
+                    key_releases: config.key_releases,
                     declared_actions,
                     requests,
                 };
@@ -1033,6 +1136,7 @@ impl Engine {
             surfaces,
             declared_actions,
             requests,
+            config,
             ..
         } = self;
         let Some(live) = surfaces.get_mut(&owner).and_then(|s| s.live.as_mut()) else {
@@ -1041,6 +1145,7 @@ impl Engine {
         };
         let mut ctx = ActionCtx {
             surface: owner,
+            key_releases: config.key_releases,
             declared_actions,
             requests,
         };
@@ -1208,10 +1313,32 @@ impl Engine {
     /// (for timeout tests).
     pub fn test_tick_frame(&mut self) {
         self.frame_count = self.frame_count.saturating_add(1);
-        let timeout_frames = self.config.pending_timeout_frames;
-        for live in self.surfaces.values_mut().filter_map(|s| s.live.as_mut()) {
-            live.pending.tick_frames(timeout_frames);
+        let ids: Vec<SurfaceId> = self.surfaces.keys().copied().collect();
+        for id in ids {
+            self.tick_surface_pending(id);
         }
+    }
+
+    /// Age surface `id`'s pending requests one frame (A3c timeouts); a timed-
+    /// out request still runs its catch-up (issue #89).
+    fn tick_surface_pending(&mut self, id: SurfaceId) {
+        let Self {
+            surfaces,
+            declared_actions,
+            requests,
+            config,
+            ..
+        } = self;
+        let Some(live) = surfaces.get_mut(&id).and_then(|s| s.live.as_mut()) else {
+            return;
+        };
+        let mut ctx = ActionCtx {
+            surface: id,
+            key_releases: config.key_releases,
+            declared_actions,
+            requests,
+        };
+        live.tick_pending(&mut ctx, config.pending_timeout_frames);
     }
 
     /// Test helper: current focus.
@@ -1253,6 +1380,7 @@ impl Engine {
                     live.text_edit = Some(TextEditSession {
                         id: id.to_string(),
                         node_id: nid,
+                        value_at_change: value_at_focus.clone(),
                         value_at_focus,
                         caret_visible: true,
                         last_blink: Instant::now(),
@@ -1361,6 +1489,24 @@ impl Engine {
         ))
     }
 
+    /// Test helper (issue #121): the open `<select>` list on the default
+    /// surface as `(first visible option, highlighted option)`, or `None`
+    /// when no list is open.
+    #[doc(hidden)]
+    pub fn test_open_select(&self) -> Option<(usize, usize)> {
+        let live = self.live(SurfaceId::DEFAULT)?;
+        let o = live.open_select.as_ref()?;
+        Some((o.top, o.highlight))
+    }
+
+    /// Test helper (issue #121): the open list's rect `(x, y, w, h)` in CSS px.
+    #[doc(hidden)]
+    pub fn test_open_select_rect(&self) -> Option<(f32, f32, f32, f32)> {
+        let live = self.live(SurfaceId::DEFAULT)?;
+        let r = live.open_select.as_ref()?.list_rect;
+        Some((r.x, r.y, r.w, r.h))
+    }
+
     /// Test helper (issue #26 round 3): content box of `id` in CSS px
     /// `(x, y, w, h)` — border box minus border and padding (the reserved
     /// gutter is part of the padding).
@@ -1463,6 +1609,37 @@ impl Engine {
             .unwrap_or(0)
     }
 
+    /// Test helper (issues #81, #85; Graph review): freeze the press clock
+    /// shared by the arrow hold and the click count, moved on by `by` (zero
+    /// just freezes it). Later presses read the frozen time, so a test's
+    /// clicks are exactly `by` apart, whatever the load on the machine.
+    #[doc(hidden)]
+    pub fn test_advance_clock(&mut self, by: std::time::Duration) {
+        if let Some(live) = self
+            .surfaces
+            .get_mut(&SurfaceId::DEFAULT)
+            .and_then(|s| s.live.as_mut())
+        {
+            live.test_clock = Some(live.press_clock() + by);
+        }
+    }
+
+    /// Test helper (issue #81): make the held ▲/▼ press `held` old and run
+    /// its repeat, as the next `sync` would after that long.
+    #[doc(hidden)]
+    pub fn test_hold_spin_for(&mut self, held: std::time::Duration) {
+        if let Some(live) = self
+            .surfaces
+            .get_mut(&SurfaceId::DEFAULT)
+            .and_then(|s| s.live.as_mut())
+        {
+            // Graph review of #84: the repeat count comes from `held` itself,
+            // not from a wall-clock read, so the 400/500 ms boundaries in the
+            // tests cannot drift under load.
+            live.advance_spin_hold_by(Some(held));
+        }
+    }
+
     /// Test helper: force one caret blink phase flip (damage + paint dirty).
     pub fn test_force_caret_blink(&mut self) {
         if let Some(live) = self
@@ -1508,6 +1685,18 @@ impl Engine {
             .and_then(|s| s.live.as_mut())?;
         let nid = live.doc.get_element_by_id(elem_id)?;
         editor_text(&mut live.doc, nid)
+    }
+
+    /// Test harness (issue #68): the focused editor's selected text for
+    /// `#id` (`None` when nothing is selected).
+    #[doc(hidden)]
+    pub fn test_selected_text(&mut self, elem_id: &str) -> Option<String> {
+        let live = self
+            .surfaces
+            .get_mut(&SurfaceId::DEFAULT)
+            .and_then(|s| s.live.as_mut())?;
+        let nid = live.doc.get_element_by_id(elem_id)?;
+        selected_text(&mut live.doc, nid).filter(|t| !t.is_empty())
     }
 
     /// Test helper: subscribed slice names the engine will ask `version` for.
@@ -1585,13 +1774,16 @@ impl LiveSurface {
 
         doc.add_user_agent_stylesheet(select_ua_stylesheet());
         doc.add_user_agent_stylesheet(slider_ua_stylesheet());
+        // Issue #116: radio baseline shifts ride on every layout pass.
         // #23: resolve, plus one more pass when a data: SVG was handed out.
-        let passes = resolve_with_data_images(&mut doc, &svg_provider);
+        let mut radio_shifts = RadioShifts::default();
+        let passes = resolve_with_data_images(&mut doc, &svg_provider, &mut radio_shifts);
         align_text_inputs(&mut doc);
         let select_nids = collect_select_nids(&doc);
         let applied_control_nids = collect_applied_control_nids(&doc);
         let mut live = Self {
             doc,
+            radio_shifts,
             bindings,
             sections,
             slice_versions: HashMap::new(),
@@ -1607,6 +1799,10 @@ impl LiveSurface {
             released_outcomes: Vec::new(),
             hover_id: None,
             press: None,
+            spin_hold: None,
+            key_hold: None,
+            last_text_click: None,
+            test_clock: None,
             focus: FocusState::default(),
             layout_viewport,
             layout_scale,
@@ -1622,6 +1818,10 @@ impl LiveSurface {
             range_grab: 0.0,
             range_paging: false,
             range_press_value: None,
+            catch_up: Vec::new(),
+            change_origin: None,
+            kept_typing: None,
+            radio_sent: HashMap::new(),
             last_sliders: Vec::new(),
             open_select: None,
             select_hover_row: None,
@@ -1643,7 +1843,7 @@ impl LiveSurface {
             scroll_press_active: false,
             last_bars: Vec::new(),
             gutters: BTreeMap::new(),
-            gutter_sheet_node: None,
+            gutter_sheet: None,
             gutter_followup: false,
         };
         // `doc.resolve` above built the editors: show opt-in grouping on load.
@@ -1671,8 +1871,10 @@ impl LiveSurface {
     fn resolve_doc(&mut self) -> u64 {
         self.prune_gutters();
         // #23: a pass that hands out a data: SVG gets one more resolve so
-        // the image is in this frame (counted, not a gutter pass).
-        let image_passes = resolve_with_data_images(&mut self.doc, &self.svg_provider);
+        // the image is in this frame (counted, not a gutter pass). Both
+        // passes go through the #116 radio baseline shifts.
+        let image_passes =
+            resolve_with_data_images(&mut self.doc, &self.svg_provider, &mut self.radio_shifts);
         self.resolve_count = self.resolve_count.saturating_add(image_passes);
         let mut passes = 1;
         // Gutters are sticky and only ever added, so this terminates; a
@@ -1681,7 +1883,7 @@ impl LiveSurface {
         // costs at most GUTTER_MAX_PASSES extra layouts per frame.
         const GUTTER_MAX_PASSES: u64 = 3;
         while passes <= GUTTER_MAX_PASSES && self.reserve_new_gutters() {
-            self.doc.resolve(0.0);
+            self.radio_shifts.resolve(&mut self.doc);
             self.resolve_count = self.resolve_count.saturating_add(1);
             passes += 1;
         }
@@ -1739,24 +1941,26 @@ impl LiveSurface {
         }
     }
 
-    /// (Re)install the engine-owned gutter stylesheet on a detached element.
+    /// (Re)install the engine-owned gutter stylesheet as the last
+    /// user-agent sheet (after the default, select and slider sheets).
+    ///
+    /// Issue #100: it used to sit on a detached `<style>` node through
+    /// `add_stylesheet_for_node`, which orders node sheets by `NodeId` and
+    /// inserts before the next higher id whatever its origin. After a swap
+    /// freed node slots, the gutter node could reuse a slot below a later
+    /// author `<style>`, and stylo panicked looking for that author sheet
+    /// among the user-agent sheets. User-agent sheets are kept in their own
+    /// ordered list, so this one is removed and appended instead.
     fn install_gutter_sheet(&mut self) {
-        let node = match self.gutter_sheet_node {
-            Some(n) => n,
-            None => {
-                let n = self
-                    .doc
-                    .mutate()
-                    .create_element(qual_name!("style"), vec![]);
-                self.gutter_sheet_node = Some(n);
-                n
-            }
-        };
-        let css = gutter_css(self.gutters.iter());
-        let sheet = self
-            .doc
-            .make_stylesheet(css, style::stylesheets::Origin::UserAgent);
-        self.doc.add_stylesheet_for_node(sheet, node);
+        if let Some(old) = self.gutter_sheet.take() {
+            self.doc.remove_user_agent_stylesheet(&old);
+        }
+        if self.gutters.is_empty() {
+            return;
+        }
+        let sheet = UserAgentStylesheet::parse(&gutter_css(self.gutters.iter()));
+        self.doc.add_user_agent_stylesheet(sheet.clone());
+        self.gutter_sheet = Some(sheet);
     }
 
     /// Issue #26, after every layout: restore offsets recorded across a swap
@@ -1951,6 +2155,8 @@ impl LiveSurface {
     ) -> Result<DirtySet, EngineError> {
         // Caret blink: only while a field is focused; unfocused pages stay idle.
         self.advance_caret_blink();
+        // Issue #81: a held ▲/▼ repeats its step while the host keeps syncing.
+        self.advance_spin_hold();
         // Always subscribe to `actions` for greying.
         let mut subscribed: HashSet<String> = HashSet::new();
         subscribed.insert("actions".into());
@@ -2114,6 +2320,11 @@ impl LiveSurface {
         // re-authored host `disabled` on the swapped-in markup is never
         // mistaken for a stale engine-owned grey.
         self.invalidate_rule_disabled_in(target_id);
+        // Graph review of #102: the markup `min`/`max`/`step` snapshot of an
+        // input this swap re-renders is retaken from its new markup, so a
+        // range under `InputLimits::at_least` follows a new markup `max` and
+        // removing the limits later restores the markup the game drew last.
+        self.invalidate_limits_markup_in(target_id);
 
         // Record old subtree ink from the last paint snapshot (no resolve here —
         // sync must not run style/layout). compute_plan merges these so old
@@ -2122,16 +2333,60 @@ impl LiveSurface {
         // Issue #26: an offset survives the swap when an element with the
         // same id does (restored + clamped at the next layout).
         self.record_scroll_offsets_in(target_id);
+        // Issue #68 (Graph review of #69): only a swap that replaces the
+        // focused field (or an ancestor) re-seeds its editor. Mark it before
+        // mutating, while the old node is still in the tree: NodeIds recycle,
+        // so `reconcile_text_edit` cannot tell a replacement from the id alone.
+        let replaces_focused = self.text_edit.as_ref().is_some_and(|s| {
+            let mut cur = Some(s.node_id);
+            while let Some(nid) = cur {
+                if nid == target_id {
+                    return swap == SwapMode::OuterHtml || nid != s.node_id;
+                }
+                cur = self.doc.get_node(nid).and_then(|n| n.parent);
+            }
+            false
+        });
+        if replaces_focused {
+            self.kept_typing = self.uncommitted_typing();
+            if let Some(s) = self.text_edit.as_mut() {
+                s.needs_prepare = true;
+            }
+        }
 
-        match swap {
+        let swapped_in: Vec<NodeId> = match swap {
             SwapMode::InnerHtml => {
                 let mut mutr = self.doc.mutate();
                 mutr.set_inner_html(target_id, html);
+                drop(mutr);
+                vec![target_id]
             }
             SwapMode::OuterHtml => {
+                // Like the `outerHTML` setter: the fragment's context is the
+                // target's parent, so a `<tr>` root parses under its
+                // `<tbody>` and a root inside `<svg>` stays foreign. Without
+                // an element parent, an HTML `<div>`.
+                let context = self
+                    .doc
+                    .get_node(target_id)
+                    .and_then(|n| n.parent)
+                    .and_then(|p| self.doc.get_node(p))
+                    .and_then(|p| p.element_data())
+                    .map(|e| e.name.clone())
+                    .filter(|q| !(q.ns == ns!(html) && q.local == local_name!("html")))
+                    .unwrap_or_else(|| qual_name!("div", html));
                 let wrapper_id = {
                     let mut mutr = self.doc.mutate();
-                    let wrapper_id = mutr.create_element(qual_name!("div"), vec![]);
+                    // The wrapper is the fragment parser's context element,
+                    // so it must be an HTML `<div>`. `qual_name!("div")`
+                    // alone has no namespace, and html5ever then parses the
+                    // fragment as foreign content: a root that is not a
+                    // "breakout" tag (`<form>`, `<button>`, `<section>`, ...)
+                    // and its children become namespace-less elements, so
+                    // `<input>` is not void (it swallows its siblings) and no
+                    // HTML user-agent style applies (#svc-tabs laid out 0 px
+                    // tall with 0x0 buttons, #104).
+                    let wrapper_id = mutr.create_element(context, vec![]);
                     mutr.set_inner_html(wrapper_id, html);
                     wrapper_id
                 };
@@ -2147,8 +2402,12 @@ impl LiveSurface {
                     mutr.replace_with_nodes(target_id, &children);
                 }
                 mutr.remove_and_drop_node(wrapper_id);
+                drop(mutr);
+                children
             }
-        }
+        };
+        // Issue #89: a redraw never overwrites a newer committed value.
+        self.restore_catch_up_values(&swapped_in);
 
         self.mark_dom_dirty();
         self.mark_paint_dirty();
@@ -2264,8 +2523,27 @@ impl LiveSurface {
             );
             return;
         }
-        self.form_baselines
-            .insert(form_id.to_string(), self.capture_form_current(form_id));
+        let mut baseline = self.capture_form_current(form_id);
+        // Issue #94 (Mainnet 5983ff17): a control with an unanswered commit
+        // keeps the game's last value as its baseline, never the put-back,
+        // so the form reads as changed until the game answers.
+        if !self.catch_up.is_empty() {
+            for (i, (nid, ..)) in capture_form_controls(&self.doc, form_id)
+                .into_iter()
+                .enumerate()
+            {
+                if let Some(e) = self
+                    .catch_up
+                    .iter()
+                    .find(|e| self.doc.get_element_by_id(&e.control_id) == Some(nid))
+                {
+                    if let Some(slot) = baseline.get_mut(i) {
+                        slot.1 = e.game.clone().unwrap_or_else(|| e.sent.clone());
+                    }
+                }
+            }
+        }
+        self.form_baselines.insert(form_id.to_string(), baseline);
     }
 
     /// `true` (clean, so the action greys) when `form_id`'s live values equal
@@ -2542,13 +2820,33 @@ impl LiveSurface {
 
         let mut any_changed = false;
         for (key, input_nid, limits) in resolved {
+            // Designer ruling (2026-10-22 12:45 America/Asuncion, #101): a
+            // range must have a real max. `at_least` (no max) on a range is
+            // refused: nothing is applied, the input keeps (or gets back) its
+            // markup `min`/`max`/`step`, and the refusal is logged with the
+            // element's id on each `input_limits()` refresh.
+            if limits.max.is_none() && self.doc.get_node(input_nid).is_some_and(is_range_input) {
+                if validate {
+                    let id = node_id_attr(&self.doc, input_nid).unwrap_or_default();
+                    eprintln!(
+                        "hx_native: refused InputLimits::at_least (no max) for range input                          id=`{id}` (action `{}`, input `{}`): a range must have a real max;                          it keeps its markup min/max/step",
+                        key.0, key.1
+                    );
+                }
+                if let Some(snap) = self.limits_markup.get(&key).cloned() {
+                    if self.restore_markup_onto(input_nid, Some(&snap)) {
+                        any_changed = true;
+                    }
+                }
+                continue;
+            }
             if !self.limits_markup.contains_key(&key) {
                 let snap = MarkupSnapshot {
                     min: node_attr(&self.doc, input_nid, "min"),
                     max: node_attr(&self.doc, input_nid, "max"),
                     step: node_attr(&self.doc, input_nid, "step"),
                 };
-                self.limits_markup.insert(key, snap);
+                self.limits_markup.insert(key.clone(), snap);
             }
             if self.write_limits_onto(input_nid, &limits) {
                 any_changed = true;
@@ -2565,8 +2863,9 @@ impl LiveSurface {
     /// key that `self.limits_cache` carried but `raw` no longer does (PR27
     /// round 2, non-blocking item): the slice stopped declaring limits for
     /// that input, so the engine's override must stop too. Restores the
-    /// markup snapshot taken the first time the engine wrote over it, or
-    /// clears the three attributes when there was nothing to restore.
+    /// markup snapshot taken the first time the engine wrote over it. With
+    /// no snapshot the engine never wrote over the current markup, so the
+    /// input is left as it is.
     fn remove_stale_limits(&mut self, raw: &[(String, String, InputLimits)]) {
         let new_keys: HashSet<(String, String)> =
             raw.iter().map(|(a, i, _)| (a.clone(), i.clone())).collect();
@@ -2581,11 +2880,17 @@ impl LiveSurface {
         }
         let mut any_changed = false;
         for key in removed {
-            let snap = self.limits_markup.remove(&key);
+            // Graph review of #102: no snapshot means the engine has not
+            // written over this input's current markup (a refused range, or
+            // a swap re-rendered it since), so there is nothing to undo, and
+            // clearing would wipe the markup `min`/`max`/`step`.
+            let Some(snap) = self.limits_markup.remove(&key) else {
+                continue;
+            };
             let (action, input_name) = key;
             for form_nid in self.forms_for_action(&action) {
                 for input_nid in self.range_or_number_inputs_named(form_nid, &input_name) {
-                    if self.restore_markup_onto(input_nid, snap.as_ref()) {
+                    if self.restore_markup_onto(input_nid, Some(&snap)) {
                         any_changed = true;
                     }
                 }
@@ -2690,9 +2995,15 @@ impl LiveSurface {
     /// clamp/snap its current value. Returns `true` when any attribute
     /// (including `value`) changed. Never fires `change` / `Action` — a
     /// clamp is a local value change only, never an edit the host sees.
+    ///
+    /// Issue #101: `limits.max: None` (`InputLimits::at_least`) writes no
+    /// `max` on a number box and clears one from markup (the slice wins),
+    /// so it clamps at `min` only. A range never gets here with no max
+    /// (`apply_limits_to_doc` refuses it, Designer ruling).
     fn write_limits_onto(&mut self, nid: NodeId, limits: &InputLimits) -> bool {
         let min_s = format_numeric(limits.min);
-        let max_s = format_numeric(limits.max);
+        let want_max: Option<String> = limits.max.map(format_numeric);
+        let clamp_max = limits.max;
         let step_s = limits
             .step
             .map(format_numeric)
@@ -2707,7 +3018,7 @@ impl LiveSurface {
         {
             let markup_disagrees = (cur_min.is_some()
                 && cur_min.as_deref() != Some(min_s.as_str()))
-                || (cur_max.is_some() && cur_max.as_deref() != Some(max_s.as_str()))
+                || (cur_max.is_some() && cur_max != want_max)
                 || (cur_step.is_some() && cur_step.as_deref() != Some(step_s.as_str()));
             if markup_disagrees {
                 eprintln!(
@@ -2724,8 +3035,11 @@ impl LiveSurface {
                 mutr.set_attribute(nid, qual_name!("min"), &min_s);
                 changed = true;
             }
-            if cur_max.as_deref() != Some(max_s.as_str()) {
-                mutr.set_attribute(nid, qual_name!("max"), &max_s);
+            if cur_max != want_max {
+                match &want_max {
+                    Some(v) => mutr.set_attribute(nid, qual_name!("max"), v),
+                    None => mutr.clear_attribute(nid, qual_name!("max")),
+                }
                 changed = true;
             }
             if cur_step.as_deref() != Some(step_s.as_str()) {
@@ -2736,7 +3050,7 @@ impl LiveSurface {
 
         let clamp_limits = NumericLimits {
             min: Some(limits.min),
-            max: Some(limits.max),
+            max: clamp_max,
             step: limits.step.unwrap_or(1.0),
             unconstrained: limits.step.is_none(),
         };
@@ -2894,6 +3208,35 @@ impl LiveSurface {
             .collect();
         for id in stale {
             self.rule_disabled.remove(&id);
+        }
+    }
+
+    /// Drop the `limits_markup` snapshot of every `(action, input)` whose
+    /// inputs all sit inside `target_id` (the swap replaces their markup).
+    /// A key with an input outside the swap keeps its snapshot: that input
+    /// still carries the engine's attributes, not markup.
+    fn invalidate_limits_markup_in(&mut self, target_id: NodeId) {
+        if self.limits_markup.is_empty() {
+            return;
+        }
+        let stale: Vec<(String, String)> = self
+            .limits_markup
+            .keys()
+            .filter(|(action, input)| {
+                let inputs: Vec<NodeId> = self
+                    .forms_for_action(action)
+                    .into_iter()
+                    .flat_map(|f| self.range_or_number_inputs_named(f, input))
+                    .collect();
+                !inputs.is_empty()
+                    && inputs
+                        .iter()
+                        .all(|&n| n == target_id || self.is_descendant(target_id, n))
+            })
+            .cloned()
+            .collect();
+        for key in stale {
+            self.limits_markup.remove(&key);
         }
     }
 
@@ -3067,12 +3410,43 @@ impl LiveSurface {
     }
 
     fn input(&mut self, ctx: &mut ActionCtx<'_>, ev: InputEvent) -> InputOutcome {
+        // Issue #88: every pointer event hit-tests the layout, so it first
+        // resolves the DOM as it stands. A `sync` may have swapped sections
+        // since the last paint; a release used to hit-test form controls
+        // against the pre-swap layout (a stale click, or a panic in blitz-dom
+        // when the pressed node was removed). The resolve carries its restyle
+        // damage to the next paint (`ensure_resolved`), and that paint diffs
+        // geometry against the last painted bounds, so partial repaint still
+        // equals full repaint.
+        if matches!(
+            ev,
+            InputEvent::PointerMove { .. }
+                | InputEvent::PointerDown { .. }
+                | InputEvent::PointerUp { .. }
+                | InputEvent::Wheel { .. }
+        ) {
+            self.ensure_resolved();
+        }
         match ev {
             InputEvent::Text(s) => self.on_text(s, false),
             InputEvent::Paste(s) => self.on_paste(s),
             InputEvent::Copy => self.on_copy(false),
             InputEvent::Cut => self.on_copy(true),
-            InputEvent::PointerLeave => self.on_pointer_leave(),
+            InputEvent::PointerLeave => {
+                // Graph review of #84: a host that loses the pointer (Mainnet
+                // drops a release outside the panel and sends PointerLeave)
+                // ends a held arrow like a release elsewhere (Q3): the repeat
+                // stops and the one `change` is queued, never a repeat that
+                // runs on with no release to stop it.
+                if self.press_is_spin_arrow() {
+                    let arrow = self.press.take().map(|p| p.id).unwrap_or_default();
+                    let out = self.release_spin_hold(ctx, &arrow);
+                    if !matches!(out, InputOutcome::None) {
+                        self.released_outcomes.push(out);
+                    }
+                }
+                self.on_pointer_leave()
+            }
             InputEvent::PointerMove { x, y, .. } => self.on_pointer_move(x, y),
             InputEvent::PointerDown { x, y, button, mods } => {
                 self.on_pointer_down(ctx, x, y, button, mods)
@@ -3088,12 +3462,18 @@ impl LiveSurface {
     /// Issue #26: wheel scrolls the innermost container under the pointer
     /// that can move that way. No chaining of a remainder to a parent.
     fn on_wheel(&mut self, pos: (f32, f32), delta: (f32, f32), unit: WheelUnit) -> InputOutcome {
-        self.ensure_resolved();
         let (x, y) = pos;
         if !delta.1.is_finite() || delta.1 == 0.0 {
             return InputOutcome::None;
         }
-        if self.open_select.is_some() {
+        if let Some(open) = self.open_select.clone() {
+            // Issue #121: a wheel over the open list scrolls the list (or is
+            // swallowed when everything fits) and never closes it. A wheel
+            // elsewhere closes the list, as before, then scrolls whatever is
+            // under the pointer.
+            if open.list_rect.contains(x, y) {
+                return self.wheel_open_list(delta.1, unit);
+            }
             self.close_select();
         }
         for nid in containers_at(&self.doc, x, y) {
@@ -3111,6 +3491,40 @@ impl LiveSurface {
             }
         }
         InputOutcome::None
+    }
+
+    /// Issue #121: a wheel over the open `<select>` list. Positive `dy`
+    /// scrolls up. Rows move whole: a `Line` is [`SCROLL_LINE_ROWS`] rows, a
+    /// `Page` is the visible rows less one, a `Pixel` is a row per
+    /// [`SELECT_ROW_H`] px with the fraction carried. The wheel is consumed
+    /// (`Scrolled`, so the host does not also scroll its own UI behind the
+    /// list) whether or not the list could move.
+    fn wheel_open_list(&mut self, dy: f32, unit: WheelUnit) -> InputOutcome {
+        let Some(open) = self.open_select.clone() else {
+            return InputOutcome::None;
+        };
+        let n = select_options(&self.doc, open.select_nid).len();
+        let visible = OpenSelect::visible_rows(n);
+        let rows = match unit {
+            WheelUnit::Pixel => -dy / SELECT_ROW_H,
+            WheelUnit::Line => -dy * SCROLL_LINE_ROWS,
+            WheelUnit::Page => -dy * visible.saturating_sub(1).max(1) as f32,
+        };
+        let moved = self
+            .open_select
+            .as_mut()
+            .is_some_and(|os| os.scroll_by(rows, n));
+        if moved {
+            // The rows under a still pointer changed: drop the stale hover so
+            // the next pointer move re-targets the highlight.
+            self.select_hover_row = None;
+            let rect = open.list_rect.as_device(self.layout_scale);
+            self.push_pending_damage(rect);
+            self.mark_paint_dirty();
+        }
+        InputOutcome::Scrolled {
+            id: open.select_id.clone(),
+        }
     }
 
     /// Issue #26: primary press on an engine-drawn scrollbar.
@@ -3268,7 +3682,6 @@ impl LiveSurface {
     /// when the hovered element actually changes, so a still pointer keeps the
     /// clean-frame skip.
     fn on_pointer_move(&mut self, x: f32, y: f32) -> InputOutcome {
-        self.ensure_resolved();
         if let Some(drag) = self.scroll_drag {
             return self.on_scroll_drag_move(drag, y);
         }
@@ -3328,8 +3741,13 @@ impl LiveSurface {
         button: PointerButton,
         mods: Modifiers,
     ) -> InputOutcome {
-        self.ensure_resolved();
         self.range_drag_released = None;
+        // Issue #85: any press ends a click run unless it continues it below.
+        // Arrow presses are not text clicks (Designer, HTML_CONTRACT §2
+        // Ruling 7, Mainnet 04c95f50): `try_spin_press` steps on every press
+        // and never records one, so a fast double-click on ▲ steps twice,
+        // and an arrow press never counts toward a double- or triple-click.
+        let prev_text_click = self.last_text_click.take();
 
         // Open select: press inside the list must not hit-test the element under
         // the overlay (focus + reconcile would close the list and steal the click).
@@ -3393,11 +3811,7 @@ impl LiveSurface {
                 self.blur_text_edit_queued(ctx);
                 self.doc.clear_focus();
                 self.focus.focused_id = None;
-                self.press = Some(PressState {
-                    id: eid.clone(),
-                    button,
-                    mods,
-                });
+                self.set_press(eid, button, mods);
                 self.reconcile_open_select_after_focus();
                 return InputOutcome::Press { id };
             }
@@ -3405,20 +3819,53 @@ impl LiveSurface {
             if editable {
                 let focus_out = self.focus_text_input(ctx, eid);
                 if let Some(nid) = self.doc.get_element_by_id(eid) {
-                    place_caret_at(&mut self.doc, nid, x, y);
+                    // Issue #85 (Designer, HTML_CONTRACT §2 Ruling 7): one
+                    // click places the caret (#68), a double-click selects
+                    // the word, and a triple-click or more selects the field.
+                    // A number box's text is one number, so its "word" is the
+                    // whole field: `.` and `,` don't split it.
+                    let count = if button == PointerButton::Primary {
+                        let now = self.press_clock();
+                        let count = prev_text_click
+                            .filter(|c| c.continues(eid, x, y, now))
+                            .map_or(1, |c| c.count.saturating_add(1));
+                        self.last_text_click = Some(TextClick {
+                            id: eid.clone(),
+                            x,
+                            y,
+                            at: now,
+                            count,
+                        });
+                        count
+                    } else {
+                        1
+                    };
+                    let is_number = self.doc.get_node(nid).is_some_and(is_number_input);
+                    match count {
+                        1 => place_caret_at(&mut self.doc, nid, x, y),
+                        2 if !is_number => select_word_at(&mut self.doc, nid, x, y),
+                        _ => select_all(&mut self.doc, nid),
+                    }
                     self.reset_caret_blink();
                     self.queue_text_field_damage(nid);
                 }
                 self.range_drag_id = None;
-                self.press = Some(PressState {
-                    id: eid.clone(),
-                    button,
-                    mods,
-                });
+                self.set_press(eid, button, mods);
                 // Same class as #18 HOLD #3: close an open select when focus
                 // moves to a text field (incl. Secondary / right-click).
                 self.reconcile_open_select_after_focus();
                 return focus_out.unwrap_or(InputOutcome::Press { id });
+            }
+
+            // Issue #81 (Designer rulings 1-2): a press on ▲/▼ steps the box
+            // at once and leaves the focus in the box, never on the arrow.
+            if button == PointerButton::Primary {
+                if let Some(out) = self.try_spin_press(ctx, eid) {
+                    self.range_drag_id = None;
+                    self.set_press(eid, button, mods);
+                    self.reconcile_open_select_after_focus();
+                    return out;
+                }
             }
 
             // Click outside a text field (or on another control): commit/blur edit.
@@ -3478,11 +3925,7 @@ impl LiveSurface {
         }
 
         if let Some(ref eid) = id {
-            self.press = Some(PressState {
-                id: eid.clone(),
-                button,
-                mods,
-            });
+            self.set_press(eid, button, mods);
             InputOutcome::Press { id }
         } else {
             self.press = None;
@@ -3504,6 +3947,12 @@ impl LiveSurface {
             self.end_scroll_press();
             self.press = None;
             return InputOutcome::None;
+        }
+        // Issue #81: the release of a ▲/▼ press, wherever it lands, ends the
+        // hold and sends its one `change`.
+        if button == PointerButton::Primary && self.press_is_spin_arrow() {
+            let arrow = self.press.take().map(|p| p.id).unwrap_or_default();
+            return self.release_spin_hold(ctx, &arrow);
         }
         // Range drag commit: clear drag, fire change once, suppress click.
         let mut suppress_click = false;
@@ -3530,7 +3979,7 @@ impl LiveSurface {
                 let opts = select_options(&self.doc, open.select_nid);
                 let n = opts.len();
                 if let Some(row) = list_row_at(open, x, y, n) {
-                    let pick = row.min(SELECT_MAX_ROWS - 1).min(n.saturating_sub(1));
+                    let pick = row.min(n.saturating_sub(1));
                     if !opts[pick].disabled && !control_is_disabled(&self.doc, open.select_nid) {
                         let changed = select_set_index(&mut self.doc, open.select_nid, pick);
                         self.close_select();
@@ -3594,11 +4043,7 @@ impl LiveSurface {
             return InputOutcome::Press { id: None };
         }
 
-        // Spin-box step arrows (data-hx-step): commit once per click via fire_change.
         if button == PointerButton::Primary {
-            if let Some(out) = self.try_spin_step(ctx, &press.id) {
-                return out;
-            }
             if let Some(out) = self.try_activate_control_at(ctx, x, y) {
                 return out;
             }
@@ -3739,11 +4184,15 @@ impl LiveSurface {
     }
 
     fn reconcile_text_edit(&mut self) {
+        // Issue #94: greying (markup, actions slice or a rule) drops a held
+        // change before the box being edited is reconciled.
+        self.drop_greyed_catch_up();
         let Some(session) = self.text_edit.clone() else {
             return;
         };
         let Some(nid) = self.doc.get_element_by_id(&session.id) else {
             self.text_edit = None;
+            self.kept_typing = None;
             if self.focus.focused_id.as_deref() == Some(session.id.as_str()) {
                 self.focus.focused_id = None;
             }
@@ -3755,11 +4204,45 @@ impl LiveSurface {
             .get_node(nid)
             .is_some_and(|n| is_editable_input(n) && !is_disabled(n));
         if !ok {
+            // Issue #81 (Designer ruling 3, HTML_CONTRACT §2): the box being
+            // edited was greyed in place. The typed text is dropped and the
+            // box shows the value the game last saw (the last `change`, or
+            // the value at focus), with no `change`; the blur below keeps the
+            // caret out. A replaced box keeps the value of its new markup.
+            if nid == session.node_id
+                && self
+                    .doc
+                    .get_node(nid)
+                    .is_some_and(|n| is_editable_input(n) && is_disabled(n))
+            {
+                let restored = session.value_at_change.clone();
+                let _ = crate::form_args::write_value_attr(&mut self.doc, nid, &restored);
+                crate::text_edit::set_editor_text(&mut self.doc, nid, &restored);
+                apply_unfocused_display(&mut self.doc, nid);
+                let _ = sync_outputs_for(&mut self.doc, &session.id);
+                self.mark_dom_dirty();
+                self.queue_text_field_damage(nid);
+                if self.spin_hold.as_ref().is_some_and(|h| h.target_nid == nid) {
+                    self.spin_hold = None;
+                }
+                if self.key_hold.as_ref().is_some_and(|k| *k == session.id) {
+                    self.key_hold = None;
+                }
+            }
+            // Ruling 6: a greyed box drops the text being typed too.
             self.text_edit = None;
+            self.kept_typing = None;
             if self.focus.focused_id.as_deref() == Some(session.id.as_str()) {
                 self.focus.focused_id = None;
             }
             self.doc.clear_focus();
+            return;
+        }
+        // Issue #68 (Graph review of #69): the same, unreplaced node (an
+        // unrelated swap, or greying attributes written on other controls)
+        // keeps its editor as it is: the Tab selection, the caret and the
+        // value at focus (Esc and the commit's `change` compare against it).
+        if nid == session.node_id && !session.needs_prepare {
             return;
         }
         // Same-id replacement: rebind node_id; defer prepare_focus_display until
@@ -3768,12 +4251,16 @@ impl LiveSurface {
         self.focus.focused_id = Some(session.id.clone());
         if let Some(s) = self.text_edit.as_mut() {
             s.node_id = nid;
+            s.value_at_change = value.clone();
             s.value_at_focus = value;
             s.caret_visible = true;
             s.last_blink = Instant::now();
             s.last_caret_rect = None;
             s.needs_prepare = true;
         }
+        // Issue #89: a box with a held or unanswered commit keeps the last
+        // value actually sent as its step base and restore value.
+        self.sync_session_sent();
         self.queue_text_field_damage(nid);
         self.mark_paint_dirty();
     }
@@ -3794,6 +4281,23 @@ impl LiveSurface {
             return;
         }
         prepare_focus_display(&mut self.doc, nid);
+        // Issue #89 (Mainnet 188feffd): text the player was typing survives
+        // the redraw; it stays uncommitted, as before the swap.
+        if let Some((kid, text)) = self.kept_typing.take() {
+            if kid == session.id {
+                let is_number = self.doc.get_node(nid).is_some_and(is_number_input);
+                let fallback = self
+                    .text_edit
+                    .as_ref()
+                    .map(|s| s.value_at_focus.clone())
+                    .unwrap_or_default();
+                set_editor_text(&mut self.doc, nid, &text);
+                let _ = sync_value_from_editor(&mut self.doc, nid, is_number, false, &fallback);
+                self.doc.with_text_input(nid, |mut driver| {
+                    driver.move_to_text_end();
+                });
+            }
+        }
         // Issue #35: the rebound node gains FOCUS here, after this frame's
         // resolve; restyle now so its `:focus` look (outline) is in this
         // frame instead of one frame late (partial == full on the swap frame).
@@ -3827,6 +4331,14 @@ impl LiveSurface {
         let disabled = control_is_disabled(&self.doc, open.select_nid);
         if !node_ok || !id_ok || disabled {
             self.close_select();
+            return;
+        }
+        // A swap may have changed the option list under the open select.
+        let n = select_options(&self.doc, open.select_nid).len();
+        if n == 0 {
+            self.close_select();
+        } else if let Some(os) = self.open_select.as_mut() {
+            os.clamp_to(n);
         }
     }
 
@@ -3845,28 +4357,722 @@ impl LiveSurface {
         }
     }
 
-    fn try_spin_step(&mut self, ctx: &mut ActionCtx<'_>, hit_id: &str) -> Option<InputOutcome> {
+    /// Issue #81 (Designer rulings 1-2, HTML_CONTRACT §2): a primary press
+    /// on a `data-hx-step` arrow. The target box takes the focus (another box
+    /// being edited commits, as on any focus move) with the caret at the end
+    /// and nothing selected, and steps once now, exactly as ArrowUp/ArrowDown
+    /// would (off-grid snaps to the grid in the arrow's direction, an on-grid
+    /// value moves one step, never past min/max). The step is not reported
+    /// yet: [`Self::advance_spin_hold`] repeats it while the press is held,
+    /// and the release sends one `change` ([`Self::release_spin_hold`]).
+    /// `None` when `hit_id` is not an arrow; an arrow of a disabled box is
+    /// pressed without stepping or moving the focus.
+    fn try_spin_press(&mut self, ctx: &mut ActionCtx<'_>, hit_id: &str) -> Option<InputOutcome> {
         let dir = step_direction(&self.doc, hit_id)?;
         let (target_nid, target_id) = resolve_step_target(&self.doc, hit_id)?;
-        // Disabled target ignores clicks.
+        self.spin_hold = None;
+        let pressed = InputOutcome::Press {
+            id: Some(hit_id.to_string()),
+        };
         if self.doc.get_node(target_nid).is_some_and(is_disabled) {
-            return Some(InputOutcome::None);
+            // A press beside an edited box still ends that edit.
+            self.blur_text_edit_queued(ctx);
+            return Some(pressed);
         }
-        let _ = step_and_regroup(&mut self.doc, target_nid, dir);
+        let out = match target_id.as_deref() {
+            Some(tid) => self.focus_text_input(ctx, tid).unwrap_or(pressed),
+            None => {
+                self.blur_text_edit_queued(ctx);
+                pressed
+            }
+        };
+        let reported = match self.text_edit.as_ref().filter(|s| s.node_id == target_nid) {
+            Some(s) => s.value_at_change.clone(),
+            None => target_id
+                .as_deref()
+                .and_then(|t| self.attr(t, "value"))
+                .unwrap_or_default(),
+        };
+        self.spin_step_target(target_nid, target_id.as_deref(), dir);
+        self.spin_hold = Some(SpinHold {
+            target_nid,
+            target_id,
+            dir,
+            pressed_at: self.press_clock(),
+            repeats: 0,
+            reported,
+            pinned: false,
+        });
+        Some(out)
+    }
+
+    /// One ▲/▼ step of `nid` (issue #81): the value moves (clamped), a focused
+    /// box keeps its raw text with the caret at the end and nothing selected,
+    /// and only the box's own damage is queued (partial repaint equals full).
+    fn spin_step_target(&mut self, nid: NodeId, id: Option<&str>, dir: i32) -> bool {
+        let fallback = self.sent_value_of(nid);
+        let changed = step_and_regroup(&mut self.doc, nid, dir, fallback.as_deref());
+        if self.text_edit.as_ref().is_some_and(|s| s.node_id == nid) {
+            prepare_focus_display(&mut self.doc, nid);
+            self.reset_caret_blink();
+        }
+        if let Some(id) = id {
+            let _ = sync_outputs_for(&mut self.doc, id);
+        }
         self.mark_dom_dirty();
-        self.queue_text_field_damage(target_nid);
-        if let Some(ref tid) = target_id {
-            return Some(self.fire_change(ctx, tid));
+        self.queue_text_field_damage(nid);
+        changed
+    }
+
+    /// The one clock for press timing: the arrow hold (#81) and the click
+    /// count (#85). The wall clock, unless a test froze it.
+    fn press_clock(&self) -> Instant {
+        self.test_clock.unwrap_or_else(Instant::now)
+    }
+
+    /// Record the pointer press on `id` (the one place a press is built).
+    fn set_press(&mut self, id: &str, button: PointerButton, mods: Modifiers) {
+        self.press = Some(PressState {
+            id: id.to_string(),
+            button,
+            mods,
+        });
+    }
+
+    /// The last value sent for `nid` while it is the box being edited (the
+    /// last `change`, or the value at focus): what an arrow on an empty or
+    /// unparsable box steps from (issue #92, Ruling 5, Mainnet cea8a42a).
+    fn sent_value_of(&self, nid: NodeId) -> Option<String> {
+        self.text_edit
+            .as_ref()
+            .filter(|s| s.node_id == nid)
+            .map(|s| s.value_at_change.clone())
+    }
+
+    /// Issue #89 (Designer, HTML_CONTRACT `hx-sync`, Mainnet master
+    /// 188feffd): hold back the `change` value control `ctrl_id` committed
+    /// while `source_id`'s request is pending. It is not marked as sent: the
+    /// box keeps the last value actually sent as its step base and restore
+    /// value, and [`Self::run_catch_up`] sends the newest committed value once
+    /// the request finishes. `false` for a control a request cannot carry
+    /// (no name, or no pair in the pending request), which keeps `hx-sync`.
+    fn hold_change(&mut self, source_id: &str, ctrl_id: &str) -> bool {
+        let Some(nid) = self.doc.get_element_by_id(ctrl_id) else {
+            return false;
+        };
+        let Some(node) = self.doc.get_node(nid) else {
+            return false;
+        };
+        let Some(committed) = control_current_value(&self.doc, node) else {
+            return false;
+        };
+        if let Some(e) = self.catch_up.iter_mut().find(|e| e.control_id == ctrl_id) {
+            e.source_id = source_id.to_string();
+            e.committed = committed;
+            e.held = true;
+        } else {
+            let Some(sent) = self
+                .pending
+                .by_source
+                .get(source_id)
+                .and_then(|p| control_value_in_args(node, &p.args))
+            else {
+                return false;
+            };
+            self.catch_up.push(CatchUp {
+                control_id: ctrl_id.to_string(),
+                source_id: source_id.to_string(),
+                sent,
+                committed,
+                game: None,
+                game_radio: None,
+                held: true,
+            });
         }
-        Some(InputOutcome::Clicked {
-            id: hit_id.to_string(),
+        // A radio's commit unticks its group; re-read the other controls
+        // (not the box being typed in, nor a slider being dragged).
+        let skip: Vec<String> = [
+            Some(ctrl_id.to_string()),
+            self.text_edit.as_ref().map(|s| s.id.clone()),
+            self.range_drag_id.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        for i in 0..self.catch_up.len() {
+            if skip.contains(&self.catch_up[i].control_id) {
+                continue;
+            }
+            let now = self
+                .doc
+                .get_element_by_id(&self.catch_up[i].control_id)
+                .and_then(|n| self.doc.get_node(n))
+                .and_then(|n| control_current_value(&self.doc, n));
+            if let Some(now) = now {
+                self.catch_up[i].committed = now;
+            }
+        }
+        self.sync_session_sent();
+        true
+    }
+
+    /// Issue #89: the player committed `value` in box `id` (an arrow step,
+    /// Enter, blur, a key release), sent or not.
+    fn note_committed(&mut self, id: &str, value: &str) {
+        if let Some(e) = self.catch_up.iter_mut().find(|e| e.control_id == id) {
+            e.committed = value.to_string();
+        }
+        self.sync_session_sent();
+    }
+
+    /// Issue #89 (point 3 of Graph's review): the box being edited steps from
+    /// and restores the last value actually sent, never a held one.
+    fn sync_session_sent(&mut self) {
+        let Some(s) = self.text_edit.as_mut() else {
+            return;
+        };
+        if let Some(e) = self.catch_up.iter().find(|e| e.control_id == s.id) {
+            s.value_at_change = e.sent.clone();
+        }
+    }
+
+    /// Issue #89: `a` and `b` are the same value of control `id` (by number
+    /// in a number box, #87).
+    fn same_control_value(&self, id: &str, a: &str, b: &str) -> bool {
+        if a == b {
+            return true;
+        }
+        let is_number = self
+            .doc
+            .get_element_by_id(id)
+            .and_then(|n| self.doc.get_node(n))
+            .is_some_and(is_number_input);
+        is_number && parse_f64(a).is_some() && parse_f64(b).is_some() && number_is_sent(a, b)
+    }
+
+    /// Issue #89 (Mainnet 188feffd): `source_id`'s request finished (done,
+    /// failed or timed out). An entry with nothing new committed is answered
+    /// and dropped. A held commit equal to the value sent needs nothing; any
+    /// other sends one `change` with the newest committed values, so fast
+    /// presses fold into it and the game ends on the box's value. Only a
+    /// player's commit holds a change, so the game's own redraw (a clamp or
+    /// a refusal) never starts another send.
+    fn run_catch_up(&mut self, ctx: &mut ActionCtx<'_>, source_id: &str) {
+        if self.pending.is_pending(source_id) {
+            return;
+        }
+        let entries = std::mem::take(&mut self.catch_up);
+        let mut kept = Vec::with_capacity(entries.len());
+        for e in entries {
+            if e.source_id == source_id
+                && (!e.held || {
+                    let sent = self.effective_sent(&e.control_id, &e.sent);
+                    self.same_control_value(&e.control_id, &e.committed, &sent)
+                })
+            {
+                continue;
+            }
+            kept.push(e);
+        }
+        self.catch_up = kept;
+        if !self.catch_up.iter().any(|e| e.source_id == source_id) {
+            self.sync_session_sent();
+            return;
+        }
+        let action = self
+            .bindings
+            .get(source_id)
+            .and_then(|b| b.hx_post.clone().map(|name| (name, b.hx_indicator.clone())));
+        let Some((action_name, indicator)) = action else {
+            self.catch_up.retain(|e| e.source_id != source_id);
+            return;
+        };
+        if self.disabled_actions.contains_key(&action_name) {
+            // Issue #94: a greyed control drops its held change.
+            self.drop_greyed_catch_up();
+            return;
+        }
+        let mut args = self.action_args_for(source_id);
+        for e in self.catch_up.iter().filter(|e| e.source_id == source_id) {
+            // The box being typed in posts its committed value, not the
+            // text in progress.
+            if let Some(node) = self
+                .doc
+                .get_element_by_id(&e.control_id)
+                .and_then(|n| self.doc.get_node(n))
+                .filter(|n| is_editable_input(n) || is_numeric_input(n))
+            {
+                patch_control_arg(node, &mut args, &e.committed);
+            }
+        }
+        let out = self.emit_action(
+            ctx,
+            source_id,
+            &action_name,
+            args,
+            TriggerInfo::Change,
+            indicator,
+        );
+        for e in self
+            .catch_up
+            .iter_mut()
+            .filter(|e| e.source_id == source_id)
+        {
+            e.held = false;
+            e.sent = e.committed.clone();
+        }
+        self.sync_session_sent();
+        self.released_outcomes.push(out);
+    }
+
+    /// Issue #89 (Mainnet 188feffd): a redraw (the answer to an older
+    /// request) never overwrites a value the player committed after it: each
+    /// control with a held or unanswered commit gets that value back. A
+    /// control the redraw removed is dropped from the catch-up. Runs inside
+    /// the swap, whose subtree is already damaged.
+    ///
+    /// Only a control inside the swapped-in nodes (`swapped_in`) was drawn
+    /// by this redraw (Graph review of #98): a redraw of another section (a
+    /// HUD on `time` redraws every tick) leaves the control, its put-back and
+    /// the game's value (`game`) as they are.
+    fn restore_catch_up_values(&mut self, swapped_in: &[NodeId]) {
+        let entries = std::mem::take(&mut self.catch_up);
+        let mut kept = Vec::with_capacity(entries.len());
+        for e in entries {
+            let Some(nid) = self.doc.get_element_by_id(&e.control_id) else {
+                continue;
+            };
+            if !self.is_inside_any(nid, swapped_in) {
+                kept.push(e);
+                continue;
+            }
+            let Some(node) = self.doc.get_node(nid) else {
+                continue;
+            };
+            let Some(now) = control_current_value(&self.doc, node) else {
+                continue;
+            };
+            let mut e = e;
+            if value_control_kind(node) == "radio" {
+                // The radio of the group the game drew ticked ("" for none),
+                // read before the put-back changes the group.
+                let name = attr_of(node, "name").unwrap_or_default();
+                e.game_radio = Some(
+                    radios_in_group(&self.doc, &name)
+                        .into_iter()
+                        .filter_map(|r| self.doc.get_node(r))
+                        .find(|r| control_current_value(&self.doc, r).as_deref() == Some("true"))
+                        .map(|r| attr_of(r, "value").unwrap_or_else(|| "on".to_string()))
+                        .unwrap_or_default(),
+                );
+            }
+            e.game = Some(now.clone());
+            if now != e.committed {
+                self.put_control_value(nid, &e.control_id, &e.committed);
+            }
+            kept.push(e);
+        }
+        self.catch_up = kept;
+    }
+
+    /// `nid` is one of `roots` or inside one of them.
+    fn is_inside_any(&self, nid: NodeId, roots: &[NodeId]) -> bool {
+        let mut cur = Some(nid);
+        while let Some(n) = cur {
+            if roots.contains(&n) {
+                return true;
+            }
+            cur = self.doc.get_node(n).and_then(|node| node.parent);
+        }
+        false
+    }
+
+    /// Issue #89: write `value` (in `control_current_value`'s encoding) into
+    /// control `nid` (`id`): the selected option, the tick, the checked
+    /// radio, or the `value` attribute.
+    fn put_control_value(&mut self, nid: NodeId, id: &str, value: &str) {
+        let Some(node) = self.doc.get_node(nid) else {
+            return;
+        };
+        match value_control_kind(node) {
+            "select" => {
+                if let Some(i) = select_options(&self.doc, nid)
+                    .iter()
+                    .position(|o| o.value == value)
+                {
+                    select_set_index(&mut self.doc, nid, i);
+                }
+            }
+            "checkbox" => {
+                // Write the state and the `checked` attribute: a box a swap
+                // just inserted has no checked state yet (Blitz creates it
+                // from the attribute at layout), so a toggle alone is lost.
+                // A greyed box is written too (drop to the game's value).
+                self.put_checked(nid, value == "true");
+            }
+            "radio" => {
+                if value == "true" {
+                    let name = attr_of(node, "name").unwrap_or_default();
+                    for other in radios_in_group(&self.doc, &name) {
+                        if other != nid {
+                            self.put_checked(other, false);
+                        }
+                    }
+                    self.put_checked(nid, true);
+                }
+            }
+            _ => {
+                let _ = write_value_attr(&mut self.doc, nid, value);
+            }
+        }
+        let _ = sync_outputs_for(&mut self.doc, id);
+        self.mark_dom_dirty();
+    }
+
+    /// Issue #94 (Graph review): set checkbox or radio `nid` checked or not,
+    /// in its live state when it has one and in its `checked` attribute, so
+    /// a node a swap just inserted (no live state until layout) keeps it.
+    fn put_checked(&mut self, nid: NodeId, checked: bool) {
+        let has_attr = self
+            .doc
+            .get_node(nid)
+            .is_some_and(|n| attr_of(n, "checked").is_some());
+        let live = self
+            .doc
+            .get_node(nid)
+            .and_then(|n| n.element_data())
+            .and_then(|el| el.checkbox_input_checked());
+        if has_attr == checked && live.is_none_or(|l| l == checked) {
+            return;
+        }
+        self.doc.snapshot_node_state_only(nid);
+        if has_attr != checked {
+            let mut mutr = self.doc.mutate();
+            if checked {
+                mutr.set_attribute(nid, qual_name!("checked"), "");
+            } else {
+                mutr.clear_attribute(nid, qual_name!("checked"));
+            }
+        }
+        if let Some(node) = self.doc.get_node_mut(nid) {
+            if let Some(el) = node.element_data_mut() {
+                if el.checkbox_input_checked().is_some() {
+                    el.set_checkbox_input_checked(checked);
+                }
+            }
+            node.mark_ancestors_dirty();
+        }
+    }
+
+    /// Issue #94 (Graph review): what radio `id` carried in the last request
+    /// any radio of its group sent, in `control_current_value`'s encoding;
+    /// `fallback` for any other control or a group nothing has sent for.
+    fn effective_sent(&self, id: &str, fallback: &str) -> String {
+        let Some(node) = self
+            .doc
+            .get_element_by_id(id)
+            .and_then(|n| self.doc.get_node(n))
+        else {
+            return fallback.to_string();
+        };
+        if value_control_kind(node) != "radio" {
+            return fallback.to_string();
+        }
+        let name = attr_of(node, "name").unwrap_or_default();
+        match self.radio_sent.get(&name) {
+            Some(v) => {
+                let mine = attr_of(node, "value").unwrap_or_else(|| "on".to_string());
+                (*v == mine).to_string()
+            }
+            None => fallback.to_string(),
+        }
+    }
+
+    /// Issue #94 (Designer, HTML_CONTRACT `hx-sync`, Mainnet master
+    /// 5983ff17): when the game greys a control (its markup, an `actions`
+    /// state or an input rule) while it holds a change, the held change is
+    /// dropped, as Ruling 6 drops typed text, and the control shows the
+    /// game's value: the value a redraw drew, else the last value sent.
+    fn drop_greyed_catch_up(&mut self) {
+        if self.catch_up.is_empty() {
+            return;
+        }
+        let entries = std::mem::take(&mut self.catch_up);
+        let mut kept = Vec::with_capacity(entries.len());
+        for e in entries {
+            let Some(nid) = self.doc.get_element_by_id(&e.control_id) else {
+                continue;
+            };
+            let action_greyed = self
+                .bindings
+                .get(&e.source_id)
+                .and_then(|b| b.hx_post.as_ref())
+                .is_some_and(|a| self.disabled_actions.contains_key(a));
+            if !(action_greyed || control_is_disabled(&self.doc, nid)) {
+                kept.push(e);
+                continue;
+            }
+            let game = e
+                .game
+                .clone()
+                .unwrap_or_else(|| self.effective_sent(&e.control_id, &e.sent));
+            if game == "false"
+                && self
+                    .doc
+                    .get_node(nid)
+                    .is_some_and(|n| value_control_kind(n) == "radio")
+            {
+                // A held radio pick: the group shows the radio the game drew
+                // or, with no redraw, the one the group last sent (Graph
+                // review of #98). Writing "false" to the held radio alone
+                // leaves it ticked.
+                self.put_radio_game(nid, e.game.as_ref().and(e.game_radio.as_deref()));
+                self.mark_paint_dirty();
+                continue;
+            }
+            // Issue #96: the box being edited greys in place next, and
+            // Ruling 6 (`reconcile_text_edit`) writes the session's
+            // `value_at_change` back. After a redraw that is the game's drawn
+            // value, not the last value sent, so the session takes it too.
+            if let Some(s) = self.text_edit.as_mut().filter(|s| s.node_id == nid) {
+                s.value_at_change = game.clone();
+                s.value_at_focus = game.clone();
+            }
+            let shown = self
+                .doc
+                .get_node(nid)
+                .and_then(|n| control_current_value(&self.doc, n));
+            if shown.as_deref() != Some(game.as_str()) {
+                self.put_control_value(nid, &e.control_id, &game);
+                if self.text_edit.as_ref().is_some_and(|s| s.node_id == nid) {
+                    set_editor_text(&mut self.doc, nid, &game);
+                }
+                apply_unfocused_display(&mut self.doc, nid);
+                self.queue_text_field_damage(nid);
+                self.mark_paint_dirty();
+            }
+        }
+        self.catch_up = kept;
+    }
+
+    /// Graph review of #98: tick the radio of `nid`'s group that the game
+    /// has, the one it drew (`drawn`, "" for none) or else the one the group
+    /// last sent, and untick `nid` when the game has none ticked.
+    fn put_radio_game(&mut self, nid: NodeId, drawn: Option<&str>) {
+        let Some(node) = self.doc.get_node(nid) else {
+            return;
+        };
+        let name = attr_of(node, "name").unwrap_or_default();
+        let want = drawn
+            .map(str::to_string)
+            .or_else(|| self.radio_sent.get(&name).cloned());
+        let target = want.and_then(|v| {
+            radios_in_group(&self.doc, &name).into_iter().find(|&r| {
+                self.doc
+                    .get_node(r)
+                    .is_some_and(|n| attr_of(n, "value").unwrap_or_else(|| "on".to_string()) == v)
+            })
+        });
+        match target {
+            Some(r) => {
+                let id = self.element_id_of(r).unwrap_or_default();
+                self.put_control_value(r, &id, "true");
+            }
+            None => {
+                self.put_checked(nid, false);
+                self.mark_dom_dirty();
+            }
+        }
+    }
+
+    /// Issue #89: the text being typed in the box being edited, when it is
+    /// not the committed value (Ruling 6 still drops it if the box greys).
+    /// A held arrow or key's steps are not typing: the replacement clears
+    /// the repeat and shows the game's value (#84).
+    fn uncommitted_typing(&mut self) -> Option<(String, String)> {
+        let s = self.text_edit.clone()?;
+        if self
+            .spin_hold
+            .as_ref()
+            .is_some_and(|h| h.target_nid == s.node_id)
+            || self.key_hold.as_deref() == Some(s.id.as_str())
+        {
+            return None;
+        }
+        let text = editor_text(&mut self.doc, s.node_id)?;
+        let is_number = self.doc.get_node(s.node_id).is_some_and(is_number_input);
+        let same = text == s.value_at_focus
+            || (is_number
+                && parse_f64(&text).is_some()
+                && parse_f64(&s.value_at_focus).is_some()
+                && number_is_sent(&text, &s.value_at_focus));
+        (!same).then_some((s.id, text))
+    }
+
+    /// True while the primary press started on a `data-hx-step` arrow.
+    fn press_is_spin_arrow(&self) -> bool {
+        self.press.as_ref().is_some_and(|p| {
+            p.button == PointerButton::Primary && step_direction(&self.doc, &p.id).is_some()
         })
+    }
+
+    /// Issue #81 (Designer ruling 2): the repeat steps a held ▲/▼ owes by now.
+    /// Called from `sync`; stops on its own once the box is gone or greyed.
+    fn advance_spin_hold(&mut self) {
+        self.advance_spin_hold_by(None);
+    }
+
+    /// [`Self::advance_spin_hold`] with the time held given (tests) or read
+    /// from the press time (`None`). A box that lost the focus since the
+    /// press (Tab, a host focus move, a click that blurred it) stops
+    /// repeating: its blur already reported the value (Graph review of #84).
+    fn advance_spin_hold_by(&mut self, held: Option<std::time::Duration>) {
+        let Some(hold) = self.spin_hold.clone() else {
+            return;
+        };
+        let live = self
+            .doc
+            .get_node(hold.target_nid)
+            .is_some_and(|n| is_number_input(n) && !is_disabled(n));
+        let lost_focus = hold.target_id.is_some()
+            && self.focus.focused_id.as_deref() != hold.target_id.as_deref();
+        // No arrow press any more (a path that cleared `press` without the
+        // release): nothing can end this hold, so end it now.
+        if !live || lost_focus || !self.press_is_spin_arrow() {
+            self.spin_hold = None;
+            return;
+        }
+        // Pinned at min or max: further steps move nothing, so do not mark
+        // the box dirty (and reset its caret blink) every 100 ms for nothing.
+        if hold.pinned {
+            return;
+        }
+        let due = spin_repeats_due(held.unwrap_or_else(|| {
+            self.press_clock()
+                .saturating_duration_since(hold.pressed_at)
+        }));
+        let mut done = hold.repeats;
+        let mut pinned = false;
+        while done < due {
+            done += 1;
+            if !self.spin_step_target(hold.target_nid, hold.target_id.as_deref(), hold.dir) {
+                // Held at min or max: the remaining steps would not move it.
+                done = due;
+                pinned = true;
+            }
+        }
+        if let Some(h) = self.spin_hold.as_mut() {
+            h.repeats = done;
+            h.pinned = pinned;
+        }
+    }
+
+    /// Issue #81: the release of a ▲/▼ press. The box keeps the focus and the
+    /// stepped value, which becomes the committed value (Esc and a refused
+    /// comma come back to it), and one `change` reports it. A press or hold
+    /// that ends on the last value sent to the game sends no `change`
+    /// (Designer, HTML_CONTRACT §2 Ruling 5: no preview refresh for nothing).
+    /// A box greyed during the hold sends nothing; a box without an `id`
+    /// reports the arrow's click instead, as before.
+    fn release_spin_hold(&mut self, ctx: &mut ActionCtx<'_>, arrow: &str) -> InputOutcome {
+        let Some(hold) = self.spin_hold.take() else {
+            return InputOutcome::None;
+        };
+        if self
+            .doc
+            .get_node(hold.target_nid)
+            .is_none_or(|n| !is_number_input(n) || is_disabled(n))
+        {
+            return InputOutcome::None;
+        }
+        let Some(tid) = hold.target_id else {
+            return InputOutcome::Clicked {
+                id: arrow.to_string(),
+            };
+        };
+        // The box being edited commits as Enter would (canonical text, held
+        // inside min/max: a typed `12` above max 10 stepped ▲ commits `10`,
+        // as ArrowUp then Enter does) and stays focused, caret at the end.
+        if let Some(session) = self
+            .text_edit
+            .clone()
+            .filter(|s| s.node_id == hold.target_nid)
+        {
+            let _ = commit_field(&mut self.doc, hold.target_nid, &session.value_at_change);
+            prepare_focus_display(&mut self.doc, hold.target_nid);
+            self.reset_caret_blink();
+            let _ = sync_outputs_for(&mut self.doc, &tid);
+            self.mark_dom_dirty();
+            self.queue_text_field_damage(hold.target_nid);
+        }
+        // Ruling 5 (b6f2c892): the box's value against the last value sent.
+        let now = self.attr(&tid, "value").unwrap_or_default();
+        let already_sent = self.is_sent_value(hold.target_nid, &now, &hold.reported);
+        self.mark_committed(hold.target_nid, &tid);
+        if already_sent {
+            return InputOutcome::None;
+        }
+        self.fire_change(ctx, &tid)
+    }
+
+    /// Issue #81 (Designer, HTML_CONTRACT §2 Ruling 5, Mainnet b6f2c892):
+    /// the box being edited ends an arrow interaction on the last value sent
+    /// to the game, so its `change` would report nothing new (no preview
+    /// refresh). The test is the box's value against that sent value, never
+    /// the typed text: typed `3` stepped ▼ to the sent `2` sends nothing, as
+    /// does ▲ at max or ▼ at min.
+    fn at_sent_value(&self, nid: NodeId, id: &str) -> bool {
+        self.text_edit.as_ref().is_some_and(|s| {
+            s.node_id == nid
+                && self.is_sent_value(
+                    nid,
+                    &self.attr(id, "value").unwrap_or_default(),
+                    &s.value_at_change,
+                )
+        })
+    }
+
+    /// Issue #87 (Designer, HTML_CONTRACT §2 Ruling 5, Mainnet master
+    /// 04c95f50): whether `now` is the last value `sent` for `nid`. A number
+    /// box compares by number ([`number_is_sent`]): `4.1` is a sent `4.10`,
+    /// and text that does not parse sends nothing. Other boxes compare text.
+    fn is_sent_value(&self, nid: NodeId, now: &str, sent: &str) -> bool {
+        if self.doc.get_node(nid).is_some_and(is_number_input) {
+            number_is_sent(now, sent)
+        } else {
+            now == sent
+        }
+    }
+
+    /// Record `id`'s value as committed for the box being edited (issue #81):
+    /// a `change` reported it, so Esc, a refused comma and the next commit's
+    /// comparison all start from it.
+    fn mark_committed(&mut self, nid: NodeId, id: &str) {
+        let value = self.attr(id, "value").unwrap_or_default();
+        if let Some(s) = self.text_edit.as_mut().filter(|s| s.node_id == nid) {
+            s.value_at_change = value.clone();
+            s.value_at_focus = value.clone();
+        }
+        self.note_committed(id, &value);
     }
 
     fn focus_text_input(&mut self, ctx: &mut ActionCtx<'_>, id: &str) -> Option<InputOutcome> {
         let nid = self.doc.get_element_by_id(id)?;
         let node = self.doc.get_node(nid)?;
         if !is_editable_input(node) || is_disabled(node) {
+            return None;
+        }
+        // Graph review of #72: a click into the box already being edited
+        // only moves the caret. Re-seeding here put the typed text through
+        // the focus display (`7` became `7.00`) and reset `value_at_focus`
+        // and `value_at_change` to the typed value, so the Enter or blur
+        // that followed fired no `change` and Esc no longer reverted.
+        if self
+            .text_edit
+            .as_ref()
+            .is_some_and(|s| s.id == id && s.node_id == nid)
+        {
+            self.ensure_text_edit_prepared();
             return None;
         }
         // Commit previous field if switching.
@@ -3880,6 +5086,7 @@ impl LiveSurface {
         self.text_edit = Some(TextEditSession {
             id: id.to_string(),
             node_id: nid,
+            value_at_change: value_at_focus.clone(),
             value_at_focus,
             caret_visible: true,
             last_blink: Instant::now(),
@@ -3915,7 +5122,9 @@ impl LiveSurface {
     }
 
     /// Commit the focused text/number field. If `clear_focus`, also clear focus.
-    /// Fires `change` only when the committed value differs from `value_at_focus`.
+    /// Fires `change` only when the committed value differs from
+    /// `value_at_change` (the focus-time value, or the value the last arrow
+    /// step's `change` already reported).
     fn commit_text_edit(
         &mut self,
         ctx: &mut ActionCtx<'_>,
@@ -3923,11 +5132,19 @@ impl LiveSurface {
     ) -> Option<InputOutcome> {
         self.ensure_text_edit_prepared();
         let session = self.text_edit.take()?;
-        let _ = commit_field(&mut self.doc, session.node_id, &session.value_at_focus);
+        // Issue #81: this commit reports any key-repeat steps, so the key
+        // release that may follow has nothing left to send.
+        if self.key_hold.as_ref().is_some_and(|k| *k == session.id) {
+            self.key_hold = None;
+        }
+        // The fallback for text that is no number is the last value sent
+        // (Ruling 5, Mainnet 98ac51a9; issue #90).
+        let _ = commit_field(&mut self.doc, session.node_id, &session.value_at_change);
         self.mark_dom_dirty();
         self.queue_text_field_damage(session.node_id);
         let value_now = self.attr(&session.id, "value").unwrap_or_default();
-        let change = if value_now != session.value_at_focus {
+        self.note_committed(&session.id, &value_now);
+        let change = if !self.is_sent_value(session.node_id, &value_now, &session.value_at_change) {
             self.fire_change(ctx, &session.id)
         } else {
             InputOutcome::None
@@ -3945,6 +5162,7 @@ impl LiveSurface {
             self.text_edit = Some(TextEditSession {
                 id: session.id.clone(),
                 node_id: session.node_id,
+                value_at_change: value_now.clone(),
                 value_at_focus: value_now,
                 caret_visible: true,
                 last_blink: Instant::now(),
@@ -3952,15 +5170,38 @@ impl LiveSurface {
                 needs_prepare: false,
             });
             self.reset_caret_blink();
+            // Issue #89: a held commit is not the value sent.
+            self.sync_session_sent();
         }
         Some(change)
+    }
+
+    /// Issue #81: the key release after ArrowUp/ArrowDown steps that sent no
+    /// `change` yet (key repeat, or every keydown under
+    /// `EngineConfig::key_releases`). One `change` unless the box ends on the
+    /// last value sent (Ruling 5); a blur or Enter before
+    /// the release reports it instead and clears the hold.
+    fn release_key_hold(&mut self, ctx: &mut ActionCtx<'_>) -> Option<InputOutcome> {
+        let fid = self.key_hold.take()?;
+        let session = self.text_edit.clone().filter(|s| s.id == fid)?;
+        if self.element_is_disabled_id(&fid) {
+            return Some(InputOutcome::None);
+        }
+        // Ruling 5: the box ends on the last value sent.
+        if self.at_sent_value(session.node_id, &fid) {
+            let value = self.attr(&fid, "value").unwrap_or_default();
+            self.note_committed(&fid, &value);
+            return Some(InputOutcome::None);
+        }
+        self.mark_committed(session.node_id, &fid);
+        Some(self.fire_change(ctx, &fid))
     }
 
     fn hold_focused_number_to_commit(&mut self) {
         let Some((nid, fallback)) = self
             .text_edit
             .as_ref()
-            .map(|s| (s.node_id, s.value_at_focus.clone()))
+            .map(|s| (s.node_id, s.value_at_change.clone()))
         else {
             return;
         };
@@ -4250,7 +5491,8 @@ impl LiveSurface {
     /// Single commit path for `hx-trigger="change"` (range release, toggle,
     /// select pick, arrow/spin step, typed Enter/blur).
     fn fire_change(&mut self, ctx: &mut ActionCtx<'_>, node_id: &str) -> InputOutcome {
-        self.fire_on(
+        let outer = self.change_origin.replace(node_id.to_string());
+        let out = self.fire_on(
             ctx,
             node_id,
             TriggerEvent::Change,
@@ -4262,7 +5504,9 @@ impl LiveSurface {
             TriggerInfo::Change,
             None,
             false,
-        )
+        );
+        self.change_origin = outer;
+        out
     }
 
     fn element_is_disabled_id(&self, id: &str) -> bool {
@@ -4376,6 +5620,16 @@ impl LiveSurface {
 
         // Pending / hx-sync.
         if self.pending.is_pending(source_id) {
+            // Issue #89 (Mainnet 188feffd): `drop` and `queue` are for
+            // clicks and actions; a value control's `change` is held and
+            // caught up when the pending request finishes.
+            if event == TriggerEvent::Change {
+                if let Some(ctrl) = self.change_origin.clone() {
+                    if self.hold_change(source_id, &ctrl) {
+                        return InputOutcome::None;
+                    }
+                }
+            }
             match binding.hx_sync {
                 SyncMode::Drop => {
                     return InputOutcome::None;
@@ -4447,6 +5701,7 @@ impl LiveSurface {
         &mut self,
         ctx: &mut ActionCtx<'_>,
         key: &str,
+        repeat: bool,
     ) -> Option<InputOutcome> {
         let fid = self.focus.focused_id.clone()?;
         if self.element_is_disabled_id(&fid) {
@@ -4491,7 +5746,8 @@ impl LiveSurface {
             }
         };
         let changed = if is_number {
-            let changed = step_and_regroup(&mut self.doc, nid, dir);
+            let fallback = self.sent_value_of(nid);
+            let changed = step_and_regroup(&mut self.doc, nid, dir, fallback.as_deref());
             // Focused: keep the raw editable text with the caret at the end,
             // not the grouped display (issue #40, Graph #42 review).
             if self.text_edit.as_ref().is_some_and(|s| s.node_id == nid) {
@@ -4508,6 +5764,25 @@ impl LiveSurface {
                 self.queue_text_field_damage(nid);
             } else {
                 self.mark_paint_dirty();
+            }
+            // Issue #81 (Designer rulings 2 and 5): key repeat steps a
+            // number box without a `change`, and so does the first keydown
+            // when the host forwards key releases (`EngineConfig::
+            // key_releases`); the key release reports the value once.
+            if is_number && (repeat || ctx.key_releases) {
+                self.key_hold = Some(fid);
+                return Some(InputOutcome::None);
+            }
+            // Issue #81 Ruling 5: a step that ends on the last value sent
+            // (▲ at max, a typed `3` ArrowDown to the sent `2`) sends no
+            // `change`.
+            let unmoved = self.at_sent_value(nid, &fid);
+            // Issue #62: this `change` reports the stepped value, so the
+            // Enter / blur that commits it must not report it again, and
+            // (issue #81) Esc and a refused comma come back to it.
+            self.mark_committed(nid, &fid);
+            if is_number && unmoved {
+                return Some(InputOutcome::None);
             }
             Some(self.fire_change(ctx, &fid))
         } else {
@@ -4540,13 +5815,14 @@ impl LiveSurface {
                 return Some(InputOutcome::None);
             }
             let opts = select_options(&self.doc, open.select_nid);
-            let rows = opts.len().min(SELECT_MAX_ROWS);
+            let rows = opts.len();
             match key.key.as_str() {
                 "ArrowDown" => {
                     if let Some(os) = self.open_select.as_mut() {
                         if os.highlight + 1 < rows {
                             os.highlight += 1;
                         }
+                        os.reveal_highlight(rows);
                     }
                     self.mark_paint_dirty();
                     return Some(InputOutcome::None);
@@ -4554,6 +5830,7 @@ impl LiveSurface {
                 "ArrowUp" => {
                     if let Some(os) = self.open_select.as_mut() {
                         os.highlight = os.highlight.saturating_sub(1);
+                        os.reveal_highlight(rows);
                     }
                     self.mark_paint_dirty();
                     return Some(InputOutcome::None);
@@ -4654,6 +5931,7 @@ impl LiveSurface {
         indicator_id: Option<String>,
     ) -> InputOutcome {
         let request = ctx.requests.issue(ctx.surface);
+        self.note_radio_sent(source_id, &args);
 
         self.pending.insert(PendingEntry {
             request,
@@ -4673,6 +5951,35 @@ impl LiveSurface {
             args,
             source_id: source_id.to_string(),
             trigger,
+        }
+    }
+
+    /// Issue #94 (Graph review): a radio's request records what its group
+    /// sent (see `radio_sent`); groups no longer in the document are pruned.
+    fn note_radio_sent(&mut self, source_id: &str, args: &[(String, String)]) {
+        let Some(node) = self
+            .doc
+            .get_element_by_id(source_id)
+            .and_then(|n| self.doc.get_node(n))
+        else {
+            return;
+        };
+        if value_control_kind(node) != "radio" {
+            return;
+        }
+        let Some(name) = attr_of(node, "name").filter(|n| !n.is_empty()) else {
+            return;
+        };
+        let doc = &self.doc;
+        self.radio_sent
+            .retain(|g, _| !radios_in_group(doc, g).is_empty());
+        match args.iter().find(|(k, _)| *k == name) {
+            Some((_, v)) => {
+                self.radio_sent.insert(name, v.clone());
+            }
+            None => {
+                self.radio_sent.remove(&name);
+            }
         }
     }
 
@@ -4778,7 +6085,15 @@ impl LiveSurface {
                     | "PageDown"
             )
         {
-            if let Some(out) = self.try_step_focused_numeric(ctx, &key.key) {
+            if let Some(out) = self.try_step_focused_numeric(ctx, &key.key, key.repeat) {
+                return out;
+            }
+        }
+
+        // Issue #81: releasing the ArrowUp/ArrowDown whose key repeat stepped
+        // a number box sends the one `change` for the repeat steps.
+        if !key.pressed && matches!(key.key.as_str(), "ArrowUp" | "ArrowDown") {
+            if let Some(out) = self.release_key_hold(ctx) {
                 return out;
             }
         }
@@ -4912,6 +6227,15 @@ impl LiveSurface {
                     .is_some_and(|n| is_editable_input(n) && !is_disabled(n));
                 if editable {
                     let _ = self.focus_text_input(ctx, nid_str);
+                    // Issue #68 (Designer lock, HTML_CONTRACT §2): focus that
+                    // arrives by Tab / Shift+Tab selects the whole text, so
+                    // typing replaces the value (Win95 edit boxes, Chrome).
+                    // Click focus places the caret; host / swap focus keeps
+                    // the caret at the end with no selection. The field's
+                    // damage is already queued by `focus_text_input`.
+                    if let Some(nid) = self.doc.get_element_by_id(nid_str) {
+                        select_all(&mut self.doc, nid);
+                    }
                 } else if let Some(nid) = self.doc.get_element_by_id(nid_str) {
                     self.doc.set_focus_to(nid);
                     self.focus.focused_id = Some(nid_str.clone());
@@ -5130,6 +6454,16 @@ impl LiveSurface {
             );
             self.released_outcomes.push(outcome);
         }
+        // Issue #89: a finished request, failed or not, runs the catch-up.
+        self.run_catch_up(ctx, &source_id);
+    }
+
+    /// Age pending requests by one frame; a timed-out request still runs
+    /// its source's catch-up (issue #89).
+    fn tick_pending(&mut self, ctx: &mut ActionCtx<'_>, timeout_frames: u32) {
+        for source_id in self.pending.tick_frames(timeout_frames) {
+            self.run_catch_up(ctx, &source_id);
+        }
     }
 
     /// Style + layout + raster when dirty (or forced). `plan == None` means the
@@ -5210,12 +6544,27 @@ impl LiveSurface {
                 .filter(|r| !r.is_empty()),
         );
 
+        let styled_scale = self.doc.viewport().scale_f64();
         self.doc.set_viewport(BlitzViewport::new(
             width,
             height,
             scale as f32,
             ColorScheme::Light,
         ));
+        // Issue #107: stylo snaps some computed values (a 1 px border becomes
+        // whole device pixels) to the device scale at cascade time. Blitz only
+        // re-shapes its text when the scale changes, so nodes styled at the
+        // old scale (`load_html` parses at scale 1, a window moves to another
+        // monitor) would keep the old numbers while a later swap styles new
+        // nodes at the new scale. Recascade everything once, like Blitz does
+        // for a colour-scheme change.
+        if (styled_scale - scale as f32 as f64).abs() > f64::EPSILON {
+            if let Some(root) = self.doc.try_root_element().map(|n| n.id) {
+                if let Some(node) = self.doc.get_node_mut(root) {
+                    node.set_restyle_hint(RestyleHint::recascade_subtree());
+                }
+            }
+        }
 
         // Graph review (PR #24 follow-up): drain damage an input-time
         // `ensure_resolved` already carried (its one-shot restyle flags are
@@ -5674,12 +7023,17 @@ fn parse_html_document(html: &str, layout_viewport: (u32, u32), fonts: &HostFont
 /// once more so Blitz takes the loaded image in before this paint. Blitz
 /// only ingests a load at the start of the next `resolve`, and its
 /// per-document image cache means the extra pass happens only on a URL's
-/// first use in a document. Returns the passes run (1 or 2).
-fn resolve_with_data_images(doc: &mut HtmlDocument, provider: &DataSvgProvider) -> u64 {
+/// first use in a document. Every pass goes through [`RadioShifts::resolve`]
+/// (issue #116). Returns the passes run (1 or 2).
+fn resolve_with_data_images(
+    doc: &mut HtmlDocument,
+    provider: &DataSvgProvider,
+    radio_shifts: &mut RadioShifts,
+) -> u64 {
     let before = provider.served();
-    doc.resolve(0.0);
+    radio_shifts.resolve(doc);
     if provider.served() != before {
-        doc.resolve(0.0);
+        radio_shifts.resolve(doc);
         2
     } else {
         1
@@ -5779,17 +7133,16 @@ fn validate_input_limits(
     input: &str,
     limits: &InputLimits,
 ) -> Result<(), EngineError> {
-    let reason = if !limits.min.is_finite() || !limits.max.is_finite() {
+    // Issue #101: `max: None` (no max) skips the max checks.
+    let lmax = limits.max.unwrap_or(limits.min);
+    let reason = if !limits.min.is_finite() || !lmax.is_finite() {
         Some("min/max must be finite numbers".to_string())
-    } else if limits.min.abs() > MAX_SAFE_NUMBER || limits.max.abs() > MAX_SAFE_NUMBER {
+    } else if limits.min.abs() > MAX_SAFE_NUMBER || lmax.abs() > MAX_SAFE_NUMBER {
         Some(format!(
             "min/max must stay within ±{MAX_SAFE_NUMBER} (±2^53, the safe integer range)"
         ))
-    } else if limits.min > limits.max {
-        Some(format!(
-            "min ({}) must be <= max ({})",
-            limits.min, limits.max
-        ))
+    } else if limits.min > lmax {
+        Some(format!("min ({}) must be <= max ({})", limits.min, lmax))
     } else if let Some(step) = limits.step {
         if !step.is_finite() || step <= 0.0 {
             Some(format!("step ({step}) must be > 0 when present"))
@@ -5998,3 +7351,13 @@ fn remove_class_token(class: &str, token: &str) -> String {
 // Silence unused import when local_name is only needed in some paths.
 #[allow(unused_imports)]
 use local_name as _;
+
+/// Issue #94 (Graph review): attribute `name` of element `node`.
+fn attr_of(node: &blitz_dom::node::Node, name: &str) -> Option<String> {
+    node.attrs().and_then(|attrs| {
+        attrs
+            .iter()
+            .find(|a| &*a.name.local == name)
+            .map(|a| a.value.to_string())
+    })
+}

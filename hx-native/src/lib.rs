@@ -17,15 +17,18 @@ mod focus;
 mod fonts;
 mod form_args;
 mod form_controls;
+mod inset_shadow;
 mod memory;
 mod paint;
 mod pending;
+mod radio;
 mod scroll;
 mod select_ui;
 mod slider;
 mod stylo_text_style;
 mod svg;
 mod text_edit;
+mod text_shadow;
 mod tile_coalesce;
 mod trigger;
 mod types;
@@ -39,6 +42,10 @@ pub use dialect::{
 pub use engine::{DirtySet, Engine};
 pub use error::EngineError;
 pub use form_args::{args_get, args_get_all};
+#[doc(hidden)]
+pub use inset_shadow::{
+    set_inset_shadow_fast_path_for_test, take_inset_shadow_counters_for_test, InsetShadowCounters,
+};
 pub use memory::{
     estimate_document_bytes, estimate_rgba_bytes, estimate_surface_engine_bytes,
     DOCUMENT_ESTIMATE_BASE_BYTES, DOCUMENT_ESTIMATE_PER_HTML_BYTE, RGBA_BYTES_PER_PIXEL,
@@ -49,6 +56,8 @@ pub use svg::{
     DATA_IMAGE_MAX_TOTAL_PIXELS, DATA_SVG_MAX_BYTES, FORBIDDEN_SVG_ELEMENTS,
     FORBIDDEN_SVG_PROPERTIES, SVG_IMAGE_MIME_TYPES, SVG_MAX_DEPTH,
 };
+#[doc(hidden)]
+pub use text_shadow::{take_text_shadow_counters_for_test, TextShadowCounters};
 #[doc(hidden)]
 pub use tile_coalesce::{
     clear_tile_cache_for_test, set_tile_coalesce_for_test, take_tile_coalesce_counters_for_test,

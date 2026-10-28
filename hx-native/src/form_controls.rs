@@ -168,6 +168,32 @@ pub fn checked_radio_in_group(doc: &HtmlDocument, name: &str) -> Option<NodeId> 
     None
 }
 
+/// Issue #94 (Graph review): every radio with `name`, document-wide like
+/// [`checked_radio_in_group`].
+pub fn radios_in_group(doc: &HtmlDocument, name: &str) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    if name.is_empty() {
+        return out;
+    }
+    let mut stack = vec![doc.root_node().id];
+    while let Some(nid) = stack.pop() {
+        let Some(node) = doc.get_node(nid) else {
+            continue;
+        };
+        for &child in &node.children {
+            stack.push(child);
+        }
+        if matches!(
+            classify_control(doc, node).map(|c| c.kind),
+            Some(FormControlKind::Radio)
+        ) && attr(node, "name").as_deref() == Some(name)
+        {
+            out.push(nid);
+        }
+    }
+    out
+}
+
 /// Select a radio in its name group (exclusive).
 ///
 /// Returns `Some(RadioSelectResult)` when state changed, `None` otherwise.

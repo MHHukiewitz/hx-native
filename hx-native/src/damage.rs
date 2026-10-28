@@ -246,7 +246,11 @@ fn local_transform_device(node: &blitz_dom::Node, scale: f64, doc_scale: f64) ->
 /// (origin at the border-box top-left, before its own transform) to device
 /// pixels. Walks the containing-block chain (same as `absolute_position`) and
 /// multiplies each ancestor's layout translation by its CSS transform.
-fn document_affine_device(doc: &HtmlDocument, nid: NodeId, scale: f64) -> Option<Affine> {
+pub(crate) fn document_affine_device(
+    doc: &HtmlDocument,
+    nid: NodeId,
+    scale: f64,
+) -> Option<Affine> {
     let mut chain = Vec::new();
     let mut cur = Some(nid);
     while let Some(id) = cur {
@@ -318,6 +322,17 @@ pub(crate) fn ink_box_device(
     nid: NodeId,
     scale: f64,
 ) -> Option<(f64, f64, f64, f64)> {
+    ink_box_device_with(doc, nid, scale, true)
+}
+
+/// [`ink_box_device`]; `text_shadows` false skips the text-shadow pad walk
+/// (the caller checked that no node has a `text-shadow`).
+fn ink_box_device_with(
+    doc: &HtmlDocument,
+    nid: NodeId,
+    scale: f64,
+    text_shadows: bool,
+) -> Option<(f64, f64, f64, f64)> {
     let node = doc.get_node(nid)?;
     if !node.is_element() {
         return None;
@@ -387,6 +402,22 @@ pub(crate) fn ink_box_device(
         }
     }
 
+    // Issue #57: text-shadow (painted by `text_shadow.rs`) moves text ink by
+    // each shadow offset, so a shadow that appears, moves or goes away stays
+    // inside this element's damage.
+    let pad = if text_shadows {
+        crate::text_shadow::bump(|c| c.pads_walked += 1);
+        crate::text_shadow::text_shadow_ink_pad(doc, nid, scale)
+    } else {
+        None
+    };
+    if let Some((l, t, r, b)) = pad {
+        x0 -= l;
+        y0 -= t;
+        x1 += r;
+        y1 += b;
+    }
+
     let xf = document_affine_device(doc, nid, scale)?;
     let bbox = xf.transform_rect_bbox(KurboRect::new(x0, y0, x1, y1));
     Some((bbox.x0, bbox.y0, bbox.width(), bbox.height()))
@@ -399,6 +430,12 @@ pub(crate) fn snapshot_bounds(doc: &HtmlDocument, scale: f64) -> BoundsSnapshot 
     // so scrolling only damages the container, not the rows scrolled away
     // beyond it (which Blitz does not paint).
     let any_scroller = !crate::scroll::scroll_containers(doc).is_empty();
+    // #60 review: a page without any `text-shadow` skips the per-element
+    // run walk of the text-shadow damage pad.
+    let text_shadows = crate::text_shadow::document_has_text_shadow(doc);
+    if !text_shadows {
+        crate::text_shadow::bump(|c| c.pads_skipped += 1);
+    }
     let root = doc.root_node().id;
     let mut stack = vec![root];
     while let Some(nid) = stack.pop() {
@@ -422,7 +459,7 @@ pub(crate) fn snapshot_bounds(doc: &HtmlDocument, scale: f64) -> BoundsSnapshot 
         }
         if let (Some(own), Some(ink)) = (
             own_box_device(doc, nid, scale),
-            ink_box_device(doc, nid, scale),
+            ink_box_device_with(doc, nid, scale, text_shadows),
         ) {
             let ink = if any_scroller {
                 clip_ink_to_scrollers(doc, nid, scale, ink)
@@ -494,6 +531,37 @@ pub(crate) fn collect_style_damaged(doc: &HtmlDocument) -> Vec<NodeId> {
     out
 }
 
+/// The nearest ancestor of an inline-flow (or `display: contents`) element
+/// that is neither (the block whose inline layout, or anonymous block, paints
+/// the element's text) and has bounds in `snapshot`. `None` for any other
+/// element. A `display: contents` box generates no box of its own (its bounds
+/// in `snapshot` are empty), so it is skipped like an inline (#60 round 2).
+fn inline_layout_host(
+    doc: &HtmlDocument,
+    nid: NodeId,
+    snapshot: &BoundsSnapshot,
+) -> Option<NodeId> {
+    let no_own_layout = |id: NodeId| {
+        doc.get_node(id)
+            .and_then(|n| n.primary_styles())
+            .is_some_and(|s| {
+                let d = s.get_box().clone_display();
+                d.is_inline_flow() || d.is_contents()
+            })
+    };
+    if !no_own_layout(nid) {
+        return None;
+    }
+    let mut cur = doc.get_node(nid)?.parent;
+    while let Some(id) = cur {
+        if !no_own_layout(id) && snapshot.contains_key(&id) {
+            return Some(id);
+        }
+        cur = doc.get_node(id)?.parent;
+    }
+    None
+}
+
 fn own_changed(a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)) -> bool {
     const EPS: f64 = 0.01;
     (a.0 - b.0).abs() > EPS
@@ -514,10 +582,21 @@ pub(crate) fn compute_raw_damage(
     previous: &BoundsSnapshot,
     style_damaged: &[NodeId],
 ) -> Vec<IntRect> {
-    let style_set: std::collections::HashSet<NodeId> = style_damaged.iter().copied().collect();
+    let mut style_set: std::collections::HashSet<NodeId> = style_damaged.iter().copied().collect();
     let mut rects: Vec<IntRect> = Vec::new();
 
     let current = snapshot_bounds(doc, scale);
+
+    // An inline element (`<a>` in a `<p>`) has no box of its own: its text is
+    // laid out and painted by the block that holds the inline layout (the
+    // paragraph, or an anonymous block of its container). Restyling it (a
+    // colour or `text-shadow` change from greying) must damage that block's
+    // ink, before and after, or the old pixels stay (#60 review, P7/P10/P15).
+    let hosts: Vec<NodeId> = style_set
+        .iter()
+        .filter_map(|&nid| inline_layout_host(doc, nid, &current))
+        .collect();
+    style_set.extend(hosts);
 
     // Disappeared nodes: old ink.
     for (nid, prev) in previous {

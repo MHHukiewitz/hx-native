@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use hx_native::*;
 
 const ICONS: &str = include_str!("fixtures/svg_icons.html");
-const BOLD: &[u8] = include_bytes!("fonts/DejaVuSans-Bold.ttf");
+const BOLD: &[u8] = include_bytes!("../../assets/fonts/DejaVuSans-Bold.ttf");
 
 const BLACK: [u8; 3] = [0, 0, 0];
 const WHITE: [u8; 3] = [255, 255, 255];

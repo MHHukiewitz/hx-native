@@ -62,6 +62,11 @@ pub struct TextEditSession {
     pub node_id: NodeId,
     /// Canonical `value` at focus time (Esc restores this).
     pub value_at_focus: String,
+    /// Canonical `value` the last `change` reported, or the focus-time value
+    /// when none fired yet. A commit fires `change` only when the value
+    /// differs from this, so an arrow step's `change` is not repeated by the
+    /// Enter / blur that follows it (issue #62).
+    pub value_at_change: String,
     /// Caret drawn this frame (toggles on blink).
     pub caret_visible: bool,
     pub last_blink: Instant,
@@ -137,6 +142,72 @@ pub fn format_grouped(canonical: &str) -> String {
         out.push_str(f);
     }
     out
+}
+
+/// Issue #87 (Designer, HTML_CONTRACT §2 Ruling 5, Mainnet master
+/// 04c95f50): a number box's value `now` already is the last value `sent`
+/// when the two parse to the same number (`4.1` is a sent `4.10`), or when
+/// `now` does not parse as a number at all (not a value, nothing to send).
+/// Plain decimals compare exactly, digit by digit; anything else falls back
+/// to the parsed `f64`.
+pub fn number_is_sent(now: &str, sent: &str) -> bool {
+    match (SentNumber::parse(now), SentNumber::parse(sent)) {
+        (None, _) => true,
+        (Some(a), Some(b)) => a.same(&b),
+        (Some(_), None) => false,
+    }
+}
+
+/// A parsed number for [`number_is_sent`].
+#[derive(PartialEq, Debug)]
+enum SentNumber {
+    /// Plain decimal: sign, whole digits without leading zeros, fraction
+    /// digits without trailing zeros (zero is unsigned and empty).
+    Decimal(bool, String, String),
+    Float(f64),
+}
+
+impl SentNumber {
+    fn parse(text: &str) -> Option<Self> {
+        let t = text.trim();
+        let (neg, body) = match t.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, t.strip_prefix('+').unwrap_or(t)),
+        };
+        let (whole, frac) = body.split_once('.').unwrap_or((body, ""));
+        let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+        if digits(whole) && digits(frac) && !(whole.is_empty() && frac.is_empty()) {
+            let whole = whole.trim_start_matches('0').to_string();
+            let frac = frac.trim_end_matches('0').to_string();
+            let zero = whole.is_empty() && frac.is_empty();
+            return Some(SentNumber::Decimal(neg && !zero, whole, frac));
+        }
+        t.parse::<f64>()
+            .ok()
+            .filter(|f| f.is_finite())
+            .map(SentNumber::Float)
+    }
+
+    fn as_f64(&self) -> f64 {
+        match self {
+            SentNumber::Float(f) => *f,
+            SentNumber::Decimal(neg, whole, frac) => {
+                let v: f64 = format!("0{whole}.{frac}0").parse().unwrap_or(0.0);
+                if *neg {
+                    -v
+                } else {
+                    v
+                }
+            }
+        }
+    }
+
+    fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (SentNumber::Decimal(..), SentNumber::Decimal(..)) => self == other,
+            _ => self.as_f64() == other.as_f64(),
+        }
+    }
 }
 
 /// Strip grouping commas (and accept them) then parse. Returns `None` if empty/invalid.
@@ -471,12 +542,32 @@ pub fn delete_selection(doc: &mut HtmlDocument, nid: NodeId) {
 /// `transform: translate(-50%, -50%)` panel (absolute_position alone ignores
 /// transforms).
 pub fn place_caret_at(doc: &mut HtmlDocument, nid: NodeId, x: f32, y: f32) {
-    let Some(node) = doc.get_node(nid) else {
+    let Some((lx, ly)) = editor_point(doc, nid, x, y) else {
         return;
     };
-    let Some((bx, by, _, _)) = crate::damage::element_border_box_css(doc, nid) else {
+    doc.with_text_input(nid, |mut driver| {
+        driver.move_to_point(lx, ly);
+    });
+}
+
+/// Issue #85 (Designer, HTML_CONTRACT §2 Ruling 7): select the word under a
+/// document-space double-click (CSS px), as Blitz's own double-click does
+/// (`PlainEditorDriver::select_word_at_point`).
+pub fn select_word_at(doc: &mut HtmlDocument, nid: NodeId, x: f32, y: f32) {
+    let Some((lx, ly)) = editor_point(doc, nid, x, y) else {
         return;
     };
+    doc.with_text_input(nid, |mut driver| {
+        driver.select_word_at_point(lx, ly);
+    });
+}
+
+/// A document-space point (CSS px) in the editor's own layout space: inside
+/// the content box, vertically centred single-line text, horizontal scroll
+/// and the device scale applied.
+fn editor_point(doc: &HtmlDocument, nid: NodeId, x: f32, y: f32) -> Option<(f32, f32)> {
+    let node = doc.get_node(nid)?;
+    let (bx, by, _, _) = crate::damage::element_border_box_css(doc, nid)?;
     let layout = node.final_layout();
     let pad_l = layout.padding.left + layout.border.left;
     let pad_t = layout.padding.top + layout.border.top;
@@ -495,9 +586,7 @@ pub fn place_caret_at(doc: &mut HtmlDocument, nid: NodeId, x: f32, y: f32) {
     let scale = doc.viewport().scale_f64();
     let local_x = (x - bx - pad_l) as f64 * scale + scroll_x;
     let local_y = (y - by - pad_t - y_off) as f64 * scale;
-    doc.with_text_input(nid, |mut driver| {
-        driver.move_to_point(local_x as f32, local_y as f32);
-    });
+    Some((local_x as f32, local_y as f32))
 }
 
 /// Caret ink rect in device pixels, or `None` when there is no caret geometry.
@@ -548,8 +637,10 @@ pub fn caret_device_rect(
 /// Restores the focused display text in the editor afterwards.
 ///
 /// A number whose commas are not thousands grouping ("3,5", "7,3480") is no
-/// number: the value becomes `fallback` (the value at focus, held in the
-/// limits), the same as a refused paste leaves it (issue #51).
+/// number: the value becomes `fallback` (the last value sent, held in the
+/// limits), the same as a refused paste leaves it (issue #51). With `clamp`
+/// (the read a `from:body` shortcut posts) an empty box or a lone sign or
+/// point also becomes `fallback`, as its commit does (issue #90).
 pub fn sync_value_from_editor(
     doc: &mut HtmlDocument,
     nid: NodeId,
@@ -573,7 +664,17 @@ pub fn sync_value_from_editor(
                 unconstrained: false,
             });
         if commas_are_grouping(display.trim()) {
-            canonical_from_display(&display, &limits, clamp)
+            let parsed = canonical_from_display(&display, &limits, clamp);
+            // `clamp` is the commit-like read (a `from:body` shortcut posting
+            // what Enter would commit, Graph review of #91): an empty box or
+            // a lone sign or point posts the last value sent, as Enter now
+            // commits it (issue #90). While typing (`clamp == false`) the
+            // live value follows the text, empty included.
+            if clamp && parsed.is_empty() {
+                fallback_value(fallback, &limits, clamp)
+            } else {
+                parsed
+            }
         } else {
             fallback_value(fallback, &limits, clamp)
         }
@@ -606,22 +707,15 @@ fn fallback_value(fallback: &str, limits: &NumericLimits, clamp: bool) -> String
 /// Commit a number/text field: clamp number, write canonical value. The
 /// caller (`commit_text_edit`) then shows a number box's display text
 /// (`prepare_focus_display` on Enter, `apply_unfocused_display` on blur).
-/// A number whose commas are not thousands grouping commits `fallback`
-/// (the value at focus) instead, see [`sync_value_from_editor`].
+/// A number whose commas are not thousands grouping, an empty box, or a
+/// lone sign or point commits `fallback` (the last value sent) instead, see
+/// [`sync_value_from_editor`].
 pub fn commit_field(doc: &mut HtmlDocument, nid: NodeId, fallback: &str) -> bool {
-    let (prev_value, limits) = {
+    let limits = {
         let Some(node) = doc.get_node(nid) else {
             return false;
         };
-        let is_number = is_number_input(node);
-        (
-            attr(node, "value").unwrap_or_else(|| "0".into()),
-            if is_number {
-                Some(numeric_limits(node))
-            } else {
-                None
-            },
-        )
+        is_number_input(node).then(|| numeric_limits(node))
     };
     let display = editor_text(doc, nid).unwrap_or_default();
     let canonical = if let Some(ref limits) = limits {
@@ -630,7 +724,13 @@ pub fn commit_field(doc: &mut HtmlDocument, nid: NodeId, fallback: &str) -> bool
         } else {
             let parsed = canonical_from_display(&display, limits, true);
             if parsed.is_empty() {
-                prev_value
+                // Issue #90 (Designer, HTML_CONTRACT §2 Ruling 5, Mainnet
+                // 98ac51a9): an empty box, or a lone `-` / `.`, is no
+                // number. Leaving it puts back the last value sent
+                // (`fallback`), so no later form post carries an empty or
+                // broken number. The live value attribute was already
+                // emptied while typing, so it can't be the fallback.
+                fallback_value(fallback, limits, true)
             } else {
                 parsed
             }
@@ -826,7 +926,18 @@ fn number_inputs_under(doc: &HtmlDocument, root: NodeId) -> Vec<(NodeId, Option<
 }
 
 /// Step a number input by `dir`, write canonical value, regroup display if enabled.
-pub fn step_and_regroup(doc: &mut HtmlDocument, nid: NodeId, dir: i32) -> bool {
+///
+/// `fallback` is the last value sent for a box being edited (issue #92,
+/// Designer, HTML_CONTRACT §2 Ruling 5, Mainnet master cea8a42a): when the
+/// box is empty or doesn't parse (a lone `-`, a cleared fee), the step
+/// starts from it, the value blur or Enter would put back, not from `min`
+/// or 0. Before anything is sent it is the box's starting value.
+pub fn step_and_regroup(
+    doc: &mut HtmlDocument,
+    nid: NodeId,
+    dir: i32,
+    fallback: Option<&str>,
+) -> bool {
     use crate::form_args::step_precise;
 
     let Some(node) = doc.get_node(nid) else {
@@ -839,6 +950,7 @@ pub fn step_and_regroup(doc: &mut HtmlDocument, nid: NodeId, dir: i32) -> bool {
     let group = grouping_enabled(node);
     let current = attr(node, "value")
         .and_then(|s| parse_f64(&s))
+        .or_else(|| fallback.and_then(parse_f64))
         .unwrap_or(limits.min.unwrap_or(0.0));
     let next = step_precise(current, dir, &limits);
     let canonical = format_numeric(next);
@@ -922,6 +1034,49 @@ mod tests {
         };
         assert!(number_char_allowed("4", '.', &lim));
         assert!(number_char_allowed("4.", '3', &lim));
+    }
+}
+
+#[cfg(test)]
+mod number_is_sent_tests {
+    use super::number_is_sent;
+
+    /// Issue #87 (Ruling 5, Mainnet 04c95f50): by number, not text.
+    #[test]
+    fn equal_numbers_are_the_sent_value() {
+        for (now, sent) in [
+            ("4.1", "4.10"),
+            ("4.10", "4.1"),
+            ("04.100", "4.1"),
+            ("7", "7.0"),
+            ("0", "-0"),
+            ("-0.0", "0"),
+            (".5", "0.5"),
+            ("+3", "3"),
+            ("100", "1e2"),
+            ("", "4.1"),
+            ("abc", "4.1"),
+            ("-", "4.1"),
+            ("", ""),
+        ] {
+            assert!(number_is_sent(now, sent), "{now:?} vs {sent:?}");
+        }
+    }
+
+    #[test]
+    fn different_numbers_send() {
+        for (now, sent) in [
+            ("4.11", "4.1"),
+            ("-4.1", "4.1"),
+            ("41", "4.1"),
+            ("0.1", "1"),
+            ("10", "1"),
+            ("5", ""),
+            ("5", "abc"),
+            ("100.000000000000001", "100"),
+        ] {
+            assert!(!number_is_sent(now, sent), "{now:?} vs {sent:?}");
+        }
     }
 }
 

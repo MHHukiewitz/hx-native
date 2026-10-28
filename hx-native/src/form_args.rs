@@ -7,7 +7,9 @@
 //! contribute a `(name, value)` pair in document order — the same shape as
 //! HTML form serialization and htmx. Use [`args_get`] for the first value and
 //! [`args_get_all`] for every value. The args type stays `Vec<(String, String)>`
-//! so Mainnet's existing consumers keep working.
+//! so Mainnet's existing consumers keep working. An unchecked checkbox or
+//! radio contributes nothing, even when it is the element that fired (issue
+//! #82: an untick posts the form without the box, as htmx does).
 //!
 //! When the triggering element has `name=` / `value=` and the form also has a
 //! field with that name, both appear: the trigger's value first, then the
@@ -63,8 +65,13 @@ pub fn collect_action_args(
     // Any element (button, tr, input, select, …) with name= contributes a
     // pair, matching htmx. Form controls use their control value (selected
     // option, checkbox value, …); other elements use the `value` attribute.
+    // Issue #82 (Mainnet #791): a checkbox or radio is posted only while it is
+    // checked, the trigger included (htmx `shouldInclude`), so an untick sends
+    // the form without the box.
     if let Some(name) = named_attr(source, "name") {
-        args.push((name, trigger_element_value(doc, source)));
+        if !is_unchecked_checkable(source) {
+            args.push((name, trigger_element_value(doc, source)));
+        }
     }
 
     // Then named controls in the closest ancestor form (document order).
@@ -137,7 +144,7 @@ fn control_baseline_pair(doc: &HtmlDocument, node: &Node) -> Option<(String, Str
 /// value). Unlike [`control_baseline_pair`], does not require a `name` —
 /// standalone `data-hx-applied` controls (Designer lock 2026-10-20) opt into
 /// `hx-changed` by the attribute alone, with or without a form or a name.
-fn control_current_value(doc: &HtmlDocument, node: &Node) -> Option<String> {
+pub(crate) fn control_current_value(doc: &HtmlDocument, node: &Node) -> Option<String> {
     match tag_name(node).as_str() {
         "input" => match input_type(node).as_str() {
             "checkbox" | "radio" => Some(is_checked(node).to_string()),
@@ -190,6 +197,60 @@ pub(crate) fn capture_applied_controls(
         .collect()
 }
 
+/// Issue #89 (Designer, HTML_CONTRACT `hx-sync`, Mainnet master 188feffd):
+/// what value control `node` contributed to a request that carried `args`,
+/// in [`control_current_value`]'s encoding (checkbox/radio `"true"` when its
+/// pair was posted, `"false"` otherwise). `None` for a control the request
+/// could not carry: no name, a hidden input, or a named value control with
+/// no pair in `args`.
+pub(crate) fn control_value_in_args(node: &Node, args: &[(String, String)]) -> Option<String> {
+    let name = named_attr(node, "name")?;
+    match tag_name(node).as_str() {
+        "input" => match input_type(node).as_str() {
+            "checkbox" | "radio" => {
+                let v = attr(node, "value").unwrap_or_else(|| "on".to_string());
+                Some(args.iter().any(|(k, a)| *k == name && *a == v).to_string())
+            }
+            "number" | "range" | "text" | "" => args
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.clone()),
+            _ => None,
+        },
+        "select" => args
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.clone()),
+        _ => None,
+    }
+}
+
+/// Issue #89: how a redraw puts a committed value back into `node`:
+/// `"select"`, `"checkbox"`, `"radio"`, or `"value"` (the `value` attribute).
+pub(crate) fn value_control_kind(node: &Node) -> &'static str {
+    match tag_name(node).as_str() {
+        "select" => "select",
+        "input" => match input_type(node).as_str() {
+            "checkbox" => "checkbox",
+            "radio" => "radio",
+            _ => "value",
+        },
+        _ => "value",
+    }
+}
+
+/// Issue #89: replace the value `node` posts in `args` (the first pair with
+/// its name) with `value`, for a text, number or range box whose live
+/// `value` holds text the player has not committed yet.
+pub(crate) fn patch_control_arg(node: &Node, args: &mut [(String, String)], value: &str) {
+    let Some(name) = named_attr(node, "name") else {
+        return;
+    };
+    if let Some(pair) = args.iter_mut().find(|(k, _)| *k == name) {
+        pair.1 = value.to_string();
+    }
+}
+
 /// Value for a triggering element: real control value for form controls,
 /// otherwise the `value` attribute (empty when missing).
 fn trigger_element_value(doc: &HtmlDocument, node: &Node) -> String {
@@ -200,7 +261,8 @@ fn trigger_element_value(doc: &HtmlDocument, node: &Node) -> String {
             let ty = input_type(node);
             match ty.as_str() {
                 "checkbox" | "radio" => {
-                    // Trigger always contributes its value attr (htmx); default "on".
+                    // A checked trigger contributes its value attr (htmx);
+                    // default "on". Unchecked ones never get here (#82).
                     match attr(node, "value") {
                         None => "on".to_string(),
                         Some(v) => v,
@@ -695,6 +757,13 @@ fn option_value(node: &Node) -> String {
     }
     // HTML: missing value attribute → option's text.
     node.text_content()
+}
+
+/// An `<input type="checkbox|radio">` that is not checked (issue #82).
+fn is_unchecked_checkable(node: &Node) -> bool {
+    tag_name(node) == "input"
+        && matches!(input_type(node).as_str(), "checkbox" | "radio")
+        && !is_checked(node)
 }
 
 fn is_checked(node: &Node) -> bool {
