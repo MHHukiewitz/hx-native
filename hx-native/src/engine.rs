@@ -7247,8 +7247,13 @@ fn node_id_attr(doc: &HtmlDocument, nid: NodeId) -> Option<String> {
 }
 
 /// Elements from `node` up to and including its outermost SVG-namespace
-/// ancestor (`node` itself counts), or `None` when `node` is not inside an
-/// inline `<svg>`. Walks parents without recursion.
+/// ancestor or `svg`-named ancestor (`node` itself counts), or `None` when
+/// `node` is not inside an inline `<svg>`. Walks parents without recursion.
+///
+/// Blitz renders every element whose local name is `svg` as an inline SVG
+/// image, whatever its namespace, and serialises its subtree for usvg by
+/// local name. Inside MathML the parser makes `<svg>` a MathML element, so
+/// the namespace alone misses it (Graph's #52 review at f63de6e).
 fn inline_svg_depth(doc: &HtmlDocument, node: &blitz_dom::Node) -> Option<usize> {
     let mut depth = 0;
     let mut svg_depth = None;
@@ -7256,7 +7261,7 @@ fn inline_svg_depth(doc: &HtmlDocument, node: &blitz_dom::Node) -> Option<usize>
     while let Some(n) = cur {
         if let Some(el) = n.element_data() {
             depth += 1;
-            if el.name.ns == ns!(svg) {
+            if el.name.ns == ns!(svg) || el.name.local == local_name!("svg") {
                 svg_depth = Some(depth);
             }
         }
