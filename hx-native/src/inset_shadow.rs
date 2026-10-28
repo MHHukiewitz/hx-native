@@ -1,4 +1,5 @@
-//! Paint zero-blur inset `box-shadow` layers as one fill (issue #123).
+//! Paint inset `box-shadow` layers as fills: hard layers in CSS order at
+//! device-px offsets (issue #125), zero-blur ones as one fill (issue #123).
 //!
 //! Blitz 0.3.0-beta.4 (`blitz-paint` `render/box_shadow.rs`,
 //! `draw_inset_box_shadow`) paints every inset shadow layer as six commands:
@@ -10,25 +11,33 @@
 //!    by the offset) in white, with the averaged corner radius and the blur;
 //! 5. and 6. two `pop_layer`s.
 //!
-//! vello_cpu draws step 4 with its blurred rounded rect shader, which runs
-//! `powf` per pixel over the whole hole, even at zero blur. A Win95 bevel
-//! (`inset 1px 1px #fff, inset -1px -1px #808080`) on a big box therefore
-//! costs more than the rest of the page (Mainnet Market: 87 ms of a 90 ms
-//! debug repaint at 1280×657).
+//! It does so for each shadow in list order, so the last listed shadow ends
+//! on top, while CSS paints the first one on top; and it moves the hole by
+//! the offset in CSS px (the transform translation is not scaled), while the
+//! spread and blur are scaled. A Win95 bevel (`inset -1px -1px #000, inset
+//! 1px 1px #fff, inset -2px -2px #808080, inset 2px 2px #dfdfdf`) therefore
+//! shows the inner colours on the outside, and at scale 2 it is half as
+//! thick as Chrome's. vello_cpu also draws step 4 with its blurred rounded
+//! rect shader, which runs `powf` per pixel over the whole hole, even at
+//! zero blur (#123: 87 ms of a 90 ms debug repaint on Mainnet Market).
 //!
 //! [`InsetScene`] sits between Blitz and the renderer and recognises that
-//! sequence. When the layer has no blur and no corner radius, and the padding
-//! box and the hole both land on whole device pixels under a pure
-//! translation, it paints one even-odd fill instead: the padding box minus
-//! the hole (cut to the padding box), inside Blitz's outer layer only when
-//! the colour is translucent. The pixels are the same: at zero blur
-//! vello's shader is a hard step at each pixel centre, which equals area
-//! coverage on whole-pixel edges. Anything else (blur, a radius, a scaled or
-//! fractional box, a different command order) is replayed unchanged.
+//! sequence. Consecutive layers over the same padding box (one element's
+//! inset shadows) are buffered as a run until another command arrives:
 //!
-//! Blitz's own offset is passed through as it is: it is in CSS px, not device
-//! px (the layer shifts by 1 device px at scale 2), and the fast path keeps
-//! that.
+//! * **Hard run** (#125): every layer has no blur and no corner radius, under
+//!   a pure translation, on a rectangular padding box. The layers are painted
+//!   last-listed first (so the first shadow ends on top, as in CSS), each as
+//!   one even-odd fill of the padding box minus the hole, with the offset in
+//!   device px (CSS offset × scale), as Chrome does. Fractional edges are
+//!   left to vello's area coverage, which matches Chrome's anti-aliasing on
+//!   whole-pixel boxes.
+//! * **Anything else** keeps Blitz's order and offsets: each layer is one
+//!   fill when that is pixel-identical to Blitz's layers (#123: no blur, no
+//!   radius, whole device pixels), else its six commands are replayed. This
+//!   covers runs mixing hard and blurred layers, and the padding boxes of
+//!   typed fields whose bevels `fields.rs` already repaints in CSS order
+//!   after rasterization (so they are not painted twice).
 //!
 //! Pin-sensitive: depends on the command order above (see BLITZ_PIN.md).
 
@@ -50,7 +59,11 @@ thread_local! {
 /// Counters for tests and benches (per thread, since the last reset).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InsetShadowCounters {
-    /// Inset layers painted as one even-odd fill.
+    /// Hard inset layers (no blur, no radius, pure translation) painted in
+    /// CSS order at device-px offsets, one even-odd fill each (issue #125).
+    pub hard: u64,
+    /// Inset layers painted as one even-odd fill pixel-identical to Blitz's
+    /// layers (hard layers left in Blitz's order: typed fields, mixed runs).
     pub fast: u64,
     /// Inset layers replayed to the renderer unchanged (blur, radius, or not
     /// on whole pixels).
@@ -59,6 +72,7 @@ pub struct InsetShadowCounters {
 
 impl InsetShadowCounters {
     const ZERO: Self = Self {
+        hard: 0,
         fast: 0,
         replayed: 0,
     };
@@ -114,30 +128,69 @@ struct Pending {
     stage: Stage,
 }
 
-/// PaintScene adapter that paints Blitz's zero-blur inset shadow layers as
-/// one fill.
+/// One whole inset layer (all six commands seen).
+struct Layer {
+    transform: Affine,
+    path: BezPath,
+    color: Color,
+    hole: Hole,
+}
+
+/// What a paint needs to know about inset shadows: the scale, and the
+/// device-px padding boxes whose hard bevels `fields.rs` repaints.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct InsetTable {
+    pub(crate) scale: f64,
+    pub(crate) fields: Vec<Rect>,
+}
+
+impl InsetTable {
+    fn is_field(&self, outer: Rect) -> bool {
+        const NEAR: f64 = 0.01;
+        self.fields.iter().any(|f| {
+            (f.x0 - outer.x0).abs() < NEAR
+                && (f.y0 - outer.y0).abs() < NEAR
+                && (f.x1 - outer.x1).abs() < NEAR
+                && (f.y1 - outer.y1).abs() < NEAR
+        })
+    }
+}
+
+/// PaintScene adapter that paints Blitz's inset shadow layers as fills: hard
+/// runs in CSS order at device px, the rest as Blitz does.
 pub(crate) struct InsetScene<'a, S: PaintScene> {
     inner: &'a mut S,
     pending: Option<Pending>,
+    /// Whole layers over one padding box, in Blitz's (list) order.
+    run: Vec<Layer>,
+    table: &'a InsetTable,
     enabled: bool,
 }
 
 impl<'a, S: PaintScene> InsetScene<'a, S> {
-    pub(crate) fn new(inner: &'a mut S) -> Self {
+    pub(crate) fn new(inner: &'a mut S, table: &'a InsetTable) -> Self {
         Self {
             inner,
             pending: None,
+            run: Vec::new(),
+            table,
             enabled: ENABLED.with(|e| e.get()),
         }
     }
 
-    /// Replay any buffered commands. Call after `paint_scene`.
+    /// Paint or replay anything buffered. Call after `paint_scene`.
     pub(crate) fn finish(&mut self) {
         self.flush();
     }
 
-    /// Forward the buffered commands unchanged.
+    /// Paint the buffered run, then forward the buffered commands unchanged.
     fn flush(&mut self) {
+        self.emit_run();
+        self.flush_pending();
+    }
+
+    /// Forward the buffered commands of an unfinished layer unchanged.
+    fn flush_pending(&mut self) {
         let Some(p) = self.pending.take() else {
             return;
         };
@@ -166,10 +219,60 @@ impl<'a, S: PaintScene> InsetScene<'a, S> {
         }
     }
 
-    /// The last `pop_layer` of a whole layer: one fill when exact, else the
-    /// six commands unchanged.
+    /// The last `pop_layer` of a whole layer: add it to the run (a layer
+    /// over another padding box paints the run first).
     fn complete(&mut self, p: Pending, color: Color, hole: Hole) {
-        if let Some(path) = fast_fill(p.transform, &p.path, hole) {
+        if self
+            .run
+            .first()
+            .is_some_and(|l| l.transform != p.transform || l.path != p.path)
+        {
+            self.emit_run();
+        }
+        self.run.push(Layer {
+            transform: p.transform,
+            path: p.path,
+            color,
+            hole,
+        });
+    }
+
+    /// Paint the buffered run: CSS order at device px when every layer is
+    /// hard (and not a typed field's), else each layer as Blitz does.
+    fn emit_run(&mut self) {
+        let run = std::mem::take(&mut self.run);
+        let Some(first) = run.first() else {
+            return;
+        };
+        let hard = run.iter().all(|l| hard_fill(l, 1.0).is_some())
+            && path_rect(&first.path)
+                .is_some_and(|r| !self.table.is_field(r + first.transform.translation()));
+        if hard {
+            // Last listed first: the first shadow ends on top.
+            for l in run.iter().rev() {
+                if let Some(path) = hard_fill(l, self.table.scale).flatten() {
+                    self.inner
+                        .fill(Fill::EvenOdd, Affine::IDENTITY, l.color, None, &path);
+                }
+                bump(|c| c.hard += 1);
+            }
+            return;
+        }
+        for l in run {
+            self.blitz_layer(l);
+        }
+    }
+
+    /// One layer as Blitz paints it: one fill when exact, else the six
+    /// commands unchanged.
+    fn blitz_layer(&mut self, l: Layer) {
+        let Layer {
+            transform,
+            path,
+            color,
+            hole,
+        } = l;
+        if let Some(fill) = fast_fill(transform, &path, hole) {
             bump(|c| c.fast += 1);
             // A translucent colour keeps Blitz's outer layer: composited
             // straight onto the backdrop it rounds one level differently
@@ -180,14 +283,14 @@ impl<'a, S: PaintScene> InsetScene<'a, S> {
                     Fill::NonZero,
                     Mix::Normal,
                     1.0,
-                    p.transform,
-                    &p.path,
+                    transform,
+                    &path,
                     None,
                     None,
                 );
             }
             self.inner
-                .fill(Fill::EvenOdd, Affine::IDENTITY, color, None, &path);
+                .fill(Fill::EvenOdd, Affine::IDENTITY, color, None, &fill);
             if layer {
                 self.inner.pop_layer();
             }
@@ -195,12 +298,42 @@ impl<'a, S: PaintScene> InsetScene<'a, S> {
         }
         bump(|c| c.replayed += 1);
         self.pending = Some(Pending {
+            transform,
+            path,
             stage: Stage::Popped(color, hole),
-            ..p
         });
-        self.flush();
+        self.flush_pending();
         self.inner.pop_layer();
     }
+}
+
+/// A hard layer (no blur, no radius, pure translations, rectangular padding
+/// box) as a device-space even-odd path with the offset scaled by `scale`:
+/// `None` when the layer is not hard, `Some(None)` when it covers nothing.
+fn hard_fill(l: &Layer, scale: f64) -> Option<Option<BezPath>> {
+    let h = l.hole;
+    if h.std_dev != 0.0
+        || h.radius != 0.0
+        || !is_translation(l.transform)
+        || !is_translation(h.transform)
+    {
+        return None;
+    }
+    let at = l.transform.translation();
+    let outer = path_rect(&l.path)? + at;
+    if !has_area(outer) {
+        return Some(None);
+    }
+    // Blitz moves the hole by the CSS offset; Chrome by offset × scale.
+    let offset = (h.transform.translation() - at) * scale;
+    let cut = (h.rect + at + offset).intersect(outer);
+    let mut out = outer.to_path(0.1);
+    // A hole the spread turned inside out, or one moved off the box, leaves
+    // the whole padding box in the shadow colour.
+    if has_area(cut) {
+        out.extend(cut.to_path(0.1));
+    }
+    Some(Some(out))
 }
 
 /// Whole device px (within EPS), rounded.
@@ -310,6 +443,7 @@ impl<'a, S: PaintScene> RenderContext for InsetScene<'a, S> {
 impl<'a, S: PaintScene> PaintScene for InsetScene<'a, S> {
     fn reset(&mut self) {
         self.pending = None;
+        self.run.clear();
         self.inner.reset();
     }
 
@@ -338,8 +472,10 @@ impl<'a, S: PaintScene> PaintScene for InsetScene<'a, S> {
                 }
             }
         }
-        self.flush();
-        // Step 1.
+        // Step 1 starts a layer that may join the run; anything else ends it.
+        if self.pending.is_some() {
+            self.flush();
+        }
         if self.enabled && plain && blend == BlendMode::from(Mix::Normal) {
             if let Some(els) = path_of(clip) {
                 self.pending = Some(Pending {
@@ -350,6 +486,7 @@ impl<'a, S: PaintScene> PaintScene for InsetScene<'a, S> {
                 return;
             }
         }
+        self.flush();
         self.inner
             .push_layer(fill, blend, alpha, transform, clip, filter, backdrop_filter);
     }
@@ -361,6 +498,7 @@ impl<'a, S: PaintScene> PaintScene for InsetScene<'a, S> {
 
     fn pop_layer(&mut self) {
         let Some(mut p) = self.pending.take() else {
+            self.flush();
             self.inner.pop_layer();
             return;
         };
@@ -521,8 +659,21 @@ mod tests {
     }
 
     fn adapted(feed: impl Fn(&mut InsetScene<'_, Scene>)) -> Vec<RenderCommand> {
+        adapted_with(
+            &InsetTable {
+                scale: 1.0,
+                fields: Vec::new(),
+            },
+            feed,
+        )
+    }
+
+    fn adapted_with(
+        table: &InsetTable,
+        feed: impl Fn(&mut InsetScene<'_, Scene>),
+    ) -> Vec<RenderCommand> {
         let mut scene = Scene::new();
-        let mut inset = InsetScene::new(&mut scene);
+        let mut inset = InsetScene::new(&mut scene, table);
         inset.enabled = true;
         feed(&mut inset);
         inset.finish();
@@ -598,5 +749,96 @@ mod tests {
         let mut curved = padding_path(BOX);
         curved.quad_to((0.0, 0.0), (0.0, 0.0));
         assert_eq!(path_rect(&curved), None);
+    }
+
+    /// The fills' colours and device-space bounding boxes, in order.
+    fn fills(out: &[RenderCommand]) -> Vec<(Color, Rect)> {
+        out.iter()
+            .map(|c| match c {
+                RenderCommand::Fill(f) => {
+                    let anyrender::Paint::Solid(color) = f.brush else {
+                        panic!("{c:?}")
+                    };
+                    (color, f.shape.bounding_box())
+                }
+                _ => panic!("{out:?}"),
+            })
+            .collect()
+    }
+
+    /// Blitz's commands for `inset 1px 1px WHITE, inset -1px -1px BLACK`
+    /// over BOX at `scale` (hole moved by the CSS offset, unscaled).
+    fn bevel(s: &mut impl PaintScene, scale: f64) {
+        let b = BOX.scale_from_origin(scale);
+        let path = padding_path(b);
+        for (d, c) in [(1.0, Color::WHITE), (-1.0, Color::BLACK)] {
+            let h = hole(T.then_translate(Vec2::new(d, d)), b, 0.0);
+            inset_layer(s, T, &path, h, c);
+        }
+    }
+
+    #[test]
+    fn a_hard_run_paints_the_first_shadow_on_top() {
+        let out = fills(&adapted(|s| bevel(s, 1.0)));
+        assert_eq!(
+            out.iter().map(|f| f.0).collect::<Vec<_>>(),
+            [Color::BLACK, Color::WHITE],
+            "last listed first"
+        );
+    }
+
+    #[test]
+    fn a_hard_run_moves_the_hole_by_the_offset_in_device_px() {
+        let table = InsetTable {
+            scale: 2.0,
+            fields: Vec::new(),
+        };
+        let out = adapted_with(&table, |s| bevel(s, 2.0));
+        let RenderCommand::Fill(f) = &out[1] else {
+            panic!("{out:?}")
+        };
+        // White layer: padding box (10,20)-(110,80), hole moved by 2 device px.
+        let segs: Vec<Rect> = f
+            .shape
+            .elements()
+            .split(|e| matches!(e, PathEl::ClosePath))
+            .filter(|s| !s.is_empty())
+            .map(|s| BezPath::from_vec(s.to_vec()).bounding_box())
+            .collect();
+        assert_eq!(
+            segs,
+            [
+                Rect::new(10.0, 20.0, 110.0, 80.0),
+                Rect::new(12.0, 22.0, 110.0, 80.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_typed_field_run_keeps_blitz_order_and_offsets() {
+        let table = InsetTable {
+            scale: 2.0,
+            fields: vec![BOX.scale_from_origin(2.0) + T.translation()],
+        };
+        let out = fills(&adapted_with(&table, |s| bevel(s, 2.0)));
+        assert_eq!(
+            out.iter().map(|f| f.0).collect::<Vec<_>>(),
+            [Color::WHITE, Color::BLACK],
+            "list order, as Blitz"
+        );
+    }
+
+    #[test]
+    fn another_command_ends_the_run_in_place() {
+        let path = padding_path(BOX);
+        let h = hole(T.then_translate(Vec2::new(1.0, 1.0)), BOX, 0.0);
+        let out = adapted(|s| {
+            inset_layer(s, T, &path, h, Color::BLACK);
+            s.fill(Fill::NonZero, T, Color::WHITE, None, &BOX);
+            inset_layer(s, T, &path, h, Color::BLACK);
+        });
+        let f = fills(&out);
+        assert_eq!(f.len(), 3, "{out:?}");
+        assert_eq!(f[1].0, Color::WHITE, "the plain fill stays between");
     }
 }

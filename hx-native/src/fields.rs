@@ -12,7 +12,9 @@
 //!   `box-shadow: inset -1px -1px #fff, inset 1px 1px #888, inset -2px -2px
 //!   #ddd, inset 2px 2px #444` therefore comes out as dark top/left only. For typed
 //!   fields whose shadows are all hard insets (no blur / spread, opaque) the
-//!   engine repaints those bands in CSS order over the Blitz raster.
+//!   engine repaints those bands in CSS order over the Blitz raster. Hard
+//!   insets elsewhere are painted in CSS order by `inset_shadow.rs` (#125),
+//!   which leaves these fields' layers to Blitz so they are painted once.
 
 use blitz_dom::NodeId;
 use blitz_html::HtmlDocument;
@@ -153,9 +155,10 @@ fn hard_insets(doc: &HtmlDocument, nid: NodeId) -> Option<Vec<HardInset>> {
     Some(out)
 }
 
-/// Repaint hard inset bevels of typed fields in CSS order (first shadow on
-/// top). Same pixels every frame, so a partial repaint equals a full one.
-pub(crate) fn paint_field_bevels(doc: &HtmlDocument, frame: &mut RgbaImage, scale: f64) {
+/// Typed fields whose hard inset bevels the replay repaints: node, padding
+/// box (CSS px) and shadows.
+fn replayed_fields(doc: &HtmlDocument) -> Vec<(NodeId, ControlRect, Vec<HardInset>)> {
+    let mut out = Vec::new();
     for nid in typed_fields(doc) {
         let Some(shadows) = hard_insets(doc, nid) else {
             continue;
@@ -181,6 +184,28 @@ pub(crate) fn paint_field_bevels(doc: &HtmlDocument, frame: &mut RgbaImage, scal
         if pad.w <= 0.0 || pad.h <= 0.0 {
             continue;
         }
+        out.push((nid, pad, shadows));
+    }
+    out
+}
+
+/// Device-px padding boxes of the typed fields [`paint_field_bevels`]
+/// repaints. `InsetScene` leaves their inset layers in Blitz's order, so
+/// they keep the pixels they had and are not reordered twice (issue #125).
+pub(crate) fn field_bevel_boxes(doc: &HtmlDocument, scale: f64) -> Vec<kurbo::Rect> {
+    replayed_fields(doc)
+        .into_iter()
+        .map(|(_, p, _)| {
+            let s = |v: f32| v as f64 * scale;
+            kurbo::Rect::new(s(p.x), s(p.y), s(p.x + p.w), s(p.y + p.h))
+        })
+        .collect()
+}
+
+/// Repaint hard inset bevels of typed fields in CSS order (first shadow on
+/// top). Same pixels every frame, so a partial repaint equals a full one.
+pub(crate) fn paint_field_bevels(doc: &HtmlDocument, frame: &mut RgbaImage, scale: f64) {
+    for (nid, pad, shadows) in replayed_fields(doc) {
         let mut cv = Canvas::new(
             frame,
             scale,

@@ -284,10 +284,15 @@ fn g3_hit_columns_match_paint_787() {
             while dpx(r + 1) == [192, 192, 192] {
                 r += 1;
             }
-            let (left_edge, right_edge) = (l - 1, r + 1); // highlight, dark bevel
+            // The 1px highlight and dark bevel are 1 CSS px = `s` device px
+            // wide, as in Chrome (#125; they were 1 device px at every scale).
+            let w = s as u32;
+            let (left_edge, right_edge) = (l - w, r + w); // highlight, dark bevel
             eprintln!("scale {s} {id}-up box css x {ax}..{} ; painted dev px {left_edge}..={right_edge} hl {:?} dk {:?} -> css {:.2}..{:.2}", ax + aw, dpx(left_edge), dpx(right_edge), left_edge as f64 / s, (right_edge + 1) as f64 / s);
-            assert_eq!(dpx(left_edge), [255, 255, 255]);
-            assert_eq!(dpx(right_edge), [10, 10, 10]);
+            for k in 1..=w {
+                assert_eq!(dpx(l - k), [255, 255, 255], "highlight");
+                assert_eq!(dpx(r + k), [10, 10, 10], "dark bevel");
+            }
             assert!(
                 (left_edge as f64 / s - ax as f64).abs() < 1e-6,
                 "painted left = box left"

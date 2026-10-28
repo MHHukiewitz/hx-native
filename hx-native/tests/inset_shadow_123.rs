@@ -1,51 +1,26 @@
-//! Issue #123: a zero-blur inset `box-shadow` layer on whole device pixels
-//! is painted as one even-odd fill instead of Blitz's two layers around a
-//! per-pixel blurred-rect hole. The fast path must be pixel-identical to
-//! Blitz's layers (bevels, spread, offsets past the box, translucent colours,
-//! borders, opacity; scale 1, 1.5 and 2), shapes it cannot draw exactly must
-//! fall back, and partial repaint must equal full repaint. The wall-clock
-//! check is `#[ignore]`d; see its doc comment.
+//! Issue #123: a zero-blur inset `box-shadow` layer is painted as one
+//! even-odd fill instead of Blitz's two layers around a per-pixel
+//! blurred-rect hole. Since #125 hard layers (no blur, no radius, pure
+//! translation) follow Chrome (CSS order, offset in device px), so they are
+//! checked against Chrome's pixels (bevels, spread, offsets past the box,
+//! translucent colours, borders, opacity); layers that are not hard must stay
+//! pixel-identical to Blitz's layers, and partial repaint must equal full
+//! repaint. The wall-clock check is `#[ignore]`d; see its doc comment.
+
+mod chrome_profiles;
 
 use std::time::Instant;
+
+use chrome_profiles as cp;
 
 use hx_native::*;
 
 const W: f64 = 320.0;
 const H: f64 = 120.0;
 
-/// Win95 kit bevels plus every inset shape the fast path has to get right or
-/// leave alone.
-const PAGE: &str = r#"<!DOCTYPE html><html><head><style>
-html,body{margin:0;background:#008080}
-.b{position:absolute;box-sizing:border-box;background:#c0c0c0}
-.bevel{box-shadow:inset 1px 1px #fff,inset -1px -1px #808080}
-.button{box-shadow:inset -1px -1px #0a0a0a,inset 1px 1px #fff,inset -2px -2px #808080,inset 2px 2px #dfdfdf}
-.field{border:2px solid #000;padding:3px;box-shadow:inset 1px 1px #808080,inset -1px -1px #dfdfdf}
-.spread{box-shadow:inset 0 0 0 3px #00f}
-.far{box-shadow:inset 30px 0 #f00,inset 0 -40px #0f0}
-.half{box-shadow:inset 2px 2px rgba(0,0,0,.5),inset -3px -1px rgba(255,255,255,.25)}
-.fade{opacity:.6}
-.round{border-radius:6px;box-shadow:inset 1px 1px #fff,inset -1px -1px #808080}
-.blur{box-shadow:inset 0 0 4px #000}
-.clear{box-shadow:inset 1px 1px transparent,inset 2px 2px #000}
-.inside{box-shadow:inset 0 0 0 20px #f0f}
-.tilt{transform:rotate(3deg)}
-.nudge{transform:translate(0.5px,0.25px)}
-</style></head><body>
-<div class="b bevel" style="left:2px;top:2px;width:120px;height:40px"></div>
-<div class="b button" style="left:130px;top:2px;width:75px;height:23px"></div>
-<div class="b field" style="left:212px;top:2px;width:100px;height:21px"></div>
-<div class="b spread" style="left:2px;top:50px;width:30px;height:30px"></div>
-<div class="b far" style="left:40px;top:50px;width:20px;height:30px"></div>
-<div class="b half" style="left:68px;top:50px;width:40px;height:30px"></div>
-<div class="fade" style="position:absolute;left:116px;top:50px"><div class="b bevel" style="left:0;top:0;width:40px;height:30px"></div></div>
-<div class="b round" style="left:164px;top:50px;width:40px;height:30px"></div>
-<div class="b blur" style="left:212px;top:50px;width:40px;height:30px"></div>
-<div class="b clear" style="left:260px;top:50px;width:40px;height:30px"></div>
-<div class="b inside" style="left:2px;top:88px;width:30px;height:24px"></div>
-<div class="b bevel nudge" style="left:40px;top:88px;width:40px;height:24px"></div>
-<div class="b bevel tilt" style="left:90px;top:88px;width:40px;height:24px"></div>
-</body></html>"#;
+/// Win95 kit bevels plus every inset shape the adapter has to get right or
+/// leave alone (`fixtures/inset123.html`).
+const PAGE: &str = include_str!("fixtures/inset123.html");
 
 fn engine() -> Engine {
     let mut e = Engine::new(EngineConfig {
@@ -86,25 +61,77 @@ fn first_diff(a: &[u8], b: &[u8], w: usize) -> Option<(usize, usize, [u8; 4], [u
         })
 }
 
+/// Hard layers on whole device pixels match Chrome (every box Chrome does
+/// not snap at that scale: `fixtures/bevel125_chrome.txt`). At 1.25 no box
+/// of this page lands on whole device pixels, so there is nothing to check.
+/// `fade` is left out: its `opacity` wrapper has no size and Blitz paints
+/// nothing of it at all (box, background or shadow), which is not an inset
+/// shadow matter.
 #[test]
-fn fast_path_is_pixel_identical_to_blitz_layers() {
+fn hard_layers_match_chrome() {
+    let mut bad = Vec::new();
     for scale in [1.0, 1.5, 2.0] {
+        assert!(!cp::profiles("inset123", scale).is_empty(), "fixture");
+        let fast = full_paint(PAGE, scale, true);
+        bad.extend(cp::mismatches(
+            "inset123",
+            scale,
+            &[
+                "bevel", "button", "field", "spread", "far", "half", "inside",
+            ],
+            &fast,
+            (W * scale) as usize,
+        ));
+    }
+    assert!(bad.is_empty(), "off Chrome:\n{}", bad.join("\n"));
+}
+
+/// Device rect (x, y, w, h) of a CSS box, grown by `pad` CSS px.
+fn device_rect(b: (f64, f64, f64, f64), pad: f64, scale: f64) -> (usize, usize, usize, usize) {
+    let x0 = ((b.0 - pad) * scale).floor() as usize;
+    let y0 = ((b.1 - pad) * scale).floor() as usize;
+    let x1 = ((b.0 + b.2 + pad) * scale).ceil() as usize;
+    let y1 = ((b.1 + b.3 + pad) * scale).ceil() as usize;
+    (x0, y0, x1 - x0, y1 - y0)
+}
+
+/// Layers that are not hard (radius, blur, rotation) and the transparent
+/// first layer Blitz stops at stay pixel-identical to Blitz's layers.
+#[test]
+fn soft_layers_are_pixel_identical_to_blitz_layers() {
+    // round, blur, clear, tilt (grown 2 CSS px for the rotation).
+    let soft = [
+        ((164.0, 50.0, 40.0, 30.0), 0.0),
+        ((212.0, 50.0, 40.0, 30.0), 0.0),
+        ((260.0, 50.0, 40.0, 30.0), 0.0),
+        ((90.0, 88.0, 40.0, 24.0), 2.0),
+    ];
+    for scale in [1.0, 1.25, 1.5, 2.0] {
         let _ = take_inset_shadow_counters_for_test();
         let fast = full_paint(PAGE, scale, true);
         let c = take_inset_shadow_counters_for_test();
         let layers = full_paint(PAGE, scale, false);
-        assert_eq!(
-            first_diff(&fast, &layers, (W * scale) as usize),
-            None,
-            "scale {scale}: (x, y, fast, layers)"
-        );
-        assert!(c.fast > 0 && c.replayed > 0, "scale {scale}: {c:?}");
+        let w = (W * scale) as usize;
+        for (b, pad) in soft {
+            let (x, y, rw, rh) = device_rect(b, pad, scale);
+            for row in y..y + rh {
+                let r = (row * w + x) * 4..(row * w + x + rw) * 4;
+                assert_eq!(
+                    first_diff(&fast[r.clone()], &layers[r], rw),
+                    None,
+                    "scale {scale} box {b:?} row {row}: (dx, _, fast, layers)"
+                );
+            }
+        }
+        assert!(c.hard > 0 && c.replayed > 0, "scale {scale}: {c:?}");
     }
 }
 
-/// Layers per class at scale 1: which take the fast path and which replay.
+/// Layers per class at scale 1, as (hard, fast, replayed): hard layers take
+/// the #125 CSS-order path, the rest replay (or, in a run mixed with a
+/// blurred layer, keep #123's one-fill path).
 #[test]
-fn whole_pixel_layers_take_the_fast_path_and_the_rest_replay() {
+fn hard_layers_take_the_css_order_path_and_the_rest_replay() {
     let count = |class: &str, style: &str| {
         let html = PAGE.split("</style>").next().unwrap().to_owned()
             + &format!(
@@ -113,25 +140,32 @@ fn whole_pixel_layers_take_the_fast_path_and_the_rest_replay() {
         let _ = take_inset_shadow_counters_for_test();
         let _ = full_paint(&html, 1.0, true);
         let c = take_inset_shadow_counters_for_test();
-        (c.fast, c.replayed)
+        (c.hard, c.fast, c.replayed)
     };
     let at = "left:10px;top:10px;width:60px;height:30px";
-    assert_eq!(count("bevel", at), (2, 0));
-    assert_eq!(count("button", at), (4, 0));
-    assert_eq!(count("field", at), (2, 0));
-    assert_eq!(count("spread", at), (1, 0));
-    assert_eq!(count("far", at), (2, 0));
-    assert_eq!(count("half", at), (2, 0));
-    assert_eq!(count("round", at), (0, 2), "a corner radius replays");
-    assert_eq!(count("blur", at), (0, 1), "a blur replays");
+    assert_eq!(count("bevel", at), (2, 0, 0));
+    assert_eq!(count("button", at), (4, 0, 0));
+    assert_eq!(count("field", at), (2, 0, 0));
+    assert_eq!(count("spread", at), (1, 0, 0));
+    assert_eq!(count("far", at), (2, 0, 0));
+    assert_eq!(count("half", at), (2, 0, 0));
+    assert_eq!(count("inside", at), (1, 0, 0));
+    assert_eq!(count("round", at), (0, 0, 2), "a corner radius replays");
+    assert_eq!(count("blur", at), (0, 0, 1), "a blur replays");
     // Blitz stops at a transparent layer (the black one is never drawn).
-    assert_eq!(count("clear", at), (0, 0));
+    assert_eq!(count("clear", at), (0, 0, 0));
     assert_eq!(
         count("bevel nudge", at),
-        (0, 2),
-        "a box off whole pixels replays"
+        (2, 0, 0),
+        "a box off whole pixels is still hard (anti-aliased like Chrome)"
     );
-    assert_eq!(count("bevel tilt", at), (0, 2), "a rotated box replays");
+    assert_eq!(count("bevel tilt", at), (0, 0, 2), "a rotated box replays");
+    let mixed = format!("{at};box-shadow:inset 1px 1px #fff,inset 0 0 4px #000");
+    assert_eq!(
+        count("", &mixed),
+        (0, 1, 1),
+        "a run with a blurred layer keeps Blitz's order"
+    );
 }
 
 #[test]
@@ -214,7 +248,7 @@ fn a_bevelled_panel_paints_every_layer_as_one_fill() {
     let _ = take_inset_shadow_counters_for_test();
     let _ = best_full_paint_ns(&html, true, 1);
     let c = take_inset_shadow_counters_for_test();
-    assert_eq!((c.fast, c.replayed), (8, 0), "{c:?}");
+    assert_eq!((c.hard, c.fast, c.replayed), (8, 0, 0), "{c:?}");
 }
 
 /// Wall-clock check: a full repaint of the bevelled panel costs at most twice
