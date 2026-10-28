@@ -174,7 +174,7 @@ fn partial_repaint_equals_full_repaint() {
     // Exact mode, as #123; Shifted may differ by 1/255 by design.
     let mode = PaintMode::Exact;
     {
-        for scale in [1.0, 2.0] {
+        for scale in SCALES {
             let vp = viewport(PAGE_W, PAGE_H, scale);
             let mut e = engine(mode);
             e.load_html(PAGE).unwrap();
@@ -205,5 +205,49 @@ fn partial_repaint_equals_full_repaint() {
                 );
             }
         }
+    }
+}
+
+/// The colour at CSS (x, y) of a full paint.
+fn pixel_at(html: &str, scale: f64, x: f64, y: f64) -> [u8; 4] {
+    let p = paint(html, 100.0, 100.0, scale, true);
+    let w = (100.0 * scale) as usize;
+    let i = (((y * scale) as usize) * w + (x * scale) as usize) * 4;
+    [p[i], p[i + 1], p[i + 2], p[i + 3]]
+}
+
+#[test]
+fn a_buffered_run_paints_before_its_clip_pops() {
+    // The kid's red band sticks out of an overflow clip; nothing follows its
+    // shadows but the clip's pop_layer.
+    let html = r#"<!DOCTYPE html><html><head><style>
+html,body{margin:0;background:#008080}
+.clip{position:absolute;left:20px;top:20px;width:40px;height:40px;overflow:hidden}
+.kid{position:absolute;left:-10px;top:-10px;width:60px;height:60px;box-shadow:inset 4px 4px #f00}
+</style></head><body><div class="clip"><div class="kid"></div></div></body></html>"#;
+    for scale in SCALES {
+        assert_eq!(
+            pixel_at(html, scale, 12.0, 30.0),
+            [0, 0x80, 0x80, 255],
+            "scale {scale}: the run escaped the clip"
+        );
+    }
+}
+
+#[test]
+fn a_child_run_paints_above_its_parent_run() {
+    // Two transparent elements, so no command separates their shadows; the
+    // runs split on the padding box and keep paint order between elements.
+    let html = r#"<!DOCTYPE html><html><head><style>
+html,body{margin:0;background:#c0c0c0}
+.p{position:absolute;left:20px;top:20px;width:60px;height:60px;box-shadow:inset 6px 6px #f00}
+.c{position:absolute;left:0;top:0;width:30px;height:30px;box-shadow:inset 3px 3px #00f}
+</style></head><body><div class="p"><div class="c"></div></div></body></html>"#;
+    for scale in SCALES {
+        assert_eq!(
+            pixel_at(html, scale, 21.0, 35.0),
+            [0, 0, 255, 255],
+            "scale {scale}: the parent's shadow painted over the child's"
+        );
     }
 }
