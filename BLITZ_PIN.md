@@ -83,7 +83,7 @@ the merge: `merged_runs_count_and_fallbacks_at_scale_1` and
 differently (e.g. one fill with an extended brush) makes the pass a no-op;
 remove it then.
 
-## Zero-blur inset box-shadow (pin-sensitive, #123)
+## Zero-blur inset box-shadow (pin-sensitive, #123, #125)
 
 `hx-native/src/inset_shadow.rs` (`InsetScene`, between `ShadowScene` and
 `TileScene` in `paint.rs`) relies on how **0.3.0-beta.4** `blitz-paint`
@@ -93,6 +93,8 @@ remove it then.
   same path with the shadow colour, `push_layer(NonZero, Compose::DestOut,
   1.0, T, padding_box_path)`, `draw_box_shadow` of the hole in white, then two
   `pop_layer`s, with nothing in between;
+- the layers of one box come in list order (first shadow painted first, so
+  it ends **under** the others; Chrome puts it on top);
 - the padding box path of a box with sharp corners is a `MoveTo` and three
   `LineTo`s (`kurbo_css` `insert_point`);
 - the hole is `padding_box.inflate(-spread * scale)`, moved by the offset in
@@ -100,19 +102,26 @@ remove it then.
   the averaged corner radius and `blur * scale` as the standard deviation;
 - a transparent layer ends the loop (`return`, not `continue`).
 
-vello_cpu 0.3 draws the hole with its blurred rounded rect shader (`powf` per
-pixel) even at zero blur; at zero blur that is a hard step at each pixel
-centre. With no blur and no radius, under a pure translation, with both
-rects on whole device px, `InsetScene` paints the padding box minus the hole
-as one even-odd fill (inside the outer layer only for a translucent colour).
-Everything else is replayed unchanged.
+`InsetScene` collects the consecutive layers that share a transform and
+padding box path. When every one is hard (no blur, no radius, pure
+translation) and the box is not a typed field that `fields.rs` repaints, it
+paints them last-listed first, each as one even-odd fill of the padding box
+minus the hole moved by the offset **times the scale** (#125: Chrome's order
+and width). Otherwise each layer is painted as before: one even-odd fill when
+both rects are on whole device px (inside the outer layer only for a
+translucent colour, #123), else Blitz's commands unchanged. vello_cpu 0.3
+draws the hole with its blurred rounded rect shader (`powf` per pixel) even
+at zero blur, so the fills are also cheaper.
 
-A bump that changes the command order or the path makes the fast path a
-no-op (the layer replays): `whole_pixel_layers_take_the_fast_path_and_the_rest_replay`
+A bump that changes the command order or the path makes the pass a no-op
+(the layers replay in Blitz's order): `hard_layers_take_the_css_order_path_and_the_rest_replay`
 and `a_bevelled_panel_paints_every_layer_as_one_fill` in
-`hx-native/tests/inset_shadow_123.rs` fail first. A bump that scales the
-offset changes the pixels of both paths alike; a bump that paints zero-blur
-inset shadows as fills makes the pass redundant; remove it then.
+`hx-native/tests/inset_shadow_123.rs` fail first. A bump that reverses the
+order or scales the offset itself would make the bevels wrong twice:
+`win95_bevels_match_chrome_at_every_scale` in
+`hx-native/tests/inset_order_125.rs` fails; drop the reversal or the scaling
+then. A bump that paints zero-blur inset shadows as fills in CSS order at
+device px makes the pass redundant; remove it then.
 
 ## Radio baseline and ring scale (pin-sensitive, #116)
 

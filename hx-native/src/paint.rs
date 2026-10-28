@@ -14,7 +14,8 @@ use peniko::{BlendMode, Color, Fill, FontData, StyleRef};
 
 use crate::damage::IntRect;
 use crate::error::EngineError;
-use crate::inset_shadow::InsetScene;
+use crate::fields::field_bevel_boxes;
+use crate::inset_shadow::{InsetScene, InsetTable};
 use crate::text_shadow::{ShadowScene, ShadowTable};
 use crate::tile_coalesce::TileScene;
 use crate::types::{PaintMode, RgbaImage};
@@ -29,11 +30,12 @@ pub fn paint_rgba(
         return Err(EngineError::Paint("viewport size must be non-zero".into()));
     }
     let table = ShadowTable::build(doc, scale);
+    let insets = inset_table(doc, scale);
     let pixels = render_to_buffer::<VelloCpuImageRenderer, _>(
         |scene| {
             let mut tiles = TileScene::new(scene);
             {
-                let mut inset = InsetScene::new(&mut tiles);
+                let mut inset = InsetScene::new(&mut tiles, &insets);
                 {
                     let mut shadow = ShadowScene {
                         inner: &mut inset,
@@ -70,16 +72,25 @@ pub fn paint_damage_into(
     }
     // Issue #57: one shadow table for every rect of this paint.
     let table = ShadowTable::build(doc, scale);
+    let insets = inset_table(doc, scale);
     for rect in damage {
         if rect.is_empty() {
             continue;
         }
         match mode {
-            PaintMode::Exact => paint_exact_rect(doc, frame, scale, *rect, &table)?,
-            PaintMode::Shifted => paint_shifted_rect(doc, frame, scale, *rect, &table)?,
+            PaintMode::Exact => paint_exact_rect(doc, frame, scale, *rect, &table, &insets)?,
+            PaintMode::Shifted => paint_shifted_rect(doc, frame, scale, *rect, &table, &insets)?,
         }
     }
     Ok(())
+}
+
+/// Issue #125: the scale and the typed-field padding boxes for `InsetScene`.
+fn inset_table(doc: &HtmlDocument, scale: f64) -> InsetTable {
+    InsetTable {
+        scale,
+        fields: field_bevel_boxes(doc, scale),
+    }
 }
 
 /// Exact method: cull + full-size clip layer, render W×H, copy the rect.
@@ -89,6 +100,7 @@ fn paint_exact_rect(
     scale: f64,
     rect: IntRect,
     table: &ShadowTable,
+    insets: &InsetTable,
 ) -> Result<(), EngineError> {
     let width = frame.width;
     let height = frame.height;
@@ -113,7 +125,7 @@ fn paint_exact_rect(
             // partial paints see the same commands (issues #57, #67).
             let mut tiles = TileScene::new(&mut cull);
             {
-                let mut inset = InsetScene::new(&mut tiles);
+                let mut inset = InsetScene::new(&mut tiles, insets);
                 {
                     let mut shadow = ShadowScene {
                         inner: &mut inset,
@@ -140,6 +152,7 @@ fn paint_shifted_rect(
     scale: f64,
     rect: IntRect,
     table: &ShadowTable,
+    insets: &InsetTable,
 ) -> Result<(), EngineError> {
     let width = frame.width;
     let height = frame.height;
@@ -165,7 +178,7 @@ fn paint_shifted_rect(
             };
             let mut tiles = TileScene::new(&mut cull);
             {
-                let mut inset = InsetScene::new(&mut tiles);
+                let mut inset = InsetScene::new(&mut tiles, insets);
                 {
                     let mut shadow = ShadowScene {
                         inner: &mut inset,

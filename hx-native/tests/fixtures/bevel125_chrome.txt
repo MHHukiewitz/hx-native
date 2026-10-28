@@ -1,0 +1,309 @@
+# Headless Chrome pixels (--force-device-scale-factor) of the fixture pages, made by
+# bevel125_chrome.py. Columns: page box scale edge, start pixel x y,
+# step dx dy, then colours from
+# the outer edge inward: edges at their middle, corners along the diagonal; ceil(4*scale)+1
+# pixels. Only boxes on whole device pixels at that scale (Chrome snaps the rest).
+bevel125 panel 1 top 36 8 0 1 ffffff dfdfdf c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 1 bottom 36 39 0 -1 000000 808080 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 1 left 8 24 1 0 ffffff dfdfdf c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 1 right 63 24 -1 0 000000 808080 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 1 tl 8 8 1 1 ffffff dfdfdf c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 1 tr 63 8 -1 1 000000 808080 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 1 bl 8 39 1 -1 000000 808080 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 1 br 63 39 -1 -1 000000 808080 c0c0c0 c0c0c0 c0c0c0
+bevel125 sunk 1 top 100 8 0 1 808080 0a0a0a ffffff ffffff ffffff
+bevel125 sunk 1 bottom 100 39 0 -1 ffffff dfdfdf ffffff ffffff ffffff
+bevel125 sunk 1 left 72 24 1 0 808080 0a0a0a ffffff ffffff ffffff
+bevel125 sunk 1 right 127 24 -1 0 ffffff dfdfdf ffffff ffffff ffffff
+bevel125 sunk 1 tl 72 8 1 1 808080 0a0a0a ffffff ffffff ffffff
+bevel125 sunk 1 tr 127 8 -1 1 ffffff dfdfdf ffffff ffffff ffffff
+bevel125 sunk 1 bl 72 39 1 -1 ffffff dfdfdf ffffff ffffff ffffff
+bevel125 sunk 1 br 127 39 -1 -1 ffffff dfdfdf ffffff ffffff ffffff
+bevel125 button 1 top 164 8 0 1 ffffff dfdfdf c0c0c0 c0c0c0 c0c0c0
+bevel125 button 1 bottom 164 31 0 -1 0a0a0a 808080 c0c0c0 c0c0c0 c0c0c0
+bevel125 button 1 left 136 20 1 0 ffffff dfdfdf c0c0c0 c0c0c0 c0c0c0
+bevel125 button 1 right 191 20 -1 0 0a0a0a 808080 c0c0c0 c0c0c0 c0c0c0
+bevel125 button 1 tl 136 8 1 1 ffffff dfdfdf c0c0c0 c0c0c0 c0c0c0
+bevel125 button 1 tr 191 8 -1 1 0a0a0a 808080 c0c0c0 c0c0c0 c0c0c0
+bevel125 button 1 bl 136 31 1 -1 0a0a0a 808080 c0c0c0 c0c0c0 c0c0c0
+bevel125 button 1 br 191 31 -1 -1 0a0a0a 808080 c0c0c0 c0c0c0 c0c0c0
+bevel125 window 1 top 68 48 0 1 dfdfdf ffffff c0c0c0 c0c0c0 000080
+bevel125 window 1 bottom 68 111 0 -1 0a0a0a 808080 c0c0c0 c0c0c0 c0c0c0
+bevel125 window 1 left 8 80 1 0 dfdfdf ffffff c0c0c0 c0c0c0 c0c0c0
+bevel125 window 1 right 127 80 -1 0 0a0a0a 808080 c0c0c0 c0c0c0 c0c0c0
+bevel125 window 1 tl 8 48 1 1 dfdfdf ffffff c0c0c0 c0c0c0 000080
+bevel125 window 1 tr 127 48 -1 1 0a0a0a 808080 c0c0c0 c0c0c0 000080
+bevel125 window 1 bl 8 111 1 -1 0a0a0a 808080 c0c0c0 c0c0c0 c0c0c0
+bevel125 window 1 br 127 111 -1 -1 0a0a0a 808080 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 1.25 top 45 10 0 1 ffffff e7e7e7 d0d0d0 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 1.25 bottom 45 49 0 -1 000000 606060 a0a0a0 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 1.25 left 10 30 1 0 ffffff e7e7e7 d0d0d0 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 1.25 right 79 30 -1 0 000000 606060 a0a0a0 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 1.25 tl 10 10 1 1 ffffff ededed d8d8d8 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 1.25 tr 79 10 -1 1 000000 787878 a8a8a8 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 1.25 bl 10 49 1 -1 000000 787878 a8a8a8 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 1.25 br 79 49 -1 -1 000000 484848 909090 c0c0c0 c0c0c0 c0c0c0
+bevel125 sunk 1.25 top 125 10 0 1 808080 272727 848484 ffffff ffffff ffffff
+bevel125 sunk 1.25 bottom 125 49 0 -1 ffffff e7e7e7 efefef ffffff ffffff ffffff
+bevel125 sunk 1.25 left 90 30 1 0 808080 272727 848484 ffffff ffffff ffffff
+bevel125 sunk 1.25 right 159 30 -1 0 ffffff e7e7e7 efefef ffffff ffffff ffffff
+bevel125 sunk 1.25 tl 90 10 1 1 808080 3d3d3d 464646 ffffff ffffff ffffff
+bevel125 sunk 1.25 tr 159 10 -1 1 ffffff d5d5d5 b2b2b2 ffffff ffffff ffffff
+bevel125 sunk 1.25 bl 90 49 1 -1 ffffff d5d5d5 b2b2b2 ffffff ffffff ffffff
+bevel125 sunk 1.25 br 159 49 -1 -1 ffffff ededed e7e7e7 ffffff ffffff ffffff
+bevel125 button 1.25 top 205 10 0 1 ffffff e7e7e7 d0d0d0 c0c0c0 c0c0c0 c0c0c0
+bevel125 button 1.25 bottom 205 39 0 -1 0a0a0a 626262 a0a0a0 c0c0c0 c0c0c0 c0c0c0
+bevel125 button 1.25 left 170 25 1 0 ffffff e7e7e7 d0d0d0 c0c0c0 c0c0c0 c0c0c0
+bevel125 button 1.25 right 239 25 -1 0 0a0a0a 626262 a0a0a0 c0c0c0 c0c0c0 c0c0c0
+bevel125 button 1.25 tl 170 10 1 1 ffffff ededed d8d8d8 c0c0c0 c0c0c0 c0c0c0
+bevel125 button 1.25 tr 239 10 -1 1 0a0a0a 7a7a7a a8a8a8 c0c0c0 c0c0c0 c0c0c0
+bevel125 button 1.25 bl 170 39 1 -1 0a0a0a 7a7a7a a8a8a8 c0c0c0 c0c0c0 c0c0c0
+bevel125 button 1.25 br 239 39 -1 -1 0a0a0a 4c4c4c 909090 c0c0c0 c0c0c0 c0c0c0
+bevel125 window 1.25 top 85 60 0 1 dfdfdf f7f7f7 e0e0e0 c0c0c0 c0c0c0 000080
+bevel125 window 1.25 bottom 85 139 0 -1 0a0a0a 626262 a0a0a0 c0c0c0 c0c0c0 c0c0c0
+bevel125 window 1.25 left 10 100 1 0 dfdfdf f7f7f7 e0e0e0 c0c0c0 c0c0c0 c0c0c0
+bevel125 window 1.25 right 159 100 -1 0 0a0a0a 626262 a0a0a0 c0c0c0 c0c0c0 c0c0c0
+bevel125 window 1.25 tl 10 60 1 1 dfdfdf f1f1f1 f0f0f0 c0c0c0 c0c0c0 000080
+bevel125 window 1.25 tr 159 60 -1 1 0a0a0a 747474 b0b0b0 c0c0c0 c0c0c0 000080
+bevel125 window 1.25 bl 10 139 1 -1 0a0a0a 747474 b0b0b0 c0c0c0 c0c0c0 c0c0c0
+bevel125 window 1.25 br 159 139 -1 -1 0a0a0a 4c4c4c 909090 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 1.5 top 54 12 0 1 ffffff efefef dfdfdf c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 1.5 bottom 54 59 0 -1 000000 404040 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 1.5 left 12 36 1 0 ffffff efefef dfdfdf c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 1.5 right 95 36 -1 0 000000 404040 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 1.5 tl 12 12 1 1 ffffff f7f7f7 dfdfdf c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 1.5 tr 95 12 -1 1 000000 606060 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 1.5 bl 12 59 1 -1 000000 606060 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 1.5 br 95 59 -1 -1 000000 202020 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 sunk 1.5 top 150 12 0 1 808080 454545 0a0a0a ffffff ffffff ffffff ffffff
+bevel125 sunk 1.5 bottom 150 59 0 -1 ffffff efefef dfdfdf ffffff ffffff ffffff ffffff
+bevel125 sunk 1.5 left 108 36 1 0 808080 454545 0a0a0a ffffff ffffff ffffff ffffff
+bevel125 sunk 1.5 right 191 36 -1 0 ffffff efefef dfdfdf ffffff ffffff ffffff ffffff
+bevel125 sunk 1.5 tl 108 12 1 1 808080 626262 0a0a0a ffffff ffffff ffffff ffffff
+bevel125 sunk 1.5 tr 191 12 -1 1 ffffff d7d7d7 dfdfdf ffffff ffffff ffffff ffffff
+bevel125 sunk 1.5 bl 108 59 1 -1 ffffff d7d7d7 dfdfdf ffffff ffffff ffffff ffffff
+bevel125 sunk 1.5 br 191 59 -1 -1 ffffff f7f7f7 dfdfdf ffffff ffffff ffffff ffffff
+bevel125 button 1.5 top 246 12 0 1 ffffff efefef dfdfdf c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 button 1.5 bottom 246 47 0 -1 0a0a0a 454545 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 button 1.5 left 204 30 1 0 ffffff efefef dfdfdf c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 button 1.5 right 287 30 -1 0 0a0a0a 454545 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 button 1.5 tl 204 12 1 1 ffffff f7f7f7 dfdfdf c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 button 1.5 tr 287 12 -1 1 0a0a0a 656565 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 button 1.5 bl 204 47 1 -1 0a0a0a 656565 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 button 1.5 br 287 47 -1 -1 0a0a0a 272727 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 window 1.5 top 102 72 0 1 dfdfdf efefef ffffff c0c0c0 c0c0c0 c0c0c0 000080
+bevel125 window 1.5 bottom 102 167 0 -1 0a0a0a 454545 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 window 1.5 left 12 120 1 0 dfdfdf efefef ffffff c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 window 1.5 right 191 120 -1 0 0a0a0a 454545 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 window 1.5 tl 12 72 1 1 dfdfdf e7e7e7 ffffff c0c0c0 c0c0c0 c0c0c0 000080
+bevel125 window 1.5 tr 191 72 -1 1 0a0a0a 5d5d5d 808080 c0c0c0 c0c0c0 c0c0c0 000080
+bevel125 window 1.5 bl 12 167 1 -1 0a0a0a 5d5d5d 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 window 1.5 br 191 167 -1 -1 0a0a0a 272727 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 2 top 72 16 0 1 ffffff ffffff dfdfdf dfdfdf c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 2 bottom 72 79 0 -1 000000 000000 808080 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 2 left 16 48 1 0 ffffff ffffff dfdfdf dfdfdf c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 2 right 127 48 -1 0 000000 000000 808080 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 2 tl 16 16 1 1 ffffff ffffff dfdfdf dfdfdf c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 2 tr 127 16 -1 1 000000 000000 808080 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 2 bl 16 79 1 -1 000000 000000 808080 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 panel 2 br 127 79 -1 -1 000000 000000 808080 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 sunk 2 top 200 16 0 1 808080 808080 0a0a0a 0a0a0a ffffff ffffff ffffff ffffff ffffff
+bevel125 sunk 2 bottom 200 79 0 -1 ffffff ffffff dfdfdf dfdfdf ffffff ffffff ffffff ffffff ffffff
+bevel125 sunk 2 left 144 48 1 0 808080 808080 0a0a0a 0a0a0a ffffff ffffff ffffff ffffff ffffff
+bevel125 sunk 2 right 255 48 -1 0 ffffff ffffff dfdfdf dfdfdf ffffff ffffff ffffff ffffff ffffff
+bevel125 sunk 2 tl 144 16 1 1 808080 808080 0a0a0a 0a0a0a ffffff ffffff ffffff ffffff ffffff
+bevel125 sunk 2 tr 255 16 -1 1 ffffff ffffff dfdfdf dfdfdf ffffff ffffff ffffff ffffff ffffff
+bevel125 sunk 2 bl 144 79 1 -1 ffffff ffffff dfdfdf dfdfdf ffffff ffffff ffffff ffffff ffffff
+bevel125 sunk 2 br 255 79 -1 -1 ffffff ffffff dfdfdf dfdfdf ffffff ffffff ffffff ffffff ffffff
+bevel125 button 2 top 328 16 0 1 ffffff ffffff dfdfdf dfdfdf c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 button 2 bottom 328 63 0 -1 0a0a0a 0a0a0a 808080 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 button 2 left 272 40 1 0 ffffff ffffff dfdfdf dfdfdf c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 button 2 right 383 40 -1 0 0a0a0a 0a0a0a 808080 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 button 2 tl 272 16 1 1 ffffff ffffff dfdfdf dfdfdf c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 button 2 tr 383 16 -1 1 0a0a0a 0a0a0a 808080 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 button 2 bl 272 63 1 -1 0a0a0a 0a0a0a 808080 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 button 2 br 383 63 -1 -1 0a0a0a 0a0a0a 808080 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 window 2 top 136 96 0 1 dfdfdf dfdfdf ffffff ffffff c0c0c0 c0c0c0 c0c0c0 c0c0c0 000080
+bevel125 window 2 bottom 136 223 0 -1 0a0a0a 0a0a0a 808080 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 window 2 left 16 160 1 0 dfdfdf dfdfdf ffffff ffffff c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 window 2 right 255 160 -1 0 0a0a0a 0a0a0a 808080 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 window 2 tl 16 96 1 1 dfdfdf dfdfdf ffffff ffffff c0c0c0 c0c0c0 c0c0c0 c0c0c0 000080
+bevel125 window 2 tr 255 96 -1 1 0a0a0a 0a0a0a 808080 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0 000080
+bevel125 window 2 bl 16 223 1 -1 0a0a0a 0a0a0a 808080 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+bevel125 window 2 br 255 223 -1 -1 0a0a0a 0a0a0a 808080 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 bevel 1 top 62 2 0 1 ffffff c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 bevel 1 bottom 62 41 0 -1 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 bevel 1 left 2 22 1 0 ffffff c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 bevel 1 right 121 22 -1 0 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 bevel 1 tl 2 2 1 1 ffffff c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 bevel 1 tr 121 2 -1 1 ffffff c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 bevel 1 bl 2 41 1 -1 ffffff c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 bevel 1 br 121 41 -1 -1 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 button 1 top 167 2 0 1 ffffff dfdfdf c0c0c0 c0c0c0 c0c0c0
+inset123 button 1 bottom 167 24 0 -1 0a0a0a 808080 c0c0c0 c0c0c0 c0c0c0
+inset123 button 1 left 130 13 1 0 ffffff dfdfdf c0c0c0 c0c0c0 c0c0c0
+inset123 button 1 right 204 13 -1 0 0a0a0a 808080 c0c0c0 c0c0c0 c0c0c0
+inset123 button 1 tl 130 2 1 1 ffffff dfdfdf c0c0c0 c0c0c0 c0c0c0
+inset123 button 1 tr 204 2 -1 1 0a0a0a 808080 c0c0c0 c0c0c0 c0c0c0
+inset123 button 1 bl 130 24 1 -1 0a0a0a 808080 c0c0c0 c0c0c0 c0c0c0
+inset123 button 1 br 204 24 -1 -1 0a0a0a 808080 c0c0c0 c0c0c0 c0c0c0
+inset123 field 1 top 262 2 0 1 000000 000000 808080 c0c0c0 c0c0c0
+inset123 field 1 bottom 262 22 0 -1 000000 000000 dfdfdf c0c0c0 c0c0c0
+inset123 field 1 left 212 12 1 0 000000 000000 808080 c0c0c0 c0c0c0
+inset123 field 1 right 311 12 -1 0 000000 000000 dfdfdf c0c0c0 c0c0c0
+inset123 field 1 tl 212 2 1 1 000000 000000 808080 c0c0c0 c0c0c0
+inset123 field 1 tr 311 2 -1 1 000000 000000 808080 c0c0c0 c0c0c0
+inset123 field 1 bl 212 22 1 -1 000000 000000 808080 c0c0c0 c0c0c0
+inset123 field 1 br 311 22 -1 -1 000000 000000 dfdfdf c0c0c0 c0c0c0
+inset123 spread 1 top 17 50 0 1 0000ff 0000ff 0000ff c0c0c0 c0c0c0
+inset123 spread 1 bottom 17 79 0 -1 0000ff 0000ff 0000ff c0c0c0 c0c0c0
+inset123 spread 1 left 2 65 1 0 0000ff 0000ff 0000ff c0c0c0 c0c0c0
+inset123 spread 1 right 31 65 -1 0 0000ff 0000ff 0000ff c0c0c0 c0c0c0
+inset123 spread 1 tl 2 50 1 1 0000ff 0000ff 0000ff c0c0c0 c0c0c0
+inset123 spread 1 tr 31 50 -1 1 0000ff 0000ff 0000ff c0c0c0 c0c0c0
+inset123 spread 1 bl 2 79 1 -1 0000ff 0000ff 0000ff c0c0c0 c0c0c0
+inset123 spread 1 br 31 79 -1 -1 0000ff 0000ff 0000ff c0c0c0 c0c0c0
+inset123 far 1 top 50 50 0 1 ff0000 ff0000 ff0000 ff0000 ff0000
+inset123 far 1 bottom 50 79 0 -1 ff0000 ff0000 ff0000 ff0000 ff0000
+inset123 far 1 left 40 65 1 0 ff0000 ff0000 ff0000 ff0000 ff0000
+inset123 far 1 right 59 65 -1 0 ff0000 ff0000 ff0000 ff0000 ff0000
+inset123 far 1 tl 40 50 1 1 ff0000 ff0000 ff0000 ff0000 ff0000
+inset123 far 1 tr 59 50 -1 1 ff0000 ff0000 ff0000 ff0000 ff0000
+inset123 far 1 bl 40 79 1 -1 ff0000 ff0000 ff0000 ff0000 ff0000
+inset123 far 1 br 59 79 -1 -1 ff0000 ff0000 ff0000 ff0000 ff0000
+inset123 half 1 top 88 50 0 1 606060 606060 c0c0c0 c0c0c0 c0c0c0
+inset123 half 1 bottom 88 79 0 -1 d0d0d0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 half 1 left 68 65 1 0 606060 606060 c0c0c0 c0c0c0 c0c0c0
+inset123 half 1 right 107 65 -1 0 d0d0d0 d0d0d0 d0d0d0 c0c0c0 c0c0c0
+inset123 half 1 tl 68 50 1 1 606060 606060 c0c0c0 c0c0c0 c0c0c0
+inset123 half 1 tr 107 50 -1 1 686868 686868 d0d0d0 c0c0c0 c0c0c0
+inset123 half 1 bl 68 79 1 -1 686868 606060 c0c0c0 c0c0c0 c0c0c0
+inset123 half 1 br 107 79 -1 -1 d0d0d0 d0d0d0 d0d0d0 c0c0c0 c0c0c0
+inset123 fade 1 top 136 50 0 1 99cccc 73a6a6 73a6a6 73a6a6 73a6a6
+inset123 fade 1 bottom 136 79 0 -1 4d8080 73a6a6 73a6a6 73a6a6 73a6a6
+inset123 fade 1 left 116 65 1 0 99cccc 73a6a6 73a6a6 73a6a6 73a6a6
+inset123 fade 1 right 155 65 -1 0 4d8080 73a6a6 73a6a6 73a6a6 73a6a6
+inset123 fade 1 tl 116 50 1 1 99cccc 73a6a6 73a6a6 73a6a6 73a6a6
+inset123 fade 1 tr 155 50 -1 1 99cccc 73a6a6 73a6a6 73a6a6 73a6a6
+inset123 fade 1 bl 116 79 1 -1 99cccc 73a6a6 73a6a6 73a6a6 73a6a6
+inset123 fade 1 br 155 79 -1 -1 4d8080 73a6a6 73a6a6 73a6a6 73a6a6
+inset123 inside 1 top 17 88 0 1 ff00ff ff00ff ff00ff ff00ff ff00ff
+inset123 inside 1 bottom 17 111 0 -1 ff00ff ff00ff ff00ff ff00ff ff00ff
+inset123 inside 1 left 2 100 1 0 ff00ff ff00ff ff00ff ff00ff ff00ff
+inset123 inside 1 right 31 100 -1 0 ff00ff ff00ff ff00ff ff00ff ff00ff
+inset123 inside 1 tl 2 88 1 1 ff00ff ff00ff ff00ff ff00ff ff00ff
+inset123 inside 1 tr 31 88 -1 1 ff00ff ff00ff ff00ff ff00ff ff00ff
+inset123 inside 1 bl 2 111 1 -1 ff00ff ff00ff ff00ff ff00ff ff00ff
+inset123 inside 1 br 31 111 -1 -1 ff00ff ff00ff ff00ff ff00ff ff00ff
+inset123 bevel 1.5 top 93 3 0 1 ffffff e0e0e0 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 bevel 1.5 bottom 93 62 0 -1 808080 a0a0a0 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 bevel 1.5 left 3 33 1 0 ffffff e0e0e0 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 bevel 1.5 right 182 33 -1 0 808080 a0a0a0 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 bevel 1.5 tl 3 3 1 1 ffffff f0f0f0 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 bevel 1.5 tr 182 3 -1 1 ffffff d0d0d0 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 bevel 1.5 bl 3 62 1 -1 ffffff d0d0d0 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 bevel 1.5 br 182 62 -1 -1 808080 909090 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 spread 1.5 top 25 75 0 1 0000ff 0000ff 0000ff 0000ff 6060e0 c0c0c0 c0c0c0
+inset123 spread 1.5 bottom 25 119 0 -1 0000ff 0000ff 0000ff 0000ff 6060e0 c0c0c0 c0c0c0
+inset123 spread 1.5 left 3 97 1 0 0000ff 0000ff 0000ff 0000ff 6060e0 c0c0c0 c0c0c0
+inset123 spread 1.5 right 47 97 -1 0 0000ff 0000ff 0000ff 0000ff 6060e0 c0c0c0 c0c0c0
+inset123 spread 1.5 tl 3 75 1 1 0000ff 0000ff 0000ff 0000ff 3030f0 c0c0c0 c0c0c0
+inset123 spread 1.5 tr 47 75 -1 1 0000ff 0000ff 0000ff 0000ff 3030f0 c0c0c0 c0c0c0
+inset123 spread 1.5 bl 3 119 1 -1 0000ff 0000ff 0000ff 0000ff 3030f0 c0c0c0 c0c0c0
+inset123 spread 1.5 br 47 119 -1 -1 0000ff 0000ff 0000ff 0000ff 3030f0 c0c0c0 c0c0c0
+inset123 far 1.5 top 75 75 0 1 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000
+inset123 far 1.5 bottom 75 119 0 -1 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000
+inset123 far 1.5 left 60 97 1 0 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000
+inset123 far 1.5 right 89 97 -1 0 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000
+inset123 far 1.5 tl 60 75 1 1 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000
+inset123 far 1.5 tr 89 75 -1 1 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000
+inset123 far 1.5 bl 60 119 1 -1 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000
+inset123 far 1.5 br 89 119 -1 -1 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000
+inset123 half 1.5 top 132 75 0 1 606060 606060 606060 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 half 1.5 bottom 132 119 0 -1 d0d0d0 c8c8c8 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 half 1.5 left 102 97 1 0 606060 606060 606060 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 half 1.5 right 161 97 -1 0 d0d0d0 d0d0d0 d0d0d0 d0d0d0 c8c8c8 c0c0c0 c0c0c0
+inset123 half 1.5 tl 102 75 1 1 606060 606060 606060 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 half 1.5 tr 161 75 -1 1 686868 686868 686868 d0d0d0 c8c8c8 c0c0c0 c0c0c0
+inset123 half 1.5 bl 102 119 1 -1 686868 646464 606060 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 half 1.5 br 161 119 -1 -1 d0d0d0 d0d0d0 d0d0d0 d0d0d0 c8c8c8 c0c0c0 c0c0c0
+inset123 fade 1.5 top 204 75 0 1 99cccc 86b9b9 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6
+inset123 fade 1.5 bottom 204 119 0 -1 4d8080 609393 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6
+inset123 fade 1.5 left 174 97 1 0 99cccc 86b9b9 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6
+inset123 fade 1.5 right 233 97 -1 0 4d8080 609393 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6
+inset123 fade 1.5 tl 174 75 1 1 99cccc 90c3c3 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6
+inset123 fade 1.5 tr 233 75 -1 1 99cccc 7db0b0 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6
+inset123 fade 1.5 bl 174 119 1 -1 99cccc 7db0b0 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6
+inset123 fade 1.5 br 233 119 -1 -1 4d8080 568989 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6
+inset123 inside 1.5 top 25 132 0 1 ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff
+inset123 inside 1.5 bottom 25 167 0 -1 ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff
+inset123 inside 1.5 left 3 150 1 0 ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff
+inset123 inside 1.5 right 47 150 -1 0 ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff
+inset123 inside 1.5 tl 3 132 1 1 ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff
+inset123 inside 1.5 tr 47 132 -1 1 ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff
+inset123 inside 1.5 bl 3 167 1 -1 ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff
+inset123 inside 1.5 br 47 167 -1 -1 ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff
+inset123 bevel 2 top 124 4 0 1 ffffff ffffff c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 bevel 2 bottom 124 83 0 -1 808080 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 bevel 2 left 4 44 1 0 ffffff ffffff c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 bevel 2 right 243 44 -1 0 808080 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 bevel 2 tl 4 4 1 1 ffffff ffffff c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 bevel 2 tr 243 4 -1 1 ffffff ffffff c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 bevel 2 bl 4 83 1 -1 ffffff ffffff c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 bevel 2 br 243 83 -1 -1 808080 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 button 2 top 335 4 0 1 ffffff ffffff dfdfdf dfdfdf c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 button 2 bottom 335 49 0 -1 0a0a0a 0a0a0a 808080 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 button 2 left 260 27 1 0 ffffff ffffff dfdfdf dfdfdf c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 button 2 right 409 27 -1 0 0a0a0a 0a0a0a 808080 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 button 2 tl 260 4 1 1 ffffff ffffff dfdfdf dfdfdf c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 button 2 tr 409 4 -1 1 0a0a0a 0a0a0a 808080 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 button 2 bl 260 49 1 -1 0a0a0a 0a0a0a 808080 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 button 2 br 409 49 -1 -1 0a0a0a 0a0a0a 808080 808080 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 field 2 top 524 4 0 1 000000 000000 000000 000000 808080 808080 c0c0c0 c0c0c0 c0c0c0
+inset123 field 2 bottom 524 45 0 -1 000000 000000 000000 000000 dfdfdf dfdfdf c0c0c0 c0c0c0 c0c0c0
+inset123 field 2 left 424 25 1 0 000000 000000 000000 000000 808080 808080 c0c0c0 c0c0c0 c0c0c0
+inset123 field 2 right 623 25 -1 0 000000 000000 000000 000000 dfdfdf dfdfdf c0c0c0 c0c0c0 c0c0c0
+inset123 field 2 tl 424 4 1 1 000000 000000 000000 000000 808080 808080 c0c0c0 c0c0c0 c0c0c0
+inset123 field 2 tr 623 4 -1 1 000000 000000 000000 000000 808080 808080 c0c0c0 c0c0c0 c0c0c0
+inset123 field 2 bl 424 45 1 -1 000000 000000 000000 000000 808080 808080 c0c0c0 c0c0c0 c0c0c0
+inset123 field 2 br 623 45 -1 -1 000000 000000 000000 000000 dfdfdf dfdfdf c0c0c0 c0c0c0 c0c0c0
+inset123 spread 2 top 34 100 0 1 0000ff 0000ff 0000ff 0000ff 0000ff 0000ff c0c0c0 c0c0c0 c0c0c0
+inset123 spread 2 bottom 34 159 0 -1 0000ff 0000ff 0000ff 0000ff 0000ff 0000ff c0c0c0 c0c0c0 c0c0c0
+inset123 spread 2 left 4 130 1 0 0000ff 0000ff 0000ff 0000ff 0000ff 0000ff c0c0c0 c0c0c0 c0c0c0
+inset123 spread 2 right 63 130 -1 0 0000ff 0000ff 0000ff 0000ff 0000ff 0000ff c0c0c0 c0c0c0 c0c0c0
+inset123 spread 2 tl 4 100 1 1 0000ff 0000ff 0000ff 0000ff 0000ff 0000ff c0c0c0 c0c0c0 c0c0c0
+inset123 spread 2 tr 63 100 -1 1 0000ff 0000ff 0000ff 0000ff 0000ff 0000ff c0c0c0 c0c0c0 c0c0c0
+inset123 spread 2 bl 4 159 1 -1 0000ff 0000ff 0000ff 0000ff 0000ff 0000ff c0c0c0 c0c0c0 c0c0c0
+inset123 spread 2 br 63 159 -1 -1 0000ff 0000ff 0000ff 0000ff 0000ff 0000ff c0c0c0 c0c0c0 c0c0c0
+inset123 far 2 top 100 100 0 1 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000
+inset123 far 2 bottom 100 159 0 -1 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000
+inset123 far 2 left 80 130 1 0 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000
+inset123 far 2 right 119 130 -1 0 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000
+inset123 far 2 tl 80 100 1 1 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000
+inset123 far 2 tr 119 100 -1 1 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000
+inset123 far 2 bl 80 159 1 -1 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000
+inset123 far 2 br 119 159 -1 -1 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000 ff0000
+inset123 half 2 top 176 100 0 1 606060 606060 606060 606060 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 half 2 bottom 176 159 0 -1 d0d0d0 d0d0d0 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 half 2 left 136 130 1 0 606060 606060 606060 606060 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 half 2 right 215 130 -1 0 d0d0d0 d0d0d0 d0d0d0 d0d0d0 d0d0d0 d0d0d0 c0c0c0 c0c0c0 c0c0c0
+inset123 half 2 tl 136 100 1 1 606060 606060 606060 606060 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 half 2 tr 215 100 -1 1 686868 686868 686868 686868 d0d0d0 d0d0d0 c0c0c0 c0c0c0 c0c0c0
+inset123 half 2 bl 136 159 1 -1 686868 686868 606060 606060 c0c0c0 c0c0c0 c0c0c0 c0c0c0 c0c0c0
+inset123 half 2 br 215 159 -1 -1 d0d0d0 d0d0d0 d0d0d0 d0d0d0 d0d0d0 d0d0d0 c0c0c0 c0c0c0 c0c0c0
+inset123 fade 2 top 272 100 0 1 99cccc 99cccc 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6
+inset123 fade 2 bottom 272 159 0 -1 4d8080 4d8080 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6
+inset123 fade 2 left 232 130 1 0 99cccc 99cccc 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6
+inset123 fade 2 right 311 130 -1 0 4d8080 4d8080 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6
+inset123 fade 2 tl 232 100 1 1 99cccc 99cccc 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6
+inset123 fade 2 tr 311 100 -1 1 99cccc 99cccc 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6
+inset123 fade 2 bl 232 159 1 -1 99cccc 99cccc 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6
+inset123 fade 2 br 311 159 -1 -1 4d8080 4d8080 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6 73a6a6
+inset123 inside 2 top 34 176 0 1 ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff
+inset123 inside 2 bottom 34 223 0 -1 ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff
+inset123 inside 2 left 4 200 1 0 ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff
+inset123 inside 2 right 63 200 -1 0 ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff
+inset123 inside 2 tl 4 176 1 1 ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff
+inset123 inside 2 tr 63 176 -1 1 ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff
+inset123 inside 2 bl 4 223 1 -1 ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff
+inset123 inside 2 br 63 223 -1 -1 ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff
