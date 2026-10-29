@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use crate::svg::SvgRejection;
 use crate::types::SurfaceId;
 
 /// `#[non_exhaustive]` (PR27 round 2, one-time breaking change): new
@@ -58,6 +59,15 @@ pub enum EngineError {
         family: String,
         reason: String,
     },
+    /// An SVG in loaded HTML or a swap fragment failed the issue #23 gate:
+    /// an inline `<svg>` or a `data:image/svg+xml` URL (in a `<style>`, a
+    /// `style` attribute or an `<img src>`) that contains `<text>`,
+    /// `<tspan>`, `<textPath>`, `<image>` or `<feImage>`, is larger than
+    /// [`DATA_SVG_MAX_BYTES`](crate::DATA_SVG_MAX_BYTES), or does not parse.
+    /// Like every fragment rejection, the whole load or swap is refused and
+    /// the document is left as it was. `id` is the element's `id`, or
+    /// `<tag>` when it has none.
+    InvalidSvg { id: String, rejection: SvgRejection },
     /// Paint / layout failure.
     Paint(String),
     /// Engine used before `load_html`.
@@ -103,6 +113,9 @@ impl fmt::Display for EngineError {
                 input,
                 reason,
             } => write!(f, "invalid input_limits for `{action}.{input}`: {reason}"),
+            EngineError::InvalidSvg { id, rejection } => {
+                write!(f, "invalid SVG in `{id}`: {rejection}")
+            }
             EngineError::Paint(msg) => write!(f, "paint error: {msg}"),
             EngineError::NotLoaded => write!(f, "engine has no loaded HTML"),
             EngineError::UnknownSurface(id) => write!(f, "{id} is not open"),

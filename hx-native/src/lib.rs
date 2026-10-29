@@ -26,6 +26,7 @@ mod scroll;
 mod select_ui;
 mod slider;
 mod stylo_text_style;
+mod svg;
 mod text_edit;
 mod text_shadow;
 mod tile_coalesce;
@@ -50,6 +51,11 @@ pub use memory::{
     DOCUMENT_ESTIMATE_BASE_BYTES, DOCUMENT_ESTIMATE_PER_HTML_BYTE, RGBA_BYTES_PER_PIXEL,
 };
 pub use pending::PendingTimeout;
+pub use svg::{
+    svg_warm_up, svg_warm_up_done, SvgRejection, DATA_IMAGE_MAX_PIXELS, DATA_IMAGE_MAX_SIDE,
+    DATA_IMAGE_MAX_TOTAL_PIXELS, DATA_SVG_MAX_BYTES, FORBIDDEN_SVG_ELEMENTS,
+    FORBIDDEN_SVG_PROPERTIES, SVG_IMAGE_MIME_TYPES, SVG_MAX_DEPTH,
+};
 #[doc(hidden)]
 pub use text_shadow::{take_text_shadow_counters_for_test, TextShadowCounters};
 #[doc(hidden)]
